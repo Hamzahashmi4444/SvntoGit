@@ -1,0 +1,1627 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : Search
+# $Id$
+#
+# Description : Searches the search_key table for matching elements
+#
+# SBEAMS is Copyright (C) 2000-2021 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+#
+###############################################################################
+
+
+###############################################################################
+# Set up all needed modules and objects
+###############################################################################
+use strict;
+use Getopt::Long;
+use FindBin;
+use URI::Escape;
+
+use lib "$FindBin::Bin/../../lib/perl";
+use vars qw ($sbeams $sbeamsMOD $q $current_contact_id $current_username
+             $PROG_NAME $USAGE %OPTIONS $QUIET $VERBOSE $DEBUG $DATABASE
+             $TABLE_NAME $PROGRAM_FILE_NAME $CATEGORY $DB_TABLE_NAME
+             @MENU_OPTIONS $SORT_COLUMN $SORT_TYPE);
+
+#TMF the below means, import $q (a CGI object) and $log
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::TabMenu;
+
+use SBEAMS::BioLink::Tables;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+
+$sbeams = new SBEAMS::Connection;
+$sbeamsMOD = new SBEAMS::PeptideAtlas;
+$sbeamsMOD->setSBEAMS($sbeams);
+$sbeams->setSBEAMS_SUBDIR($SBEAMS_SUBDIR);
+
+my %search_type_param;
+
+###############################################################################
+# Set program name and usage banner for command like use
+###############################################################################
+$PROG_NAME = $FindBin::Script;
+$USAGE = <<EOU;
+Usage: $PROG_NAME [OPTIONS] key=value key=value ...
+Options:
+  --verbose n         Set verbosity level.  default is 0
+  --quiet             Set flag to print nothing at all except errors
+  --debug n           Set debug flag
+
+ e.g.:  $PROG_NAME [OPTIONS] [keyword=value],...
+
+EOU
+
+#### Process options
+unless
+(GetOptions(\%OPTIONS,"verbose:s","quiet","debug:s",)) {
+  print "$USAGE";
+  exit;
+}
+
+$VERBOSE = $OPTIONS{"verbose"} || 0;
+$QUIET = $OPTIONS{"quiet"} || 0;
+$DEBUG = $OPTIONS{"debug"} || 0;
+if ($DEBUG) {
+  print "Options settings:\n";
+  print "  VERBOSE = $VERBOSE\n";
+  print "  QUIET = $QUIET\n";
+  print "  DEBUG = $DEBUG\n";
+}
+
+my $table_name = "tbl1";
+my $ROW_COUNT = 0;
+my %exact_resultset = ();
+my %fuzzy_resultset = ();
+my $param_string;
+###############################################################################
+# Set Global Variables and execute main()
+###############################################################################
+main();
+exit(0);
+
+
+
+###############################################################################
+# Main Program:
+#
+# Call $sbeams->Authenticate() and exit if it fails or continue if it works.
+###############################################################################
+sub main {
+
+  #### Do the SBEAMS authentication and exit if a username is not returned
+  exit unless ($current_username = $sbeams->Authenticate(
+#      permitted_work_groups_ref=>[],
+      permitted_work_groups_ref=>['PeptideAtlas_user','PeptideAtlas_admin',
+      'PeptideAtlas_readonly', 'PeptideAtlas_exec'],
+      #connect_read_only=>1,
+      allow_anonymous_access=>1,
+  ));
+
+
+  #### Read in the default input parameters
+  my %parameters;
+  my $n_params_found = $sbeams->parse_input_parameters(
+      q=>$q,            # TMF: CGI object; received into $self
+      parameters_ref=>\%parameters);
+   #$sbeams->printDebuggingInfo($q);
+ 
+  #### Process generic "state" parameters before we start
+  
+  $sbeams->processStandardParameters(parameters_ref=>\%parameters); 
+  # This will look for mod-specific params and do the right thing
+  $sbeamsMOD->processModuleParameters(parameters_ref=>\%parameters);
+  
+ #   foreach (keys %parameters){
+ #   print "$_ \t $parameters{$_} <BR>";
+ # }
+  #### Decide what action to take based on information so far
+
+  if ( !$parameters{action} && !$parameters{apply_action} ) {
+    handle_request(ref_parameters=>\%parameters);
+  } else {
+    my $paramstr = join( ',', %parameters );
+    $log->logCGI( paramstr => $paramstr, mode => 'start' );
+    handle_request(ref_parameters=>\%parameters);
+    $log->logCGI( paramstr => $paramstr, mode => 'done' );
+    $sbeamsMOD->display_page_footer();
+  }
+
+
+} # end main
+
+
+
+###############################################################################
+# Handle Request
+###############################################################################
+sub handle_request {
+  my %args = @_;
+
+  #### Process the arguments list
+  my $ref_parameters = $args{'ref_parameters'}
+      || die "ref_parameters not passed";
+
+  my %parameters = %{$ref_parameters};
+
+
+  #### Define some generic varibles
+  my ($i,$element,$key,$value,$line,$result,$sql);
+
+
+  #### Define some variables for a query and resultset
+  my %resultset = ();
+  my $resultset_ref = \%resultset;
+  my (%url_cols,%hidden_cols,%max_widths,$show_sql);
+  ##TMF. Tends to show a blank page in html mode. Anti-useful!
+  #$show_sql = 1;
+
+
+  #### Read in the standard form values
+  my $apply_action  = $parameters{'action'} || $parameters{'apply_action'};
+  ##TMF: this is never used, and receives no value from cgi.
+  my $TABLE_NAME = $parameters{'QUERY_NAME'};
+
+
+  #### Set some specific settings for this program
+  my $CATEGORY="Search PeptideAtlas";
+  my $PROGRAM_FILE_NAME = $PROG_NAME;
+  my $base_url = "$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME";
+  my $help_url = "$CGI_BASE_DIR/help_popup.cgi";
+
+
+  #### If the apply action was to recall a previous resultset, do it
+  my %rs_params = $sbeams->parseResultSetParams('q' => $q);
+  my $n_params_found = 0;
+  if ($apply_action =~ /(DOWNLOAD|VIEWRESULTSET)/) {
+    $sbeams->readResultSet(
+      resultset_file=>$rs_params{set_name},
+      resultset_ref=> $resultset_ref,
+      query_parameters_ref=>\%parameters,
+      resultset_params_ref=>\%rs_params,
+    );
+    $n_params_found = 99;
+    #separate the result into exact_resultset and fuzzy_result
+    if($apply_action =~ /VIEWRESULT/ and ! $search_type_param{single_table}){
+
+			for my $row ( @{$resultset_ref->{data_ref}} ) {
+				 my $match_string = $row->[8];
+				 if($match_string =~ /exact/){
+					 push(@{$exact_resultset{data_ref}},$row); 
+				 }else{
+					 push(@{$fuzzy_resultset{data_ref}}, $row);
+				}      
+			}
+			foreach my $k ( keys %{$resultset_ref}){
+				next if($k eq 'data_ref');
+				$exact_resultset{$k} = $resultset_ref->{$k};
+				$fuzzy_resultset{$k} = $resultset_ref->{$k};
+			}
+    }
+  }
+
+  #### Get the passed parameters
+  my $search_key = $parameters{"search_key"};
+  my $organism_name = $parameters{"organism_name"};
+  my $build_type_name = $parameters{"build_type_name"};
+  #TMF added below 
+  my $atlas_build_id = $parameters{"atlas_build_id"};
+  if ($build_type_name && $atlas_build_id && 
+         ($sbeams->output_mode() ne 'html')) {
+    print "Specify only one of build_type_name and atlas_build_id.\n";
+    return(0);
+  }   
+
+  #### Check to see whether specified atlas build is accessible
+  if ($atlas_build_id) {
+    #get project ID
+    my $sql = qq~
+	 SELECT project_id
+	   FROM $TBAT_ATLAS_BUILD 
+	  WHERE atlas_build_id = $atlas_build_id
+    ~;
+    my ($project_id) = $sbeams->selectOneColumn($sql);
+    my @accessible_project_ids = $sbeams->getAccessibleProjects();
+    my $ok_project = 0;
+    for my $id (@accessible_project_ids) {
+      if ($project_id == $id) {
+        $ok_project = 1;
+        last;
+      }
+    }
+    if ( ! $ok_project ) {
+      print "Atlas build $atlas_build_id does not exist, or you do not have access permission.\n";
+      return(0);
+    }
+  }
+
+  #### If a new search_key was supplied, store it
+  if ($search_key) {
+    $sbeams->setSessionAttribute(
+      key => 'PeptideAtlas_search_string',
+      value => $search_key,
+    );
+
+  #### Else see if we had one stored
+  } else {
+    $search_key = $sbeams->getSessionAttribute(
+      key => 'PeptideAtlas_search_string',
+    );
+  }
+
+
+  #### Build the list of build type names
+  my $build_type_selection = getBuildTypeSelection(
+    organism_name => $organism_name,
+    build_type_name => $build_type_name,
+  );
+
+  #### This is needed for displaying the page header
+  my $project_id = $sbeamsMOD->getProjectID(
+    atlas_build_id => $atlas_build_id
+  );
+
+
+  #### Show current user context information
+  #print "<BR>\n" if ($sbeams->output_mode() eq 'html');
+  #$sbeams->printUserContext();
+
+  #### Get the HTML to display the tabs
+  my $tabMenu = $sbeamsMOD->getTabMenu(
+    extra_width => 1,
+    parameters_ref => \%parameters,
+    program_name => $PROG_NAME,
+  );
+
+
+
+  #### If the output_mode is HTML, then display the form
+  my $buffer = '';
+  my $search_types_clause = getSearchTypeClause( params => \%parameters );
+
+  if ($sbeams->output_mode() eq 'html') {
+      my $spacer = $sbeams->getGifSpacer(100);
+      my $sm_spacer = '&nbsp;' x 20;
+
+      $buffer .= $q->start_form(-method=>"POST",
+                           -action=>"$base_url",
+                          );
+      $buffer .= $tabMenu->asHTML();
+      $buffer .= "<BR>$spacer<BR><P>";
+      $buffer .= qq~<nobr><CENTER><IMG SRC="$HTML_BASE_DIR/images/PeptideAtlas_Logo.png"><BR>~;
+      my $advanced = getSearchKeyTypeHTML();
+      
+      $buffer .= $q->textfield(-name=>"search_key",
+                               -default=>$search_key,
+                               -size=>60,
+                               -maxlength=>2000,
+                               );
+
+      $buffer .= "&nbsp;&nbsp;&nbsp;";
+      $buffer .= $q->submit(-name => "action",
+                       -value => 'QUERY',
+                       -label => 'GO');
+      $buffer .= qq~<BR>
+      <TABLE WIDTH=50% ALIGN=CENTER BORDER=0 CELLPADDING=0>
+      <TR VALIGN=CENTER >
+      <TD ALIGN=RIGHT { white-space: nowrap } >
+      <label for='btype' style="float:left margin-right:3px;";>Build type:&nbsp;</label> 
+      <select name="build_type_name" id='btype'> $build_type_selection->{HTML_optionlist}</select> 
+      </TD>
+      <TD WIDTH=10% ALIGN=LEFT { white-space: nowrap } >
+      <DT>
+      <INPUT ID="exact_match" TYPE=radio $search_type_param{exact_match} NAME="exact_match"
+          ONCLICK=toggle_radiobutton(this)>
+          Exact Match
+      <DT><INPUT ID="single_table" TYPE=radio $search_type_param{single_table}  NAME="single_table"
+          ONCLICK=toggle_radiobutton(this)>
+          Tabular Results 
+      </TD>
+      <TR VALIGN=LEFT ><TD>&nbsp;&nbsp;
+      </TD><TD WIDTH=30% { white-space: nowrap } >
+      &nbsp;$advanced
+      </TD></TR></TABLE>
+      <BR>
+        (e.g.
+          <A HREF="$base_url?search_key=ENSP00000238647.3&build_type_name=Human&action=GO"><SPAN TITLE="Ensembl protein identifier" CLASS="popup">ENSP00000238647.3</SPAN></A>,
+          <A HREF="$base_url?search_key=IPI00807403&build_type_name=Human&action=GO"><SPAN TITLE="IPI protein identifier" CLASS="popup">IPI00807403</SPAN></A>,
+          <A HREF="$base_url?search_key=NP_001366&build_type_name=Human&action=GO"><SPAN TITLE="Refseq protein identifier" CLASS="popup">NP_001366</SPAN></A>,
+          <A HREF="$base_url?search_key=Hs.232375&build_type_name=Human&action=GO"><SPAN TITLE="UniGene identifier" CLASS="popup">Hs.232375</SPAN></A>,
+          <A HREF="$base_url?search_key=RBP&build_type_name=Human&action=GO"><SPAN TITLE="Gene name wildcard search" CLASS="popup">RBP</SPAN></A>,
+          <A HREF="$base_url?search_key=RBP4&build_type_name=Human&action=GO"><SPAN TITLE="Gene name" CLASS="popup">RBP4</SPAN></A>,<BR>
+          <A HREF="$base_url?search_key=helicase&build_type_name=Yeast&action=GO"><SPAN TITLE="Gene description wildcard search in yeast" CLASS="popup">helicase</SPAN></A>,
+          <A HREF="$base_url?search_key=P06634&build_type_name=Yeast&action=GO"><SPAN TITLE="UniProt Identifier" CLASS="popup">P06634</SPAN></A>,
+          <A HREF="$base_url?search_key=MCCC2&build_type_name=Human&action=GO"><SPAN TITLE="Gene name" CLASS="popup">MCCC2</SPAN></A>,
+          <A HREF="$base_url?search_key=PAp00000097&build_type_name=Human&action=GO"><SPAN TITLE="Peptide accession" CLASS="popup">PAp00000097</SPAN></A>,
+          <A HREF="$base_url?search_key=AAVEEGIVLGGGCALLR&build_type_name=Human&action=GO"><SPAN TITLE="Peptide sequence" CLASS="popup">AAVEEGIVLGGGCALLR</SPAN></A>
+        )<BR>
+      ~;
+
+      $buffer .= '</CENTER></nobr></P>';
+      $buffer .= $q->end_form;
+  }
+
+  #########################################################################
+  #### Process all the constraints
+
+  #### If search_key was not selected, stop here
+  my $key_error;
+  my $error_msg;
+  if ( !$parameters{search_key} && $apply_action ) {
+    $key_error++;
+    $error_msg = 'You must provide some text to search',
+  } elsif ( $parameters{search_key} =~ /^[%_; ]+$|^[%_; ]+;|;[%_; ]+$|;[%_; ]+;/  && $apply_action ) {
+    $key_error++;
+    $error_msg = 'Full wildcard searches (%,_ only) are not supported.' 
+  }
+
+  if ( $key_error ) {
+    $sbeams->set_page_message( type => 'Error', msg => <<"    END" );
+		<BR>
+      $error_msg
+		<BR>
+    END
+    if ($sbeams->output_mode() eq 'html') {
+      $sbeamsMOD->display_page_header(project_id => $project_id);
+      print $buffer;
+    } else {
+      $sbeams->reportException(
+          state => 'ERROR',
+          type => 'INSUFFICIENT CONSTRAINTS',
+          message => $error_msg,
+      );
+    }
+    return '';
+  }
+
+  ### identifiy PASS accession search
+  if ($search_key =~ /^PASS\d{5}/i && $parameters{action} ){
+    print $q -> redirect("PASS_View?identifier=$search_key");
+    exit;
+  }
+  
+  ### search PASS datasets
+  my $filterstr='';
+  if ($build_type_name !~ /Any/i){
+    $filterstr = "$search_key $build_type_name";
+  }else{
+    $filterstr = $search_key; 
+  }
+  my $pass_query_result = query_repository (file => "/proteomics/peptideatlas2/PASS.json", 
+                                            filterstr=>$filterstr);
+
+  if ($pass_query_result ne '' and $pass_query_result =~ /PASS\d{5}/i){
+    my $link = "https://db.systemsbiology.net/sbeams/cgi/PeptideAtlas/PASS_View?identifier=";
+    my @matches = split(",", $pass_query_result); 
+    $pass_query_result = "PASS submission matches: <BR>";
+    my $seq = '';
+    foreach my $m (@matches){
+      $pass_query_result .= qq~$seq<a href="$link$m">$m</a>~;
+      $seq = ', ';
+    }
+  }
+  
+  ### search repository
+  my $repository_query_result  =  query_repository (file => "/net/dblocal/wwwspecial/peptideatlas/cgi/Repository/PA_Samples_entries.json",
+                                            filterstr=>$filterstr);
+
+  if ($repository_query_result ne '' and $repository_query_result =~ /PAe\d{6}/i){
+    my $link = "ftp://ftp.peptideatlas.org/pub/PeptideAtlas/Repository/"; 
+    my @matches = split(",", $repository_query_result);
+    $repository_query_result = '<BR>PeptideAtlas repository dataset matches: <BR>';
+    my $seq = '';
+    foreach my $m (@matches){
+      $repository_query_result .= qq~$seq<a href="$link$m">$m</a>~;
+      $seq = ', ';
+    }
+  }
+
+  #print "*$pass_query_result*\n*$repository_query_result*\n";
+  #### Build SEARCH_KEY constraint
+  my $exact_search_key =  $parameters{search_key};
+  if($exact_search_key =~ /%/){
+    $exact_search_key =~ s/%/ /g;
+  }
+  $exact_search_key =~ s/^\s+//;
+  $exact_search_key =~ s/\s+$//;
+
+  my $search_key_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"search_key_name",
+      constraint_type=>"plain_text",
+      constraint_name=>"Search Key",
+      constraint_value=>$exact_search_key,
+      );
+  return if ($search_key_clause eq '-1');
+
+  my $atlas_build_ids;
+  my $atlas_build_column;
+  my $atlas_build_clause;
+
+  #### Command-line specification of a specific atlas build id
+  if ($sbeams->output_mode() ne 'html' && defined $atlas_build_id
+         && !defined $build_type_name ) {
+    $atlas_build_ids = $atlas_build_id;
+    $atlas_build_column =  ["atlas_build","AB.atlas_build_name","Build Name"];
+    $atlas_build_clause = qq~
+         JOIN $TBAT_ATLAS_BUILD DAB
+              ON ( SKL.atlas_build_id = DAB.atlas_build_id)
+    ~;
+
+  #### ... or, typical CGI/command-line specification of an atlas build type
+  } else {
+    $atlas_build_ids = $build_type_selection->{atlas_build_ids};
+    $atlas_build_column =  ["build_type","(CASE WHEN DAB.organism_specialized_build IS NULL THEN O.organism_name ELSE DAB.organism_specialized_build END)","Build Type"],
+    $atlas_build_clause = qq~
+         JOIN $TBAT_DEFAULT_ATLAS_BUILD DAB
+              ON ( SKL.atlas_build_id = DAB.atlas_build_id
+                   AND DAB.organism_id IS NOT NULL )
+    ~;
+  }
+
+  
+
+  #### Define the desired columns in the query
+  #### [friendly name used in url_cols,SQL,displayed column title]
+  my @column_array = (
+    ["search_key_name","SKE.search_key_name","Search Key"],
+#    ["search_key_type","SK.search_key_type","search_key_type"],
+    $atlas_build_column,
+    ["resource_name","SKL.resource_name","Identifier"],
+    ["resource_type","SKE.resource_type","resource_type"],
+    ["resource_n_matches","SKL.resource_n_matches","N PSM obs"],
+    ["resource_url","SKL.resource_url","resource_url"],
+    ["organism_id","O.organism_id","organism_id"],
+    ["organism_name","O.organism_name","organism_name"],
+    ["presence_level","PROTLEVEL.presence_level", "Protein Level"]
+  );
+
+  push @column_array, ["match_string","'exact_match'", "match_string"];
+
+  #### Build the columns part of the SQL statement
+  my %colnameidx = ();
+  my @column_titles = ();
+  my $columns_clause = $sbeams->build_SQL_columns_list(
+    column_array_ref=>\@column_array,
+    colnameidx_ref=>\%colnameidx,
+    column_titles_ref=>\@column_titles
+  );
+
+  ## all any search for sequence search 
+  my $select_sql;
+  if (($parameters{sequence} =~/on/i || $parameters{exact_match} =~ /on/i || $parameters{accession} =~ /on/i ) &&
+       $parameters{organism_name}=~ /any/i){
+    # skip protein level query  
+    # use all build
+    my $build_id_sql = qq~
+			SELECT DISTINCT AB.ATLAS_BUILD_ID
+			FROM $TBAT_DEFAULT_ATLAS_BUILD DAB
+			JOIN $TBAT_ATLAS_BUILD AB ON (AB.ATLAS_BUILD_ID = DAB.ATLAS_BUILD_ID)
+			WHERE AB.PROJECT_ID = 475
+    ~;
+    my @default_build_ids = $sbeams->selectOneColumn($build_id_sql);
+    $atlas_build_ids = join(",", @default_build_ids);
+    $columns_clause =~ s/PROTLEVEL.presence_level/''/;
+		$select_sql = qq~
+			 SELECT DISTINCT TOP 501 $columns_clause
+				 FROM $TBAT_SEARCH_KEY_LINK SKL
+				 LEFT JOIN  $TBAT_SEARCH_KEY_ENTITY SKE
+							ON (SKL.RESOURCE_NAME = SKE.RESOURCE_NAME)
+				 JOIN $TB_ORGANISM O ON (O.ORGANISM_ID = SKL.ORGANISM_ID)
+									$atlas_build_clause
+				 JOIN $TBAT_ATLAS_BUILD AB ON (AB.ATLAS_BUILD_ID = DAB.ATLAS_BUILD_ID)
+		 ~;
+  }else{
+ 		my $msg = $sbeams->update_PA_table_variables($atlas_build_ids);
+		#### Define the SQL statement to find the biosequence(s)
+		my $proteinlevel_sql = qq~
+			(SELECT  AB.atlas_build_id as "atlas_build_id",
+							 BS_REF.biosequence_name AS "biosequence_name",
+							 PPL.level_phrase AS "presence_level"
+			 FROM $TBAT_PROTEIN_IDENTIFICATION PID
+			 INNER JOIN $TBAT_ATLAS_BUILD AB	ON ( AB.atlas_build_id = PID.atlas_build_id )
+			 INNER JOIN $TBAT_BIOSEQUENCE_SET BSS ON ( BSS.biosequence_set_id = AB.biosequence_set_id )
+			 INNER JOIN $TB_ORGANISM O ON ( O.organism_id = BSS.organism_id )
+			 INNER JOIN $TBAT_BIOSEQUENCE BS_REF ON ( BS_REF.biosequence_id = PID.biosequence_id )
+									AND ( BS_REF.biosequence_set_id = BSS.biosequence_set_id)
+			 INNER JOIN $TBAT_PROTEIN_PRESENCE_LEVEL PPL ON ( PPL.protein_presence_level_id = PID.presence_level_id )
+			 WHERE 1 = 1
+						 AND AB.atlas_build_id IN ( $atlas_build_ids )
+						 AND PPL.protein_presence_level_id IN ( 1,2,6,3 )
+				)
+				UNION
+			 ( SELECT  AB.atlas_build_id as "atlas_build_id",
+						 BS_REL.biosequence_name AS "biosequence_name", 
+						 BRT.relationship_phrase  + ' ' + 
+						 BS_REF.biosequence_name AS "presence_level" 
+				 FROM $TBAT_PROTEIN_IDENTIFICATION PID
+				 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP BR ON ( BR.reference_biosequence_id = PID.biosequence_id ) 
+								AND (BR.atlas_build_id = PID.atlas_build_id )
+				 INNER JOIN $TBAT_ATLAS_BUILD AB ON ( AB.atlas_build_id = PID.atlas_build_id )
+				 INNER JOIN $TBAT_BIOSEQUENCE_SET BSS ON ( BSS.biosequence_set_id = AB.biosequence_set_id )
+				 INNER JOIN $TB_ORGANISM O ON ( O.organism_id = BSS.organism_id )
+				 INNER JOIN $TBAT_BIOSEQUENCE BS_REF ON ( BS_REF.biosequence_id = PID.biosequence_id )
+							 AND ( BS_REF.biosequence_set_id = BSS.biosequence_set_id)
+				 INNER JOIN $TBAT_PROTEIN_PRESENCE_LEVEL PPL ON ( PPL.protein_presence_level_id = PID.presence_level_id )
+				 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE BRT ON ( BRT.biosequence_relationship_type_id = BR.relationship_type_id )
+				 LEFT JOIN $TBAT_BIOSEQUENCE BS_REL ON ( BS_REL.biosequence_id = BR.related_biosequence_id )
+							AND ( BS_REL.biosequence_set_id = BSS.biosequence_set_id )
+				 WHERE 1 = 1
+									AND AB.atlas_build_id IN ( $atlas_build_ids )
+									AND PPL.protein_presence_level_id IN ( 1,2,6,3 )
+									AND BRT.biosequence_relationship_type_id IN ( 1,2 )
+				)
+				UNION
+			 ( SELECT  
+						 AB.atlas_build_id as "atlas_build_id",
+						 BS_INDIS.biosequence_name AS "biosequence_name",
+						 BRT.relationship_phrase   + ' ' +
+						 BS_REL.biosequence_name AS "presence_level"  
+				 FROM $TBAT_PROTEIN_IDENTIFICATION PID
+				 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP BR	ON ( BR.reference_biosequence_id = PID.biosequence_id )
+							 AND (BR.atlas_build_id = PID.atlas_build_id )
+				 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP BR_INDIS ON ( BR_INDIS.reference_biosequence_id = BR.related_biosequence_id 
+							 AND  BR_INDIS.atlas_build_id = PID.atlas_build_id )
+				 INNER JOIN $TBAT_ATLAS_BUILD AB ON ( AB.atlas_build_id = PID.atlas_build_id )
+				 INNER JOIN $TBAT_BIOSEQUENCE_SET BSS ON ( BSS.biosequence_set_id = AB.biosequence_set_id )
+				 INNER JOIN $TB_ORGANISM O ON ( O.organism_id = BSS.organism_id )
+				 INNER JOIN $TBAT_PROTEIN_PRESENCE_LEVEL PPL ON ( PPL.protein_presence_level_id = PID.presence_level_id )
+				 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE BRT ON ( BRT.biosequence_relationship_type_id = BR_INDIS.relationship_type_id )
+				 LEFT JOIN $TBAT_BIOSEQUENCE BS_INDIS ON ( BR_INDIS.related_biosequence_id = BS_INDIS.biosequence_id )
+							AND ( BS_INDIS.biosequence_set_id = BSS.biosequence_set_id)
+				 LEFT JOIN $TBAT_BIOSEQUENCE BS_REL ON ( BS_REL.biosequence_id = BR_INDIS.reference_biosequence_id  )
+							AND ( BS_REL.biosequence_set_id = BSS.biosequence_set_id)
+						 WHERE 1 = 1
+									AND AB.atlas_build_id IN ( $atlas_build_ids )
+									AND PPL.protein_presence_level_id IN ( 1,2,6,3 )
+									AND BRT.biosequence_relationship_type_id IN ( 1,2 )
+				 )
+				 ~;
+
+		$select_sql = qq~
+				 SELECT DISTINCT TOP 501 $columns_clause
+					 FROM $TBAT_SEARCH_KEY_LINK SKL
+					 LEFT JOIN  $TBAT_SEARCH_KEY_ENTITY SKE 
+								ON (SKL.RESOURCE_NAME = SKE.RESOURCE_NAME) 
+					 JOIN $TB_ORGANISM O ON (O.ORGANISM_ID = SKL.ORGANISM_ID)
+										$atlas_build_clause
+					 JOIN $TBAT_ATLAS_BUILD AB ON (AB.ATLAS_BUILD_ID = DAB.ATLAS_BUILD_ID)
+					 LEFT JOIN ($proteinlevel_sql) AS PROTLEVEL
+						ON (PROTLEVEL.BIOSEQUENCE_NAME = SKL.RESOURCE_NAME and SKL.atlas_build_id = PROTLEVEL.atlas_build_id)
+			 ~;
+   }
+	 my $where_clause = qq~
+				WHERE 1 = 1
+					$search_key_clause
+					$search_types_clause
+					AND SKL.atlas_build_id IN ( $atlas_build_ids )
+			 ORDER BY search_key_name
+	 ~;
+	 $sql = $select_sql.$where_clause; 
+   $sbeams->display_sql(sql=>$sql) if ($show_sql);
+
+  #### Define the hypertext links for columns that need them
+  %url_cols = (
+    	       'Identifier' => "$CGI_BASE_DIR/PeptideAtlas/\%$colnameidx{resource_url}V",
+	       'Search Key_OPTIONS' => {allow_wrap=>1},
+  );
+
+  #### Define the hidden columns
+  %hidden_cols = (
+    	       'search_key_type' => 1,
+#    	       'resource_type' => 1,
+    	       'resource_url' => 1,
+    	       'organism_id' => 1,
+             'organism_name' => 1,
+             'match_string' => 1
+  );
+  my $spacer = '&nbsp;' x 3;
+
+  my $reexec_url = "${base_url}?${param_string}";
+  my $url_base = $SERVER_BASE_DIR . $CGI_BASE_DIR;
+  my $reexec_key = $sbeams->setShortURL( $reexec_url );
+
+  #########################################################################
+  #### If QUERY or VIEWRESULTSET was selected, display the data
+  if ($apply_action =~ /(QUERY|GO|VIEWRESULTSET|DOWNLOAD)/) {
+
+    if ($apply_action =~ /DOWNLOAD/){
+      $sbeams->displayResultSet(
+        resultset_ref=>$resultset_ref,
+        query_parameters_ref=>\%parameters,
+        rs_params_ref=>\%rs_params,
+        url_cols_ref=>\%url_cols,
+        hidden_cols_ref=>\%hidden_cols,
+        max_widths=>\%max_widths,
+        column_titles_ref=>\@column_titles,
+        base_url=>$base_url,
+      )
+    } else {
+      #### Show the SQL that will be or was executed
+      my $start = [ Time::HiRes::gettimeofday( ) ];
+      # script code goes here
+      $sbeams->display_sql(sql=>$sql) if ($show_sql);
+      #### If the action contained QUERY, then fetch the results from
+      #### the database
+      my $n_fuzzy_results;
+      my $n_exact_results;
+      my %tmp_resultset = ();
+      my $tmp_resultset_ref = \%tmp_resultset;
+
+      if ($apply_action =~ /(QUERY|GO)/i) {
+				#### Fetch the results from the database server
+				$sbeams->fetchResultSet(
+					sql_query=>$sql,
+					resultset_ref=>$tmp_resultset_ref,
+				);
+				%exact_resultset = %$tmp_resultset_ref;
+				%resultset = %$tmp_resultset_ref;
+      }
+
+      if(defined $exact_resultset{data_ref}){
+				$n_exact_results = scalar(@{$exact_resultset{data_ref}});
+      } else {
+				$n_exact_results = 0;
+      }
+
+      #### If exactly one result came back, then redirect to the one hit
+      if  ($sbeams->output_mode() eq 'html') {
+        $buffer ="$buffer";
+        $buffer.= $pass_query_result if ($pass_query_result =~ /PASS\d+/);
+        $buffer .= $repository_query_result if ($repository_query_result =~ /PAe\d+/);
+				if ($n_exact_results == 1) {
+					print $q -> redirect("$url_base/PeptideAtlas/$exact_resultset{data_ref}->[0]->[$colnameidx{resource_url}]");
+					exit;
+
+        } elsif ($n_exact_results > 1) {
+
+          if ( ! $search_type_param{single_table} ) {
+            $sbeamsMOD->display_page_header(project_id =>$project_id,init_tooltip =>0,onload=>'sortables_init()');
+            print $buffer;
+            print "<BR>";
+            print "Exact search results: <BR>" if($n_exact_results > 1 && $rs_params{page_number} == 0);
+            displayTable(
+              column_array_ref=>\@column_array,
+              colnameidx_ref=>\%colnameidx,
+              column_titles_ref=>\@column_titles,
+              resultset_ref => \%exact_resultset,
+              build_type_selection => $build_type_selection,
+              parameter_ref => \%parameters,
+              rs_param_ref => \%rs_params,
+              url_cols_ref=> \%url_cols,
+              hidden_cols_ref=>\%hidden_cols,
+              max_width_ref=>\%max_widths,
+              search_key => $exact_search_key,
+              base_url  => $base_url
+            );
+
+	  } else {
+            $sbeamsMOD->display_page_header(project_id => $project_id);
+            print $buffer;
+            print "<BR>";
+          }
+        } 
+      }
+
+		my $print_warning_msg = 0;
+		if ($apply_action =~ /(QUERY|GO)/i){
+			if(! $parameters{exact_match}) {
+				pop @column_array;
+				push @column_array, ["match_string","'fuzzy_match'", "fuzzy_match"];
+				$columns_clause = $sbeams->build_SQL_columns_list(
+					column_array_ref=>\@column_array,
+					colnameidx_ref=>\%colnameidx,
+					column_titles_ref=>\@column_titles
+				);
+					my $search_key_clause = $exact_search_key;
+					$search_key_clause =~ s/\s+/.*/g;
+					my %search_key_ids =();
+					my $counter =0;
+					foreach my $build_id (split(",", $atlas_build_ids)){
+						my $file ="/regis/sbeams5/nobackup/builds_output/cache/search_keys_$build_id.txt";
+						if ( -e $file){
+							open (F, "<$file");
+              $search_key_clause =~ s/\|/\\|/g;
+							foreach my $line (grep(/$search_key_clause/i, <F>)){
+								chomp $line;
+								my ($key_id,$search_key_name) = split(/\t/, $line);
+								$search_key_ids{$key_id} =1;
+								$counter++;
+							}
+						}
+						if ($counter > 500){
+							$print_warning_msg = 1;
+							last;
+						}
+
+				 }
+					my $search_key_id_str =  join(",", keys %search_key_ids);
+
+				 if ($search_key_id_str){
+					$sql = qq~
+							$select_sql
+							WHERE 1 = 1
+								$search_types_clause
+								AND SKE.search_key_id in ($search_key_id_str)
+								AND SKL.atlas_build_id IN ( $atlas_build_ids )
+							ORDER BY search_key_name
+					~;
+					#$log->error($sql);
+					$sbeams->fetchResultSet(
+						sql_query=>$sql,
+					  resultset_ref=> \%fuzzy_resultset,
+					);
+				}
+			} else {
+				if ($n_exact_results == 0) {
+					if ($sbeams->output_mode() eq 'html') {
+						$sbeamsMOD->display_page_header(project_id => $project_id);
+						print "$buffer<BR>";
+						print "There were no matches in the index for your search string<BR>";
+					}
+					return(0);
+				}
+			}
+		}
+			
+      if(defined $fuzzy_resultset{data_ref}){
+				$n_fuzzy_results = scalar(@{$fuzzy_resultset{data_ref}});
+      } else {
+				$n_fuzzy_results = 0;
+      }
+
+      if ($apply_action =~ /(QUERY|GO)/i){
+				foreach my $row(@{$fuzzy_resultset{data_ref}}){
+					push @{$resultset{data_ref}}, $row;
+        }
+				undef %tmp_resultset;
+      }
+
+      #### If exactly one result came back, then redirect to the one hit
+      if ($sbeams->output_mode() eq 'html' and $n_exact_results == 0){
+				if ($n_fuzzy_results == 1){
+					#print "Status: 302 Resource Temporarily Moved\r\n";
+					#print "Location: $CGI_BASE_DIR/PeptideAtlas/".
+					#$fuzzy_resultset{data_ref}->[0]->[$colnameidx{resource_url}]."\n\n";
+					#my $newpage = "$url_base/PeptideAtlas/$fuzzy_resultset{data_ref}->[0]->[$colnameidx{resource_url}]";
+					#print 'Status: 302 Moved', "\r\n", 'Location: ', "$newpage\r\n\r\n";
+					print $q -> redirect("$url_base/PeptideAtlas/$fuzzy_resultset{data_ref}->[0]->[$colnameidx{resource_url}]");
+					exit;
+				}elsif( $n_fuzzy_results > 1){
+					if( ! $search_type_param{single_table} ){
+						$sbeamsMOD->display_page_header(project_id =>$project_id,init_tooltip =>0,onload=>'sortables_init()');
+						print $buffer;
+            print "<BR>";
+            print "<BR>Exact search results: None";
+					}else{
+						$sbeamsMOD->display_page_header(project_id => $project_id);
+						print $buffer;
+						print "<BR>";
+				 }
+				}else{
+					 $sbeamsMOD->display_page_header(project_id => $project_id);
+					 print "$buffer<BR>";
+					 print "There were no matches in the index for your search string<BR>";
+					 return(0);
+        }
+			}
+      if ($apply_action =~ /(QUERY|GO)/i) {
+        $rs_params{set_name} = "SETME";
+        #### Store the resultset and parameters to disk resultset cache
+        $sbeams->writeResultSet(
+             resultset_file_ref=>\$rs_params{set_name},
+             resultset_ref=>$resultset_ref,
+             query_parameters_ref=>\%parameters,
+             resultset_params_ref=>\%rs_params,
+             query_name=>"$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME",
+        );
+      }
+
+     if($sbeams->output_mode() eq 'html'){
+       if($search_type_param{single_table}){ 
+					$sbeams->displayResultSet(
+							resultset_ref=>$resultset_ref,
+							query_parameters_ref=>\%parameters,
+							rs_params_ref=>\%rs_params,
+							url_cols_ref=>\%url_cols,
+							hidden_cols_ref=>\%hidden_cols,
+							max_widths=>\%max_widths,
+							column_titles_ref=>\@column_titles,
+							base_url=>$base_url,
+					);
+          if(scalar(@{$resultset_ref->{data_ref}}) >= 500|| $print_warning_msg){
+           print "<BR><font color=\"red\"><b>There were too many matching results, please refine the search key.</b></font><BR><BR>\n";
+         }
+
+          $sbeams-> displayResultSetControls(
+              resultset_ref=> $resultset_ref,
+              query_parameters_ref=>\%parameters,
+              rs_params_ref=>\%rs_params,
+              base_url=>$base_url,
+          );
+
+			 }else{
+          if($n_fuzzy_results > 1){
+            print "<BR>Wild card search results: <BR>" ;
+						displayTable(
+								column_array_ref=>\@column_array,
+								colnameidx_ref=>\%colnameidx,
+								column_titles_ref=>\@column_titles,
+								resultset_ref => \%fuzzy_resultset,
+								build_type_selection => $build_type_selection,
+								parameter_ref => \%parameters,
+								rs_param_ref => \%rs_params,
+								url_cols_ref=> \%url_cols,
+								hidden_cols_ref=>\%hidden_cols,
+								max_width_ref=>\%max_widths,
+								search_key => $exact_search_key,
+								base_url  => $base_url
+						);
+					}
+         if(($n_fuzzy_results+ $n_exact_results) >= 500 || $print_warning_msg){
+           print "<BR><font color=\"red\"><b>There were too many matching results, please refine the search keys.</b></font><BR><BR>\n";
+         }
+          $sbeams-> displayResultSetControls(
+            resultset_ref=> $resultset_ref,
+            query_parameters_ref=>\%parameters,
+            rs_params_ref=>\%rs_params,
+            base_url=>$base_url,
+            row_count => $ROW_COUNT,
+            search_page => 1,
+         );
+       }
+   }elsif($sbeams->output_mode() eq 'xml' || $sbeams->output_mode() eq 'tsv'  || 
+          $sbeams->output_mode() eq 'excel'  || $sbeams->output_mode() eq 'csv' ){
+
+      $sbeams->displayResultSet(
+              resultset_ref=>$resultset_ref,
+              query_parameters_ref=>\%parameters,
+              rs_params_ref=>\%rs_params,
+              url_cols_ref=>\%url_cols,
+              hidden_cols_ref=>\%hidden_cols,
+              max_widths=>\%max_widths,
+              column_titles_ref=>\@column_titles,
+              base_url=>$base_url,
+      );
+   }
+
+  }
+		#### If QUERY was not selected, then tell the user to enter some parameters
+  } else {
+    if ($sbeams->invocation_mode() eq 'http') {
+      $sbeamsMOD->display_page_header(project_id => $project_id);
+      print $buffer;
+      print "<br><br><center>Click <b>[QUERY]</b> to execute the search</center><br>\n";
+    } else {
+      print "Set action=GO to execute the search\n";
+    }
+  }
+} # end handle_request
+
+
+#####################################################################################
+# query repositroy and pass_summary page 
+# not using cgi call to reduce memory usage
+#####################################################################################
+sub query_repository{
+  my %args = @_;
+  my $file = $args{file};
+  my $filterstr = $args{filterstr};
+  my ($date) = `date '+%F'`;
+  chomp($date);
+  my %selectedID=();
+  return '' if ($filterstr eq '');
+
+	$filterstr =~ s/^\s+//;
+	$filterstr =~ s/\s+$//;
+	$filterstr =~ s/[,;]//g;
+  $filterstr =~ s/\|/\\|/g;
+
+	my %tmp;
+	my @qts = split (/\s+/, $filterstr);
+	open (IN, "<$file");
+	my $first = 1;
+	my $str = '';
+	my $id = '';
+	my $releaseDate='';
+	#           "release" : {
+	#              "std" : {
+	#                 "month" : "12",
+	#                 "day" : "30",
+	#                 "year" : "2013"
+	#              }
+	#           },
+
+	while (my $l = <IN>){
+		if($l =~ /^\s{9}\{$/){
+			if($first){
+				$first = 0;
+			}else{
+				$str =~ s/[\{\}\[\]\s+]/ /g;
+				foreach my $q (@qts){
+				if($str =~ /$q/i){
+								$tmp{$id}++;
+				}
+			}
+		 }
+		 $str = '';
+		}elsif($l =~ /"id"\s+:\s+"(PASS\d{5})/ || $l =~ /"acc"\s+:\s+"(PAe\d{6})/){
+			$str .= $1;
+			$id = $1;
+		}else{
+			if ($l =~ /"release"/){
+		   	while ($l !~ /\}/){
+					$l = <IN>;
+					if ($l =~ /"month"\s+:"(\d+)/){
+						 $releaseDate = $1;
+					}elsif($l =~ /"day"\s+:"(\d+)/){
+						 $releaseDate = "$releaseDate-$1";
+					}elsif($l =~ /"year"\s+:"(\d+)/){
+						 $releaseDate = "$1-$$releaseDate";
+					}
+				 $l =~ s/"\w+"\s+://;
+				 $str .= $l;
+				}
+			}else{
+				$l =~ s/"\w+"\s+://;
+				$str .= $l;
+      }
+    }
+  }
+	foreach my $id (keys %tmp){
+		if($tmp{$id} == scalar @qts){
+      if ($date > $releaseDate and $file =~ /peptideatlas2/i){
+				$selectedID{$id} = 1;
+      }else{
+        $selectedID{$id} = 1;
+      }
+    }
+  }
+  return join(",", sort {$a cmp $b} keys %selectedID);
+}
+
+sub displayTable{
+  my %args = @_;
+  my $resultset_ref = $args{resultset_ref};
+  my $column_array_ref = $args{column_array_ref};
+  my $colnameidx_ref = $args{colnameidx_ref};
+  my $column_titles_ref = $args{column_titles_ref};
+  my $build_type_selection = $args{build_type_selection};
+  my $parameter_ref = $args{parameter_ref};
+  my $rs_param_ref = $args{rs_param_ref};
+  my $url_cols_ref = $args{url_cols_ref};
+  my $hidden_cols_ref = $args{hidden_cols_ref};
+  my $max_width_ref = $args{max_width_ref};
+  my $base_url = $args{base_url};
+  my $ini_search_key = $args{search_key};
+  my $spacer = $sbeams->getGifSpacer(100);
+   
+  my %filtered_result = ();
+  ### one search key may have several search key type, we only keep one
+  my %Distinct_SearchResult = ();
+  ### keep the recored of maxium number of matched for row entry..
+  my %max_n_matches = ();
+
+  my $page_size = $rs_param_ref->{page_size} || 50;
+  my $page_number = $rs_param_ref->{page_number} || 0;
+
+  my @searchKeys = split(/\s+/, $ini_search_key);
+  my $firstKey = $searchKeys[0];
+  my $lastKey;
+  if(scalar @searchKeys == 1){
+    $lastKey = '';
+  }
+  else{
+    $lastKey = $searchKeys[scalar @searchKeys -1];
+  }
+   
+  for my $row ( @{$resultset_ref->{data_ref}} ) {
+    my $search_key = uc($row->[0]);
+    my $build_type = $row->[1];
+    my $rescource_name = $row->[2];
+    my $organism_name = $row->[7];
+    my $resource_n_matches = $row->[4];
+    my $resource_type = 'Protein';
+    if ($row->[8] =~ /sumed/){
+      $row->[8] =~ s/sumed/sumed by/;
+    }elsif($row->[8] =~ /identical/){
+      $row->[8] =~ s/identical/identical to/;
+    }elsif($row->[8] =~ /indistinguishable/){
+      $row->[8] =~ s/indistinguishable/indistinguishable from/;
+    }
+    next if($rescource_name =~ /NO_ENS/);
+    $resource_type = 'Peptide' if($row->[3] eq 'PeptideAtlas peptide');
+
+    if($max_n_matches{$resource_type}{$search_key}{$organism_name}{n_obs} < $resource_n_matches){
+      $max_n_matches{$resource_type}{$search_key}{$organism_name}{n_obs} = $resource_n_matches;
+    }
+    push @{$max_n_matches{$resource_type}{$search_key}{$organism_name}{data}}, $row;
+    #if(not defined $Distinct_SearchResult{$search_key}{$organism_name}{$build_type}{$rescource_name}){
+    #   if($search_key =~ /(\s+|^|_|-)$ini_search_key(_|-|\s+|$)/i){
+    #    	push @{$filtered_result{$resource_type}{highpriority}{$search_key}{$organism_name}},$row;
+    #   }else{
+    #     push @{$filtered_result{$resource_type}{lowpriority}{$search_key}{$organism_name}} , $row;
+    #   }
+    #}
+    $Distinct_SearchResult{$search_key}{$organism_name}{$build_type}{$rescource_name} = 1;
+  }
+
+  ### count number of result rows, auto expand when result row <= 2 
+  my $n_result_rows = 0;
+  my $pre_resource_type = '';
+  my $visible = 0;
+  #foreach my $resource_type (sort {$b cmp $a} keys %filtered_result){
+  #  foreach my $order (qw(highpriority lowpriority)){
+  #    foreach my $search_key (keys%{$filtered_result{$resource_type}{$order}}){
+  #      foreach my $organism_name(keys%{$filtered_result{$resource_type}{$order}{$search_key}}){
+  #        $n_result_rows++;
+  #      }
+  #    }
+  #  }
+  #}
+  foreach my $resource_type(keys %max_n_matches){
+    foreach my $search_key ( keys %{$max_n_matches{$resource_type}}){
+      foreach my $organism_name(keys %{$max_n_matches{$resource_type}{$search_key}}){
+	my $n_obs = 0;
+	$n_obs = $max_n_matches{$resource_type}{$search_key}{$organism_name}{n_obs};
+	if($search_key =~ /(\s+|^|_|-)$ini_search_key(_|-|\s+|$)/i){
+	  push @{$filtered_result{$organism_name}{$n_obs}{highpriority}{$search_key}{$resource_type}}, 
+	  @{$max_n_matches{$resource_type}{$search_key}{$organism_name}{data}};
+	}else{
+	  push @{$filtered_result{$organism_name}{$n_obs}{lowpriority}{$search_key}{$resource_type}},
+	  @{$max_n_matches{$resource_type}{$search_key}{$organism_name}{data}};
+	}
+	$n_result_rows++;
+      }
+    }
+  }
+
+  if( $parameter_ref->{open_all} || $n_result_rows <= 2 ){
+    $visible =1;
+  }
+
+  my $pre_resource_type = '';
+
+  foreach my $organism_name (sort {$a cmp $b} keys %filtered_result){
+    foreach my $n_obs (sort {$b <=> $a} keys %{$filtered_result{$organism_name}}){
+      foreach my $order (qw(highpriority lowpriority)){
+	foreach my $search_key (sort {$a cmp $b} keys %{$filtered_result{$organism_name}{$n_obs}{$order}}){
+	  foreach my $resource_type (sort {$a cmp $b} keys %{$filtered_result{$organism_name}{$n_obs}{$order}{$search_key}}){ 
+	    if( $ROW_COUNT >= $page_size*$page_number && $ROW_COUNT < $page_size*($page_number+1)){
+	      $resultset_ref->{data_ref} = \@{$filtered_result{$organism_name}{$n_obs}{$order}{$search_key}{$resource_type}};      
+	      my %resource_names = ();
+	      my $n_resource_name = 1 ;
+	      my $n_builds = scalar keys %{$Distinct_SearchResult{$search_key}{$organism_name}};
+	      my $download_link = '';
+	      my $str = '';
+	      my $str_build = '';
+	      my $search_key_org = $search_key;
+	      next if($n_builds == 0);
+	      if($n_builds > 1){
+		$str_build = 's';
+	      }
+	      foreach my $build( keys %{$Distinct_SearchResult{$search_key}{$organism_name}}){
+		foreach my $id (keys %{$Distinct_SearchResult{$search_key}{$organism_name}{$build}}){
+		  $resource_names{$id} = 1;
+		}
+	      }
+	      $n_resource_name = scalar keys %resource_names;
+
+	      if($n_resource_name > 1){
+		$str = 's';
+	      }
+
+	      if ( $build_type_selection->{atlas_build_ids} =~ /^\d+$/ ) {
+		my @identifiers;
+		for my $row ( @{$resultset_ref->{data_ref}} ) {
+		  push @identifiers, $row->[$colnameidx_ref->{resource_name}];
+		} 
+		my $id_string = join( '%3B', @identifiers );
+
+		$id_string =~ s/\s//g;
+		my $prot_link = qq ~<A HREF="GetProteins?atlas_build_id=$build_type_selection->{atlas_build_ids};
+				    biosequence_name_constraint=$id_string;QUERY_NAME=AT_GetProteins;action=QUERY"> link</A> ~;
+		my $pep_link = $prot_link;
+		$pep_link =~ s/GetProteins/GetPeptides/g;
+
+		$download_link = qq~
+				  $spacer You can download more information about the proteins via this $prot_link. <BR>
+				  $spacer Or information about all observed peptides for the proteins via this $pep_link.
+				    ~;
+	      }
+	      if ( $sbeams->output_mode() eq 'html') {
+		my ( $tr, $link ) = $sbeams->make_table_toggle( name => $table_name,
+								visible => $visible,
+								tooltip => 'Show/Hide Section',
+								imglink => 0,
+								sticky => 0 );
+		my $pre_str='';
+		my $aft_str='';
+		my $str1 = '';
+		my $str2 = '';
+		my $search_key_str = '';
+		my $pattern = "$firstKey.*$lastKey";
+		if($lastKey eq ''){
+		  $pattern = $firstKey;
+		}
+
+		$search_key =~ /(.*)($pattern)(.*)/i;
+		$search_key_str = $2;
+		$search_key_str =~ s/([\[\]\(\)])/\\$1/g;
+
+		if(length($search_key) > 80){
+		  if(length($2) > 80){
+		    if($1){$pre_str = '...';}
+		    if($3){$aft_str = '...';}
+		  }
+		  else{   
+		    my $len = int((80 - length($2))/2);
+		    if(length($1) > $len){
+		      $pre_str = '...';
+		      $search_key =~ s/.+\s+(\S*.{$len}$search_key_str.*)/$1/i;
+		    }
+		    if(length($3) > $len){
+		      $aft_str = '...';
+		      $search_key =~ s/(.*$search_key_str.{$len}\S*)\s+.+/$1/i;
+		    }
+		  }
+		}
+		if(length($search_key_str) > 80){
+		  my $len = 80 - length($firstKey) - length($lastKey);
+		  $search_key_str =~ s/^$firstKey(.{$len}).*$lastKey$/$firstKey$1...$lastKey/i;
+		}else{
+		  $search_key =~ /(.*)$search_key_str(.*)/i;
+		  #if($1 ne ''){ $str1 = qq~<font style="BACKGROUND-COLOR: FFFF99">$1</font>~;}
+		  #if($2 ne ''){ $str2 = qq~<font style="BACKGROUND-COLOR: FFFF99">$2</font>~;}
+		  if($1){ $str1 = $1;}
+		  if($2){ $str2 = $2;}
+		}
+		my $patt = join("|", @searchKeys);
+		#foreach (@searchKeys){
+		$search_key_str =~ s/\\//g;
+		$search_key_str =~s/($patt)/<font style="BACKGROUND-COLOR: CCCCCC">$1<\/font>/ig;
+		#}
+		$search_key_str =~ s/(<font.+<\/font>)(.+)<font/$1<font style="BACKGROUND-COLOR: FFFF99">$2<\/font><font/g;
+		if($n_resource_name == 1){
+		  $search_key_str = qq~<A HREF="$CGI_BASE_DIR/PeptideAtlas/$resultset_ref->{data_ref}->[0]->[$colnameidx_ref->{resource_url}]">$pre_str$str1$search_key_str$str2$aft_str</A>~;
+		}
+		else{
+		  $search_key_str = qq~$pre_str$str1$search_key_str$str2$aft_str~;
+		}
+
+		my $text = qq~$organism_name: $search_key_str - find <B>$n_resource_name</B> identifier$str in <B>$n_builds</B> build$str_build ~;
+		if( $n_obs >= 1){ 
+		  $text .= qq~, observed <= <B>$n_obs</B> times ~;
+		}else{
+		  $text .=  qq~, observed <B>0</B> time~;
+		}
+
+		my $buffer = qq~<TR><TD colspan="1" >$link $text</TD></TR>~;
+
+		print "$resource_type hits<BR>" if($pre_resource_type ne $resource_type);
+		$pre_resource_type = $resource_type;
+		print qq~ \n<TABLE style="padding-left: 1.5em;" >$buffer</TABLE><TABLE style="padding-left: 1.5em;"><TR $tr><TD>~;
+		#### Display the resultset
+		$sbeams->displayResultSet(
+		  resultset_ref=>$resultset_ref,
+		  query_parameters_ref=> $parameter_ref,
+		  url_cols_ref=> $url_cols_ref,
+		  hidden_cols_ref=> $hidden_cols_ref,
+		  max_widths=> $max_width_ref,
+		  column_titles_ref=> $column_titles_ref,
+		  sortable  => 1,
+		    );
+		print "</TD></TR></TABLE>\n";
+		$table_name++; 
+	      }
+	    }#check row_count
+	    $ROW_COUNT++;
+	  }
+	}
+      }
+    }
+  }
+} # end displayTable
+
+sub throw_error {
+  my %args = @_;
+  for my $arg ( qw(project error) ) {
+    die ( "must provide $arg" ) unless $args{$arg};
+  }
+  $args{buffer} ||= '';
+
+
+  if ($sbeams->output_mode() eq 'html') {
+    $sbeams->set_page_message( type => 'Error', msg => $args{error} );
+    $sbeamsMOD->display_page_header(project_id => $args{project});
+    print $args{buffer};
+    $sbeamsMOD->display_page_footer();
+  } else {
+    $sbeams->reportException( state => 'ERROR',
+          type => 'INSUFFICIENT CONSTRAINTS',
+          message => $args{error},
+      );
+  }
+  exit;
+}
+
+###############################################################################
+
+###############################################################################
+# getBuildTypeSelection
+###############################################################################
+sub getBuildTypeSelection {
+  my $SUB_NAME = 'getBuildTypeSelection';
+  my %args = @_;
+
+  #### Decode the argument list
+  my $organism_name = $args{'organism_name'};
+  my $build_type_name = $args{'build_type_name'};
+
+
+  #### If no organism was supplied, see if it was cached for this session
+  unless ($organism_name) {
+    $organism_name = $sbeams->getSessionAttribute(
+      key => 'PeptideAtlas_organism_name',
+    );
+  }
+
+  #### If no build_type_name was supplied, see if it's cached for this session
+  unless ($build_type_name) {
+    $build_type_name = $sbeams->getSessionAttribute(
+      key => 'PeptideAtlas_build_type_name',
+    );
+  }
+
+  #### Or default to Any
+  unless ($build_type_name) {
+    $build_type_name = $organism_name || 'Human';
+  }
+
+
+  #### Get a list of accessible project_ids
+  my @accessible_project_ids = $sbeams->getAccessibleProjects();
+  my $accessible_project_ids = join( ",", @accessible_project_ids ) || '0';
+
+  #### Get a hash of available organisms via atlas builds
+  my $sql = qq~
+      SELECT DISTINCT DAB.atlas_build_id,O.organism_name,DAB.organism_specialized_build
+        FROM $TBAT_ATLAS_BUILD AB
+        JOIN $TBAT_DEFAULT_ATLAS_BUILD DAB
+             ON (AB.atlas_build_id = DAB.atlas_build_id)
+        JOIN $TBAT_BIOSEQUENCE_SET BS
+             ON (BS.biosequence_set_id = AB.biosequence_set_id)
+        JOIN $TB_ORGANISM O ON (O.organism_id = BS.organism_id)
+       WHERE AB.project_id IN ( $accessible_project_ids )
+         AND AB.record_status!='D'
+         AND DAB.record_status!='D'
+       ORDER BY organism_name,DAB.organism_specialized_build
+  ~;
+  #print "Content-type: text/html\n\n<PRE>$sql</PRE>\n";
+  my @build_types = $sbeams->selectSeveralColumns($sql);
+
+  #my @options = ('Any');
+  #my %options = ('Any'=>'Any');
+  my @options = ();
+  my %options = ();
+  my %atlas_build_ids;
+
+  #### Build the list of available organisms
+  foreach my $build_type ( @build_types ) {
+    my $build_type_name = $build_type->[2] || $build_type->[1];
+    push(@options,$build_type_name);
+    $options{$build_type_name} = $build_type_name;
+    $atlas_build_ids{$build_type_name} = $build_type->[0];
+  }
+
+
+  #### Build the option list HTML
+  my $optionlist = '';
+  my $matched_parameter = 0;
+  foreach my $key ( @options ) {
+    my $flag = '';
+    if ($key eq $build_type_name) {
+      $flag = 'SELECTED';
+      $matched_parameter++;
+    }
+    $optionlist .= "<OPTION VALUE=\"$key\" $flag>$options{$key}</OPTION>\n";
+  };
+
+
+  #### Also make sure the user selected a valid option
+  unless ($matched_parameter) {
+    $build_type_name = 'Human';
+  }
+
+
+  #### Get the atlas_build_ids
+  my $atlas_build_ids = $atlas_build_ids{$build_type_name};
+  if ($build_type_name eq 'Any') {
+    $atlas_build_ids = join(",",values(%atlas_build_ids));
+  }
+
+  #### Build a data structure to return
+  my %tmp = (
+    HTML_optionlist => $optionlist,
+    build_type_name => $build_type_name,
+    atlas_build_ids => $atlas_build_ids,
+  );
+
+  #### Store the selected organism_name in the session cache
+  if ($build_type_name) {
+    $sbeams->setSessionAttribute(
+      key => 'PeptideAtlas_build_type_name',
+      value => $build_type_name,
+    );
+  }
+
+  return \%tmp;
+
+} # end getBuildTypeSelection
+
+sub getSearchTypeClause {
+  my %args = @_;
+  for my $param ( keys( %{$args{params}} ) ) {
+    $log->debug( "$param -> $args{params}->{$param}" );
+  }
+  my $clause = '';
+  $search_type_param{all_fields} = 'checked';
+
+  if ( $args{params}->{single_table} ){
+    $search_type_param{single_table} = 'checked';
+  }
+
+  if ( $args{params}->{exact_match} ){
+    $search_type_param{exact_match} = 'checked';
+  }
+
+  # Short circuit if'n all was specified
+  return $clause if $args{params}->{all_fields} eq 'on';
+
+  # conjuntion?
+  my $conj = '';
+
+  if ( $args{params}->{gene_name} eq 'on'  ) {
+    $search_type_param{gene_name} = 'checked';
+    $clause .= " $conj search_key_type LIKE '%NAME%'\n";
+    $conj = ' OR ';
+  }
+  if ( $args{params}->{gene_id} eq 'on'  ) {
+    $search_type_param{gene_id} = 'checked';
+    $clause .= " $conj search_key_type LIKE '%ID%'\n";
+    $conj = ' OR ';
+  }
+    
+  if ( $args{params}->{sequence} eq 'on'  ) {
+    $search_type_param{sequence} = 'checked';
+    $clause .= " $conj search_key_type = 'peptide sequence'\n";
+    $conj = ' OR ';
+  }
+  if ( $args{params}->{refseq} eq 'on'  ) {
+    $search_type_param{refseq} = 'checked';
+    $clause .= " $conj search_key_type LIKE 'REFSEQ%'\n";
+    $conj = ' OR ';
+  }
+  if ( $args{params}->{accession} eq 'on'  ) {
+    $search_type_param{accession} = 'checked';
+    $clause .= " $conj search_key_type IN ('Protein Accession','Protein name', 'Accession', 'gi Accession',
+     'VEGA', 'HINV', 'IPI','WormProt',
+     'RefSeq', 'SGD ID','UniGene', 
+     'UniProt', 'UniProt ID', 'UniProt Name','UniProt/TrEMBL', 'UniProtKB','TrEMBL','UniProt/Swiss-Prot',
+     'Swiss-Prot','SwissProt') ";
+    $conj = ' OR ';
+  }
+  if ( $args{params}->{pa_accession} eq 'on'  ) {
+    $search_type_param{pa_accession} = 'checked';
+    $clause .= " $conj search_key_type = 'PeptideAtlas'\n";
+    $conj = ' OR ';
+  }
+  if ( $args{params}->{gene_symbol} eq 'on'  ) {
+    $search_type_param{gene_symbol} = 'checked';
+    $clause .= " $conj search_key_type LIKE '%symbol'\n";
+    $conj = ' OR ';
+  }
+  if ( $clause && $clause =~/\S/ ) {
+    $search_type_param{all_fields} = '';
+    $clause = " AND ( $clause ) ";
+  }
+  return $clause;
+}
+
+# http://db.systemsbiology.net/devDC/sbeams/cgi/PeptideAtlas/Search2?search_key=yal%25&action=GO&build_type_name=Any
+# &all_fields=on
+# &gene_name=on
+# &gene_id=on
+# &gene_symbol=on
+# &accession=on
+# &refseq=on
+# &sequence=on
+# &pa_accession=on
+#
+# Alias                  
+# COG                    
+# combined               
+# Common Name            
+# Description            
+# Ensembl Protein        
+# Entrez Gene Symbol     
+# Entrez GeneID          
+# Full Name              
+# full_name              
+# Functional Description 
+# Functional_Note        
+# Gene ID                
+# Gene name              
+# gene_name              
+# gi Accession           
+# HINV                   
+# IPI                    
+# Old ORF Name           
+# ORF Name               
+# ORF qualifier          
+# ORF_name               
+# peptide sequence       
+# PeptideAtlas           
+# Protein name           
+# RefSeq                 
+# REFSEQ_INFERRED        
+# REFSEQ_MODEL           
+# REFSEQ_PREDICTED       
+# REFSEQ_PROVISIONAL     
+# REFSEQ_REVIEWED        
+# REFSEQ_VALIDATED       
+# SGD ID                 
+# TrEMBL                 
+# UniGene                
+# UniProt                
+# UniProt ID             
+# UniProt Name           
+# UniProt Symbol         
+# UniProt/TrEMBL         
+# UniProtKB              
+# VEGA   
+#
+#
+sub getSearchKeyTypeHTML {
+  my $spacer = $sbeams->getGifSpacer(300);
+  my $content = qq~
+  <SCRIPT  TYPE="text/javascript">
+   document.title = "PeptideAtlas: Search";
+						
+  function toggle_boxes(type) {
+    var fields = new Array();
+    if ( type == "specific" ) {
+      fields[0] = "gene_name";
+      fields[1] = "gene_id";
+      fields[2] = "gene_symbol";
+      fields[3] = "accession";
+      fields[4] = "refseq";
+      fields[5] = "sequence";
+      fields[6] = "pa_accession";
+    }else {
+      fields[0] = "all_fields";
+    }
+//    alert( "array fields has " + fields.length + " elements" );
+    for (var i=0; i< fields.length; i++) {
+      var box = document.getElementsByName(fields[i]);
+      box[0].checked = false;
+    }
+  }
+   var state = new Array;
+   function toggle_radiobutton(button) {
+    if (state[button.name] && state[button.name] == button.value) {
+        button.checked = false;
+        state[button.name] = '';
+    }
+    else {
+      button.checked = true;
+     state[button.name] = button.value;
+    }
+     return true;
+  } 
+     function make_sticky_tbl_toggle( obj_name, appearance ) {
+      var cookie = document.cookie;
+      var regex = new RegExp( "SBEAMSui=([^;]+)" );
+      var match = regex.exec( cookie + ";" );
+      var newval = obj_name + "&" + appearance;
+      var cookie = "";
+      if ( match ) {
+        cookie = match[0] + "&" + newval;
+      } else {
+        cookie = "SBEAMSui=" + newval;
+      }
+      document.cookie = cookie;
+    }
+    function toggle_tbl(obj_name) {
+      // Grab page elements by their IDs
+      var gif_file = obj_name + "_gif";
+      var tgif = document.getElementById(gif_file);
+
+      if ( tgif ) {
+        var src = tgif.src;
+        if ( src.match(/small_gray_minus.gif/) ) {
+          tgif.src =  '/devZS/sbeams/images/small_gray_plus.gif'
+        } else {
+          tgif.src =  '/devZS/sbeams/images/small_gray_minus.gif'
+        }
+       }
+      var tbl_obj = document.getElementsByName( obj_name );
+      for (var i=0; i < tbl_obj.length; i++) {
+        var current_state = tbl_obj[i].className;
+        var new_state = 'none';
+        if ( current_state == 'tbl_hidden' ) {
+          new_state = 'tbl_visible';
+        } else if (  current_state == 'tbl_visible' ) {
+          new_state = 'tbl_hidden';
+        }
+        tbl_obj[i].className = new_state;
+      }
+            // Set cookie?
+      make_sticky_tbl_toggle( obj_name, new_state );
+    }
+ 
+  </SCRIPT>
+
+  <TABLE class=info_box>
+  <TR>
+  <TD ALIGN=RIGHT><INPUT TYPE=checkbox ID="all" $search_type_param{all_fields} NAME=all_fields ONCHANGE=toggle_boxes('specific')></INPUT></TD>
+  <TD>All</TD>
+  </TR>
+
+  <TR>
+  <TD ALIGN=RIGHT><INPUT ID="specific" TYPE=checkbox NAME=gene_name $search_type_param{gene_name} ONCHANGE=toggle_boxes('all')></INPUT></TD>
+  <TD>Protein/Gene Name</TD>
+  </TR>
+
+  <TR>
+  <TD ALIGN=RIGHT><INPUT ID="specific" TYPE=checkbox NAME=gene_id $search_type_param{gene_id} ONCHANGE=toggle_boxes('all')></INPUT></TD>
+  <TD>Protein/Gene ID</TD>
+  </TR>
+
+  <TR>
+  <TD ALIGN=RIGHT><INPUT ID="specific" TYPE=checkbox NAME=gene_symbol $search_type_param{gene_symbol} ONCHANGE=toggle_boxes('all')></INPUT></TD>
+  <TD>Protein/Gene Symbol</TD>
+  </TR>
+
+  <TR>
+  <TD ALIGN=RIGHT><INPUT ID="specific" TYPE=checkbox NAME=accession  $search_type_param{accession} ONCHANGE=toggle_boxes('all')></INPUT></TD>
+  <TD>Accession</TD>
+  </TR>
+
+  <TR>
+  <TD ALIGN=RIGHT><INPUT ID="specific" TYPE=checkbox NAME=refseq $search_type_param{refseq} ONCHANGE=toggle_boxes('all')></INPUT></TD>
+  <TD>Refseq</TD>
+  </TR>
+
+  <TR>
+  <TD ALIGN=RIGHT><INPUT ID="specific" TYPE=checkbox NAME=sequence $search_type_param{sequence} ONCHANGE=toggle_boxes('all')></INPUT></TD>
+  <TD>Sequence</TD>
+  </TR>
+
+  <TR>
+  <TD ALIGN=RIGHT><INPUT ID="specific" TYPE=checkbox $search_type_param{pa_accession} NAME=pa_accession></INPUT></TD>
+  <TD>Peptide Accession</TD>
+  </TR>
+  </TABLE>
+  ~; 
+  my $toggle = $sbeams->make_toggle_section( textlink => 1,
+                                             showtext => "Advanced Search",
+                                             hidetext => "Basic Search", 
+                                               sticky => 1,
+                                               name   => 'PA_search_key_options',
+                                              imglink => 1,
+                                              visible => 0,
+                                              content => $content );
+
+  return "$toggle";
+}

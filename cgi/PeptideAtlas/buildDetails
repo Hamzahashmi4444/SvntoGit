@@ -1,0 +1,1742 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# $Id$
+#
+# SBEAMS is Copyright (C) 2000-2021 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+###############################################################################
+
+
+###############################################################################
+# Get the script set up with everything it will need
+###############################################################################
+use strict;
+#use vars qw ($sbeams);
+
+use lib "../../lib/perl";
+
+#use CGI::Carp qw(fatalsToBrowser croak);
+use vars qw($PROGRAM_FILE_NAME);
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::DataTable;
+use SBEAMS::Connection::GoogleVisualization;
+use SBEAMS::Connection::TabMenu;
+
+use SBEAMS::Proteomics;
+use SBEAMS::Proteomics::Tables;
+
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::PeptideAtlas::Utilities;
+
+
+###############################################################################
+# Global Variables
+###############################################################################
+my $sbeams = new SBEAMS::Connection;
+$sbeams->setSBEAMS_SUBDIR($SBEAMS_SUBDIR);
+my $atlas = new SBEAMS::PeptideAtlas;
+$atlas->setSBEAMS($sbeams);
+
+# Read input parameters
+my $params = process_params();
+$|++;
+
+our $organism;
+our $organism_id;
+
+my $show_image = 0;
+
+{ # Main
+    # Authenticate or exit
+    my $username = $sbeams->Authenticate( permitted_work_groups_ref => 
+                                                      ['PeptideAtlas_user',
+                                                      'PeptideAtlas_admin', 
+                                                      'PeptideAtlas_readonly', 'PeptideAtlas_exec'],
+                                                      # connect_read_only=>1,
+                                                      allow_anonymous_access=>1,
+                                              ) || exit;
+
+
+    ## get current settings
+    my $project_id = $sbeams->getCurrent_project_id();
+
+    my $build_help = get_table_help( table => 'build' );
+    my %resultset = ();
+    my $resultset_ref = \%resultset;
+    my $section = $params->{section} || '';
+
+    my $page = $sbeams->getGifSpacer( 700 ) . "<BR>\n";
+  #### Get the HTML to display the tabs
+    my $tabMenu = $atlas->getTabMenu(
+      parameters_ref => $params,
+      program_name => 'buildDetails',
+    );
+#		my $back = $sbeams->getBackForm();
+    $page .=<<"    END";
+		$tabMenu
+    <P>
+    <!--This shows some information about the currently selected build.
+    You can view the details of other builds by selecting an 
+    item in the list below.  Although this will change build whose statistics 
+    are to be displayed, it will not change your currently selected build.-->
+    </P>
+    $build_help
+    END
+
+    # We are not forcing the user into the new build - is that correct?
+    my $build_id = $params->{atlas_build_id} || $atlas->getCurrentAtlasBuildID(parameters_ref => $params);
+    my $build_path = get_build_path( build_id => $build_id );
+
+    if ( !grep /^$build_id$/, $atlas->getAccessibleBuilds() ) {
+#      die( "Access to specified build is not allowed" );
+       $atlas->display_page_header(init_tooltip => 1);
+       $build_id = $atlas->getCurrentAtlasBuildID(parameters_ref => $params);
+		   $atlas->display_page_footer();
+       exit;
+    }
+    $organism = $atlas->getCurrentAtlasOrganism (parameters_ref => $params);
+    $organism_id = $atlas->getCurrentAtlasOrganism (parameters_ref => $params, type =>'organism_id');
+    my $valid_build = 1;
+
+    if (! $params->{caching} && ! $section){
+      my $page_url = 'http';
+      if ($ENV{HTTPS} = "on") {
+				$page_url .= "s";
+      }
+      $page_url .= "://$ENV{SERVER_NAME}$ENV{REQUEST_URI}";
+      #my $url_mdsum = md5_hex( $page_url ); 
+      $page_url =~ /(atlas_build_id=\d+)/;
+      my $html_cache_name = $1; 
+      my $html_cache_loc  = '';
+      if ($PHYSICAL_BASE_DIR !~ /dev\w+\/sbeams/){
+				$html_cache_loc = "/net/dblocal/www/html/sbeamscommon/htmlcache/buildDetails";
+      }else{
+				$html_cache_loc = "$PHYSICAL_BASE_DIR/htmlcache/buildDetails";
+      }
+
+      if ( -e "$html_cache_loc/$html_cache_name"){
+				if (open (IN,"<$html_cache_loc/$html_cache_name")){
+					print "Content-type: text/html\n\n";
+					print $_ while (<IN>);
+					close IN; 
+					exit;
+				}
+      }
+    }
+
+    # Add general section 
+    my $n_canonical_protein;
+    my ( $header );
+    if (! $section ){
+      $atlas->display_page_header( init_tooltip => 1, 
+                                   header_info => $header, 
+                                   project_id => $project_id, 
+                                   onload => 'sortables_init()', 
+                                   sortable => 1 );
+
+			if (-e "$build_path/analysis/build_detail_tables.tsv") {
+         print "$page";
+
+				 generate_html_from_file (file => "$build_path/analysis/build_detail_tables.tsv",
+                                  build_id => $build_id,
+                                  build_path => $build_path);
+				 exit; 
+			}
+
+      my $build_overview_html;
+      ($n_canonical_protein, $build_overview_html) = get_build_overview ( $build_id );
+      print $build_overview_html;
+    }
+    if (! $section || $section =~ /what.*new/i){
+      my $what_is_new = fetchResultset(atlas_build_id => $build_id,
+				       rs_table => 'buildDetail-new',
+				       params => $params,
+				       resultset_ref => $resultset_ref,
+				       module_ref => sub{ $atlas->get_what_is_new(@_)});
+      print "<BR>\n$what_is_new\n" if($what_is_new);
+      
+    }
+    if (! $section || $section =~ /ProteomeCoverage/i){
+      my $proteome_cover = '';
+      my $ptm_coverage = '';
+      my $proteomeComponentOrder_file = "$PHYSICAL_BASE_DIR/lib/conf/PeptideAtlas/ProteomeComponentOrder.txt";
+      my @patterns =();
+      if (open (O, "<$proteomeComponentOrder_file")){
+         while (my $line = <O>){
+           chomp $line;
+           next if ($line =~ /^#/ ||  $line =~ /^$/);
+           my ($org_id, $str) = split(/,/, $line);
+           if ($org_id == $organism_id){
+              push @patterns,$line;
+           }
+         }
+      }
+       if (@patterns){
+           $proteome_cover = fetchResultset(atlas_build_id => $build_id,
+                                         rs_table => 'buildDetail-ProteomeCoverage',
+                                         params => $params,
+                                         resultset_ref => $resultset_ref,
+                                         module_ref => sub{$atlas->get_proteome_coverage_new( $build_id, \@patterns)});
+          $ptm_coverage = fetchResultset(atlas_build_id => $build_id,
+                                         rs_table => 'buildDetail-ptmCoverage',
+                                         params => $params,
+                                         resultset_ref => $resultset_ref,
+                                         module_ref => sub{$atlas->get_proteome_coverage_new( $build_id, \@patterns)});
+        
+       }else{
+           $proteome_cover = fetchResultset(atlas_build_id => $build_id,
+                                         rs_table => 'buildDetail-ProteomeCoverage',
+                                         params => $params,
+                                         resultset_ref => $resultset_ref,
+                                         module_ref => sub{$atlas->get_proteome_coverage(@_)});
+       }
+      
+      if($proteome_cover){
+				print "$proteome_cover<BR>\n";
+      }
+      if ($ptm_coverage){
+        print "$proteome_cover<BR>\n";
+      }
+    }
+    my ( $sample_table, $sample_array_ref ,$column_name_ref ) = get_sample_info( $build_id );
+    my ($dataset_contri_table) = get_dataset_contrib_info($build_id);
+
+    if (! $section || $section =~ /SampleContribution/i){
+      if ($params->{output_mode} =~ /tsv/i && $section){
+        $atlas->print_html_table_to_tsv( data_ref => $sample_array_ref,
+                                         column_name_ref => $column_name_ref,
+                                         filename=>'SampleContribution.tsv'); 
+      }else{
+			  print "$sample_table\n";
+				print "$dataset_contri_table\n"; 
+      }
+    }
+    
+    if (! $section){
+      $page = get_dataset_protein_info( build_id => $build_id);
+      print "$page";
+      $page = get_dataset_spec_protein_info( build_id => $build_id);
+      print "$page";
+      my $mayu_data_path = "$build_path/analysis/Mayu_out.csv";
+      if ( -e $mayu_data_path ) {
+				$page = get_mayu_info( $mayu_data_path );
+				print $page;
+      }
+      #  print STDERR 'showtime ' . time() . "\n";
+      # Add peptide stats section
+      # Add graphic
+      if ( $show_image ) {
+				my $plots = get_build_plots ( build_id => $build_id, 
+				      sample_array_ref => $sample_array_ref, 
+				      column_name_ref => $column_name_ref); 
+				print $plots;
+      }
+      my $charge_length_data_path = "$build_path/analysis/peptide_length-charge_dist.tsv";
+      if (-e $charge_length_data_path){
+				$page = get_peptide_length_charge_distribution(data_path=>$charge_length_data_path);
+        print $page;
+      }
+
+      if ($organism =~ /(human|Arabidopsis)/i){ 
+				my $sql = qq~
+				SELECT SC.name as NAME,
+							 SC.ID, 
+				       COUNT (DISTINCT PI.PEPTIDE_ID) AS CNT
+				FROM $TBAT_PEPTIDE_INSTANCE PI
+				JOIN $TBAT_PEPTIDE_INSTANCE_SAMPLE PIS ON ( PIS.PEPTIDE_INSTANCE_ID = PI.PEPTIDE_INSTANCE_ID )
+				JOIN $TBAT_SAMPLE S  ON (PIS.SAMPLE_ID = S.SAMPLE_ID)
+				JOIN $TBAT_SAMPLE_CATEGORY SC ON (S.SAMPLE_CATEGORY_ID = SC.ID) 
+				WHERE 1=1
+				AND PI.ATLAS_BUILD_ID = $build_id 
+				GROUP BY SC.NAME,SC.ID
+        ORDER BY SC.NAME
+			 ~;
+      
+				my @result = $sbeams->selectSeveralColumns($sql);
+				if (@result > 1){
+					my $chart = $atlas->display_peptide_sample_category_plotly(
+						build_id=>$build_id,
+						sample_array_ref=>$sample_array_ref,
+						column_name_ref => $column_name_ref,
+						data_ref=>\@result,
+							);
+					print $chart ;
+				}
+      }
+      ## color "Dataset Specific Protein Identification" table  
+      my $col = 2;
+      if ($column_name_ref->[1] eq 'Experiment Annotation'){
+        $col=3;
+      }
+
+      print $atlas->tableHeatMap(table_id => 'dataset_spec_protein_info',column=>$col, total => $n_canonical_protein);
+      print $atlas->tableHeatMap(table_id => 'dataset_protein_info', column=>$col, total=> $n_canonical_protein);
+      $atlas->display_page_footer();
+    }
+} # end main
+
+sub fetchResultset {
+  my %args = @_;
+  my $build_id = $args{atlas_build_id};
+  my $rs_table = $args{rs_table};
+  my $params = $args{params};
+  my $resultset_ref = $args{resultset_ref}; 
+  my $module_ref = $args{module_ref};
+  #### Fetch the results from the database server
+  my $result;
+  $atlas->fetchResultHTMLTable(
+    table_name => $rs_table,
+    key_value => $build_id,	
+    resultset_ref=>$resultset_ref,
+    use_caching => 0
+      );
+
+  if ( $resultset_ref->{from_cache} ) {
+    $log->info( "Skipping post-processing with cached RS" );
+  }else{
+    $resultset_ref->{data} = $module_ref->($build_id);
+    my %rs_params;
+    $rs_params{set_name} = 'SETME';
+    my %write_params = ( rs_table => $rs_table,
+			 key_field => 'atlas_build_id',
+			 key_value => $build_id );
+
+    $sbeams->writeResultSet(
+      resultset_file_ref=>\$rs_params{set_name},
+      resultset_ref=>$resultset_ref,
+      query_parameters_ref=>$params,
+      resultset_params_ref=>\%rs_params,
+      query_name=>"$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME",
+      %write_params
+	);
+  }
+  return $resultset_ref->{data};
+}
+ 
+sub get_table_help {
+  my %args = @_;
+  my $name = $args{table};
+  return '' unless $name;
+  $args{mode} ||= 'section';
+  my @entries;
+  my $hidetext;
+  my $showtext;
+  my $heading;
+  my $description;
+
+  if ( $name eq 'build' ) {  
+    @entries = ( { key => 'Build Name', value => 'The simple name for this build, usually contains organism, prophet cutoff, and other information. ' },
+                 { key => 'Build Description', value => 'More detailed information about build. ' },
+                 { key => 'Reference Database', value => 'Database to which peptides were mapped, generally different than search database.  This mapping is done by running BLAST, and allows the peptides to be mapped the the organism\'s genomic sequence. ' },
+                 { key => 'Build Date', value => 'Date upon which build was finished. ' },
+                 { key => '# Experiments', value => 'The number of individual experiments which comprise this build.  Each experiment contains one or more LCMS/MS runs, and generally corresponds to a single scientific experiment.' } ,
+                 { key => 'Total Observations ', value => 'The total number of s </div>pectra </div> that yeilded identifications above the build threshold.  Observations of the same base peptide sequences multiple times or in various charge states/modifications, whould each contribute to the total' },
+                 { key => 'Distinct Peptides', value => 'This shows the number of distinct peptide sequences that were seen in this build.  Observations of the peptide in different charge states or with different modifications are coalesced.' } ,
+                 { key => 'Probability threshold', value => 'iProphet probability threshold applied to each experiment in this build' },
+                 { key => 'PSM FDR threshold', value => 'PSM (peptide-spectrum match) level FDR threshold applied to each experiment in this build' },
+                 { key => 'Canonical Proteins', value => 'Minimally redundant set of proteins required to explain (virtually) all non-decoy peptides observed in build (<a target=_termdefs href="http://www.peptideatlas.org/docs/protein_ident_terms.php">more info</a>)' },
+                 { key => 'Noncore-Canonical', value => 'Noncore canonical means that there are uniquely mapping peptides to this protein that do not map to a protein that is considered part of the core proteome of a species. A non-core canonical protein might be an isoform, contaminant, or protein missing from the core reference proteome.'},
+                 { key => 'Indistinguishable Representative Protein', value=>'Indistinguishable representative means that there are peptides that map uniquely to a set of non-canonical proteins, thereby indicating that at least one of the proteins in the set must be present, but it cannot be determined which it is.'},
+                 { key => 'Marginally Distinguished Proteins', value=>'Marginally distinguished means that this protein has peptides that are shared with a canonical peptide, but it also has a small number of peptides that appear to distinguish it from the canonical identification.'},
+                 { key => 'Representative Proteins', value=>'Representative means that there are peptides that map uniquely to a set of non-canonical proteins, thereby indicating that at least one of the proteins in the set must be present, but it cannot be determined which it is.'},
+                 { key => 'Insufficient evidence', value=>'Protein has one or more apparently uniquely mapping peptides but none are 9AA or greater'},
+                 { key => 'weak', value=>'Protein has one peptide that is uniquely mapping and at least 9 AA long, but is missing a second peptide that meets HPP guidelines'},
+        );
+
+    $showtext = 'show row descriptions';
+    $hidetext = 'hide row descriptions';
+    $heading = 'Build Overview';
+    $description= 'These values pertain to the atlas build as a whole';
+  } 
+
+  return unless @entries;
+  return \@entries if $args{mode} eq 'entries_only';
+
+  my $help = $atlas->get_table_help_section( name => $name,
+                                             description => $description,
+                                             heading => $heading,
+                                             entries => \@entries,
+                                             showtext => $showtext,
+                                             hidetext => $hidetext  );
+  return $help;
+
+} # end get_table_help
+sub get_mayu_info {
+  my $mayu_data_path = shift;
+  open (mayu, $mayu_data_path);
+  my $line = <mayu>;
+  my @headings = split(",",$line);
+  my @sortable;
+  for my $col ( @headings ) {
+    push @sortable, $col, $col;
+  }
+
+  my @records = ();
+  for $line (<mayu>) {
+    chomp ($line);
+    my @fields = split(",",$line);
+    for my $field (@fields) {
+      if ($field =~ /^\d+$/) {
+	$field = $sbeams->commifyNumber($field);
+      }
+    }
+    push @records, \@fields;
+  }
+  my @align = qw(center center left
+right center center right right center center left center left center center
+center left center left center center center center left center center center
+center left);
+  my $html = $atlas->create_table (data => \@records,
+				   column_names=> \@headings,
+				   table_name => "Mayu Decoy-based FDR Analysis",
+				   table_id => "mayu",
+				   align => \@align,
+				   sortable => 0);
+  return ($html);
+}
+
+sub get_dataset_spec_protein_info {
+  my %args = @_;
+  my $build_id = $args{build_id};
+
+  my $sql = qq~
+   SELECT A.repository_id , A.NAME, count (distinct A.ID) as cnt
+   FROM (
+     SELECT PID.dataset_specific_id as repository_id,
+            PRL.LEVEL_NAME AS NAME,
+            PID.biosequence_id as ID
+     FROM $TBAT_PROTEIN_IDENTIFICATION PID 
+     JOIN  $TBAT_PROTEIN_PRESENCE_LEVEL PRL
+     ON (PID.PRESENCE_LEVEL_ID = PRL.PROTEIN_PRESENCE_LEVEL_ID)
+     WHERE 1 = 1
+           AND atlas_build_id IN ($build_id)
+           AND dataset_specific_id IS NOT NULL
+           AND dataset_specific_id != ''
+           AND dataset_specific_id != 'OTHERS'
+     UNION
+     SELECT BR.DATASET_SPECIFIC_ID AS  repository_id, 
+            BRT.RELATIONSHIP_NAME AS NAME, 
+            BR.RELATED_BIOSEQUENCE_ID as ID 
+     FROM $TBAT_BIOSEQUENCE_RELATIONSHIP BR
+     JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE BRT
+     ON (BR.RELATIONSHIP_TYPE_ID = BRT.BIOSEQUENCE_RELATIONSHIP_TYPE_ID)
+     WHERE 1 = 1
+           AND atlas_build_id IN ($build_id)
+           AND dataset_specific_id IS NOT NULL
+           AND dataset_specific_id != '' 
+           AND dataset_specific_id != 'OTHERS'
+   ) AS A
+   GROUP BY A.repository_id, A.NAME
+   order by cnt DESC  
+  ~;
+  my @rows = $sbeams->selectSeveralColumns($sql);
+  return '' if (@rows < 1);
+  my %unique_prot2dataset_cnt;
+  my $possibly_distinguished = 0; 
+  foreach my $row(@rows){
+    my ($repository_id, $name,$cnt) =@$row;
+    $unique_prot2dataset_cnt{$repository_id}{$name} = $cnt;
+    if ($name =~ /(possibly_distinguished|ntt-subsumed)/i){
+      $possibly_distinguished++;
+    }
+  } 
+  ## older builds
+  return '' if ($possibly_distinguished > 0);
+
+  my @level_names = ('canonical','noncore-canonical','indistinguishable representative'  ,'representative'
+                     ,'marginally distinguished','weak','insufficient evidence','indistinguishable','subsumed');
+  $sql =qq~;
+    SELECT LEVEL_NAME AS NAME, PROTEIN_PRESENCE_LEVEL_ID AS ID
+    FROM $TBAT_PROTEIN_PRESENCE_LEVEL
+    UNION 
+    SELECT RELATIONSHIP_NAME AS NAME, BIOSEQUENCE_RELATIONSHIP_TYPE_ID AS ID
+    FROM $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE 
+  ~;
+  my %protein_level_ids = $sbeams->selectTwoColumnHash($sql);
+
+  my @headings =('Dataset', @level_names);
+  my @sortable=();
+  my @align=();
+  for my $col ( @headings ) {
+    $col =~ s/(\w+)/\u$1/g;
+    push @sortable, $col,$col;
+    push @align, 'center';
+  }
+  $align[0] = 'left';
+  my @records = ();
+  my @annotation_urls;
+  my $anno = 0;
+  foreach my $repository_id (sort {$a cmp $b } keys %unique_prot2dataset_cnt){ 
+    my @row =();
+    my ($repository_id_w_links, $annotation_url) = $atlas->get_dataset_url($repository_id);
+    push @row , $repository_id_w_links;
+    push @annotation_urls, $annotation_url; 
+    $anno =1 if ($annotation_url ne '');
+    foreach my $level_name (@level_names){
+      my $cnt = $unique_prot2dataset_cnt{$repository_id}{$level_name} || '';
+      if (defined $unique_prot2dataset_cnt{$repository_id}{$level_name}){
+         my $cnt = $unique_prot2dataset_cnt{$repository_id}{$level_name};
+         my $level_id = $protein_level_ids{$level_name};
+         my $constraint = '';
+         if($level_name =~ /^indistinguishable$/i){
+            $constraint = "redundancy_constraint=1";
+         }elsif ($level_name =~ /(subsumbed_by|identical)/i){
+            $constraint = "redundancy_constraint=$level_id";
+         }else{
+           $constraint = "presence_level_constraint=$level_id&redundancy_constraint=4";
+        }
+         my $str  = $atlas->make_pa_tooltip( tip_text => $cnt,
+           link_text => "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$build_id&biosequence_name_constraint=!DECOY%&dataset_specific_id=$repository_id&$constraint&apply_action=QUERY' target='_blank'>$cnt</a>" );
+         push @row , $str;
+      }else{
+         push @row ,'';
+      }
+    }
+    push @records, \@row;
+  }
+  ## insert annotation column to second column
+  if ($anno){
+    for (my $i=0; $i<=$#records; $i++){
+      splice @{$records[$i]}, 1, 0, $annotation_urls[$i];
+    }
+    splice @headings, 1, 0, 'Experiment Annotation';
+    splice @align, 1, 0, 'center';
+  }
+  my $html = $atlas->create_table (data => \@records,
+                          column_names=> \@headings,
+                          table_name => "Dataset Specific Protein Identification",
+                          table_id => "dataset_spec_protein_info",
+                          align => \@align,
+                          sortable => 1);
+
+  return $html; 
+}
+
+# less informative sample contribution plot
+sub get_build_plots {
+  my %args = @_;
+  my $build_id = $args{build_id};
+  my $sample_array_ref = $args{sample_array_ref};
+  my $column_name_ref = $args{column_name_ref};
+  my $table = "<table>\n";
+
+  my ( $tr, $link ) = $sbeams->make_table_toggle( name    => 'build_plot',
+                                                  visible => 1,
+                                                  tooltip => 'Show/Hide Section',
+                                                  imglink => 1,
+                                                  sticky  => 1 );
+
+  $table .= $atlas->encodeSectionHeader(
+      text => 'Experiment Contribution Plots',
+      span => 4,
+      trinfo => "class=hoverable",
+      LMTABS => 1,
+      divname => 'experiment_contribution_div',
+      no_toggle => 0,
+      link => $link,
+  );
+
+  my $chart = $atlas->displayExperiment_contri_plotly(
+      tr => $tr,
+      data_ref=>$sample_array_ref,
+      column_name_ref => $column_name_ref, 
+  );
+
+  $table .= qq~
+   $chart
+    </table>
+  ~;
+ 
+  return $table;
+}
+
+# General build info, date, name, organism, specialty, default
+sub get_build_overview {
+  my $build_id = shift;
+  
+  # Get a list of accessible project_ids
+  my @project_ids = $sbeams->getAccessibleProjects();
+  my $project_ids = join( ",", @project_ids ) || '0';
+
+  my $build_info = $sbeams->selectrow_hashref( <<"  BUILD" );
+  SELECT atlas_build_name, probability_threshold, atlas_build_description, 
+  build_date, set_name, protpro_PSM_FDR_per_expt
+  FROM $TBAT_ATLAS_BUILD AB 
+  JOIN $TBAT_BIOSEQUENCE_SET BS ON AB.biosequence_set_id = BS.biosequence_set_id
+  WHERE atlas_build_id = $build_id 
+  AND AB.record_status <> 'D'
+  BUILD
+
+#  for my $k ( keys( %$build_info ) ) { print STDERR "$k => $build_info->{$k}\n"; }
+  my $build_name = $build_info->{atlas_build_name};
+  my $phospho_info;
+  if ($build_name =~ /phospho/i){
+    my ($id_col_name, $protein_name_contraint);
+    if ($build_name =~ /human/i){
+      $id_col_name = '#_neXtProt_(PE=1-4)';
+      $protein_name_contraint = 'AND B.dbxref_id = 65 and BSS.organism_id = 2'; 
+    }else{
+      $id_col_name = '#_protein';
+      $protein_name_contraint ="AND B.biosequence_name not like 'CONTAM%' AND B.biosequence_name not like 'DECOY%'";  
+    }
+    $phospho_info =  $sbeams->selectrow_hashref( <<"  PHOS" );
+  SELECT PS.atlas_build_id, 
+         count(distinct PS.biosequence_id) as '$id_col_name', 
+         count(offset) as #_observed_phosphorylation_sites, 
+         sum(case when residue = 'S'  then 1 else 0 end) as S_sites,
+         sum(case when residue = 'T'  then 1 else 0 end) as T_sites,
+         sum(case when residue = 'Y'  then 1 else 0 end) as Y_sites
+  FROM $TBAT_PTM_SUMMARY PS 
+  JOIN $TBAT_BIOSEQUENCE B ON PS.BIOSEQUENCE_ID = B.BIOSEQUENCE_ID
+  JOIN $TBAT_BIOSEQUENCE_SET BSS ON B.BIOSEQUENCE_SET_ID = BSS.BIOSEQUENCE_SET_ID
+  WHERE PS.atlas_build_id = $build_id
+  $protein_name_contraint
+  GROUP BY PS.atlas_build_id
+  PHOS
+
+     my $sql = qq~
+       SELECT mp.modified_peptide_sequence
+       FROM $TBAT_PEPTIDE_INSTANCE PI
+       JOIN $TBAT_MODIFIED_PEPTIDE_INSTANCE MP ON (PI.PEPTIDE_INSTANCE_ID = MP.PEPTIDE_INSTANCE_ID)
+       JOIN $TBAT_PEPTIDE_MAPPING PM ON (PI.PEPTIDE_INSTANCE_ID = PM.PEPTIDE_INSTANCE_ID)
+       JOIN $TBAT_BIOSEQUENCE B ON (B.BIOSEQUENCE_ID = PM.MATCHED_BIOSEQUENCE_ID)
+       WHERE PI.ATLAS_BUILD_ID = $build_id
+       $protein_name_contraint
+     ~;
+
+     my @rows = $sbeams->selectSeveralColumns($sql);
+     my %result =();
+     foreach my $row(@rows){
+       my ($mod_pep) = @$row;
+       $mod_pep =~ s/([^STY])\[\d+\]/$1/g;
+       $mod_pep =~ s/[nc]//g;
+       my @m = $mod_pep =~ /[STY]\[/g;
+       if (@m == 1){
+         $result{'singly_phosphorylated'}{$mod_pep} =1;
+       }elsif(@m == 2){
+          $result{'doubly_phosphorylated'}{$mod_pep} =1;
+       }else{
+          $result{'over_2_phosphorylated'}{$mod_pep} =1;
+       }
+     }
+     foreach my $type(keys %result){
+       $phospho_info->{$type} = scalar keys %{$result{$type}};
+     }
+  }
+
+  my $pep_count = $sbeams->selectrow_hashref( <<"  PEP" );
+  SELECT COUNT(*) cnt,  SUM(n_observations) obs
+  FROM $TBAT_PEPTIDE_INSTANCE 
+  WHERE atlas_build_id = $build_id 
+  PEP
+
+  my $pep_count = $sbeams->selectrow_hashref( <<"  PEP" );
+  SELECT COUNT(*) cnt,  SUM(n_observations) obs
+	FROM (
+		SELECT DISTINCT PI.PEPTIDE_INSTANCE_ID, PI.N_OBSERVATIONS
+		FROM $TBAT_PEPTIDE_INSTANCE PI
+		JOIN $TBAT_PEPTIDE_MAPPING PM ON (PI.PEPTIDE_INSTANCE_ID = PM.PEPTIDE_INSTANCE_ID)
+		JOIN $TBAT_BIOSEQUENCE B ON (PM.MATCHED_BIOSEQUENCE_ID = B.BIOSEQUENCE_ID)
+		WHERE  ATLAS_BUILD_ID= $build_id AND B.BIOSEQUENCE_NAME NOT LIKE 'DECOY%'
+          AND B.BIOSEQUENCE_NAME NOT LIKE 'CONTAM%'
+	) A
+  PEP
+
+  my $smpl_count = $sbeams->selectrow_hashref( <<"  SMPL" );
+  SELECT COUNT(*) cnt FROM $TBAT_ATLAS_BUILD_SAMPLE 
+  WHERE atlas_build_id = $build_id
+  SMPL
+
+  my %prot_count = $sbeams->selectTwoColumnHash( <<"  PROT" );
+  SELECT PPL.level_name, COUNT(BS.biosequence_name) cnt
+  FROM $TBAT_PROTEIN_IDENTIFICATION PID
+  JOIN $TBAT_PROTEIN_PRESENCE_LEVEL PPL
+  ON PPL.protein_presence_level_id = PID.presence_level_id
+  JOIN $TBAT_BIOSEQUENCE BS
+  ON BS.biosequence_id = PID.biosequence_id
+  WHERE PID.atlas_build_id = $build_id
+  AND PPL.level_name in 
+      ('canonical', 'indistinguishable representative', 
+       'marginally distinguished', 'representative',
+       'possibly_distinguished','weak', 'insufficient evidence')
+  AND BS.biosequence_name NOT LIKE 'DECOY%'
+  AND BS.biosequence_name NOT LIKE '%UNMAPPED%'
+  AND BS.biosequence_name NOT LIKE '%CONTAM%'
+  AND BS.biosequence_desc NOT LIKE '%common contaminant%'
+  GROUP BY PPL.level_name 
+  PROT
+
+  $build_info->{pep_count}{obs} = $pep_count->{obs};
+  $build_info->{pep_count}{cnt} = $pep_count->{cnt}; 
+  $build_info->{smpl_count} = $smpl_count->{cnt}; 
+  $build_info->{phospho_info} = $phospho_info;
+  $build_info->{prot_count} = \%prot_count;
+ 
+  my $table =  build_overview_html (build_info => $build_info);
+  return ($prot_count{canonical},  $table);
+
+}
+sub build_overview_html { 
+  my %args =@_;
+  my $build_info = $args{build_info};
+                     
+  my $build_name = $build_info->{atlas_build_name};
+
+  my $table = "<table style='margin-left:15px;'>\n";
+  my ( $tr, $link ) = $sbeams->make_table_toggle( name    => 'build_overview',
+                                                  visible => 1,
+                                                  tooltip => 'Show/Hide Section',
+                                                  imglink => 1,
+                                                  sticky  => 1 );
+
+  $table .= $atlas->encodeSectionHeader(
+      LMTABS => 1,
+      no_toggle => 1,
+      divname => 'build_overview_div',
+      text => 'Build Overview',
+      span => 4,
+      link => $link
+  );
+
+  $tr = 'class="hoverable"';
+  $build_info->{build_date} =~ s/^([0-9-]+).*$/$1/;
+
+  if ($build_info->{protpro_PSM_FDR_per_expt} <= 0) {
+    $build_info->{protpro_PSM_FDR_per_expt} =  $sbeams->makeInactiveText( 'n/a' );
+  } else {
+    $build_info->{protpro_PSM_FDR_per_expt} = sprintf( "%0.7f", $build_info->{protpro_PSM_FDR_per_expt} );
+    $build_info->{protpro_PSM_FDR_per_expt} =~ s/ /&nbsp;/g;
+  }
+  if ($build_info->{probability_threshold} <= 0) {
+    $build_info->{probability_threshold} = $sbeams->makeInactiveText( 'n/a' );
+  } else {
+    $build_info->{probability_threshold} = sprintf( "%0.4f", $build_info->{probability_threshold} );
+    $build_info->{probability_threshold} =~ s/ /&nbsp;/g;
+  }
+
+  $table .= $atlas->encodeSectionItem( key   => 'Build Name', tr_info => $tr,
+				       value => $build_info->{atlas_build_name}, vspan => 3 ) . "\n";
+  $table .= $atlas->encodeSectionItem( key   => 'Build Description', tr_info => $tr,
+				       value => $build_info->{atlas_build_description}, vspan => 3 ) . "\n";
+  $table .= $atlas->encodeSectionItem( key   => 'Reference Database', tr_info => $tr,
+				       value => $build_info->{set_name}, vspan => 3 ) . "\n";
+  $table .= $atlas->encodeSectionItem( key   => 'Build Date', tr_info => $tr,
+				       value => $build_info->{build_date} ) . "\n";
+  $table .= $atlas->encodeSectionItem( key   => '# Experiments', tr_info => $tr,
+				       value => $build_info->{smpl_count}, align => 'right' ) . "\n";
+  $table .= $atlas->encodeSectionItem( key   => 'PSM FDR threshold', tr_info => $tr,
+				       value => $build_info->{protpro_PSM_FDR_per_expt}, align => 'right' ) . "\n";
+  $table .= $atlas->encodeSectionItem( key   => 'Probability threshold', tr_info => $tr,
+				       value => $build_info->{probability_threshold}, align => 'right' ) . "\n";
+
+  $table .= $atlas->encodeSectionItem( key   => 'Total Observations', tr_info => $tr,
+				       value => $sbeams->commifyNumber($build_info->{pep_count}->{obs}), align => 'right' ) . "\n";
+
+  $table .= $atlas->encodeSectionItem( key   => 'Distinct Peptides', tr_info => $tr,
+				       value => $sbeams->commifyNumber($build_info->{pep_count}->{cnt}), align => 'right' ) . "\n";
+
+  $table .= $atlas->encodeSectionItem( key   => 'Protein Presence Levels', tr_info => $tr, value => '', align => 'right' ) . "\n";
+
+  my @levels = sort {$a cmp $b} keys %{$build_info->{prot_count}};
+  my @idx = grep {$levels[$_] ~~ 'noncore-canonical'} 0 .. $#levels;
+  if (@idx){
+    #move noncore-canonical to second
+    my $i = $idx[0];
+    my $val = $levels[$i];
+    splice @levels, $i, 1;
+    splice @levels, 1, 0, $val;
+  }
+
+  foreach my $key (@levels){
+     my $level = $key;
+     $level =~ s/\_/ /g;
+     $level =~ s/(\w+)/\u$1/g; 
+     $table .= $atlas->encodeSectionItem( key   => "&#8195;$level", tr_info => $tr, value => $sbeams->commifyNumber($build_info->{prot_count}{$key}), align => 'right' ) . "\n";
+  }
+  if ($build_name =~ /phospho/i){
+    $table .= $atlas->encodeSectionItem( key   => 'PhosphoProteome Summary', tr_info => $tr, value => '', align => 'right' ) . "\n";
+    $table .= $atlas->encodeSectionItem( key   => "&#8195;# of Phosphorylated Sites in Modified Peptides", tr_info => $tr, value =>'', align => 'right' ) . "\n";
+    foreach my $key (qw (singly_phosphorylated doubly_phosphorylated over_2_phosphorylated)){
+      my $level = $key;
+      $level =~ s/\_/ /g;
+      $level =~ s/(\w+)/\u$1/g;
+      $table .= $atlas->encodeSectionItem( key   => "&#8195;&#8195;$level", tr_info => $tr, value => $build_info->{phospho_info}->{$key}, align => 'right' ) . "\n";
+    }
+
+  }
+ 
+  $table .= "</table>\n";
+  $table .= "<script>document.title = 'PeptideAtlas Build Details: $build_info->{atlas_build_name}';</script>\n";
+  return $table; 
+}
+
+# Peptide build stats
+sub get_sample_info {
+  my $build_id = shift;
+
+  # Get a list of accessible project_ids
+  my @project_ids = $sbeams->getAccessibleProjects();
+  my $project_ids = join( ",", @project_ids ) || '0';
+  #### Define some variables needed to build the query
+  my @column_array = (
+      ["repository_identifiers","S.repository_identifiers","Dataset"],
+      ["sample_id", "S.sample_id","Experiment ID"],
+      ["sample_tag", "sample_tag", "Experiment Tag"],
+      ["n_runs","SBS.n_runs", "MS Runs"],
+      ["n_searched_spectra", "SBS.n_searched_spectra", "Spectra Searched"],
+      ["n_good_spectra", "n_good_spectra", "Spectra ID'd"],
+      ["per_id", "CASE WHEN SBS.n_searched_spectra > 0 THEN FORMAT((n_good_spectra*1.00)/(SBS.n_searched_spectra/1.00), 'P2') ELSE '' END", "%Spectra ID'd"],
+      ["n_distinct_peptides", "n_distinct_peptides","Distinct Peptides"],
+      ["n_uniq_contributed_peptides", "n_uniq_contributed_peptides", "Unique Peptides"],
+      ["n_progressive_peptides", "n_progressive_peptides", "Added Peptides"],
+      ["cumulative_n_peptides", "cumulative_n_peptides", "Cumulative Peptides"],
+      ["n_canonical_proteins", "n_canonical_proteins", "Distinct Canonical Proteins"],
+      ["n_unique_canonical_prots", "''", "Unique Canonical Proteins"],
+      ["n_unique_prots", "''", "Unique All Proteins"],
+      ["n_added_canonical_prots", "''", "Added Canonical Proteins"],
+      ["cumulative_n_proteins", "cumulative_n_proteins", "Cumulative Canonical Proteins"],
+      ["date_created", "CONVERT(VARCHAR(10), PE.date_created, 126)", "Date Added"],
+      ["pubmed_id", "pubmed_id", "Pubmed Id or DOI"],
+      ["instrument_name","instrument_name","Instrument Name"],
+      ["sample_category", "SC.name", "Sample Category"],
+      ["sample_category_id", "S.sample_category_id", "sample_category_id"]
+    );
+
+  #### Build the columns part of the SQL statement
+  my %colnameidx = ();
+  my @column_titles = ();
+  my $columns_clause = $sbeams->build_SQL_columns_list(
+    column_array_ref=>\@column_array,
+    colnameidx_ref=>\%colnameidx,
+    column_titles_ref=>\@column_titles
+  );
+  my $sql =qq~;
+  select $columns_clause
+  FROM $TBAT_SEARCH_BATCH_STATISTICS SBS 
+  JOIN $TBAT_ATLAS_BUILD_SEARCH_BATCH ABSB ON ABSB.atlas_build_search_batch_id = SBS.atlas_build_search_batch_id
+  JOIN $TBAT_ATLAS_SEARCH_BATCH ASB ON ( ASB.atlas_search_batch_id = ABSB.atlas_search_batch_id )
+  JOIN $TBAT_SAMPLE S ON (S.sample_id = ASB.sample_id)
+  LEFT JOIN $TBAT_SAMPLE_CATEGORY SC ON (S.sample_category_id = SC.id)
+  LEFT JOIN (
+		SELECT DISTINCT SAMPLE_ID, 
+		STUFF(
+			(SELECT DISTINCT ',' + CONVERT (VARCHAR , P.PUBMED_ID )
+			FROM $TBAT_SAMPLE_PUBLICATION F2
+			JOIN $TBAT_PUBLICATION P ON (P.PUBLICATION_ID = F2.PUBLICATION_ID AND F2.record_status != 'D')
+      AND F1.SAMPLE_ID = F2.SAMPLE_ID
+			FOR XML PATH ('')),1, 1, '' 
+      ) AS Pubmed_ID
+		FROM $TBAT_SAMPLE_PUBLICATION F1
+  ) AS A ON (A.SAMPLE_ID = S.SAMPLE_ID) 
+  JOIN $TBPR_SEARCH_BATCH PSB  ON (PSB.SEARCH_BATCH_ID = ASB.PROTEOMICS_SEARCH_BATCH_ID)
+  JOIN $TBPR_PROTEOMICS_EXPERIMENT PE ON (PE.EXPERIMENT_ID = PSB.EXPERIMENT_ID)
+  JOIN $TBPR_INSTRUMENT I ON (I.INSTRUMENT_ID = PE.INSTRUMENT_ID) 
+  WHERE ABSB.atlas_build_id = $build_id
+  ORDER BY rownum, cumulative_n_peptides, ABSB.atlas_build_search_batch_id ASC
+  ~;
+
+  my @sample_info = $sbeams->selectSeveralColumns ( $sql );
+  #$log->debug( "build table SQL: $td" );
+
+  my (%unique_prot2sample_cnt, %unique_canprot2sample_cnt);
+  $sql = qq~
+   SELECT A.sample_id , count (distinct A.id)
+   FROM (
+		 SELECT sample_specific_id as sample_id, biosequence_id as id 
+		 FROM $TBAT_PROTEIN_IDENTIFICATION 
+		 WHERE 1 = 1
+					 AND atlas_build_id IN ($build_id)
+					 AND sample_specific_id is not null
+		 UNION 
+		 SELECT sample_specific_id as sample_id, related_biosequence_id as id 
+		 FROM $TBAT_BIOSEQUENCE_RELATIONSHIP
+		 WHERE 1 = 1
+					 AND atlas_build_id IN ($build_id)
+					 AND sample_specific_id is not null
+   ) AS A
+   GROUP BY A.sample_id
+	~;
+  %unique_prot2sample_cnt = $sbeams->selectTwoColumnHash($sql);
+  $sql = qq~
+     SELECT sample_specific_id , count(biosequence_id) 
+     FROM $TBAT_PROTEIN_IDENTIFICATION
+     WHERE 1 = 1
+           AND atlas_build_id IN ($build_id)
+           AND sample_specific_id is not null
+           AND presence_level_id = 1
+     GROUP BY sample_specific_id
+  ~;
+  %unique_canprot2sample_cnt = $sbeams->selectTwoColumnHash($sql);
+
+  # Massage/format some of the columns in the sample info just retrieved
+  my %hidden_cols = ();
+  if ($organism !~ /(human|Arabidopsis)/i){
+    $hidden_cols{'sample_category'} = 1;
+  }
+  #$hidden_cols{'sample_id'} = 1;
+  my @samples;
+  ## rows without second and last column
+  my @samples2;
+  my $rownum =0;
+  my @column_names;
+  my @annotation_urls;
+  my $anno = 0;
+
+  for my $batch ( @sample_info ) {
+    $show_image++;
+    # if these aren't defined, set to zero
+    for my $col_name (qw(n_uniq_contributed_peptides 
+                    n_progressive_peptides 
+                    cumulative_n_peptides
+                    n_canonical_proteins
+                    cumulative_n_proteins)){
+        $batch->[$colnameidx{$col_name}] ||=0;
+    }
+    if ($rownum == 0){
+      $batch->[$colnameidx{n_added_canonical_prots}] = $batch->[$colnameidx{n_canonical_proteins}];
+    }else{
+      $batch->[$colnameidx{n_added_canonical_prots}] = $batch->[$colnameidx{cumulative_n_proteins}] 
+                                                       - $sample_info[$rownum-1]->[$colnameidx{cumulative_n_proteins}];
+    } 
+    for my $idx ( $colnameidx{'n_unique_prots'}) {
+      if (defined $unique_prot2sample_cnt{$batch->[$colnameidx{sample_id}]}){
+         $batch->[$idx] = $unique_prot2sample_cnt{$batch->[$colnameidx{sample_id}]};
+         $batch->[$idx] = $atlas->make_pa_tooltip( tip_text => $batch->[$idx],
+           link_text => "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$build_id&".
+                        "sample_specific_id=$batch->[$colnameidx{sample_id}]&apply_action=QUERY' target='_blank'>$batch->[$idx]</a>" );
+      }else{
+        $batch->[$idx] = '';
+      }
+    }
+    for my $idx ( $colnameidx{'n_unique_canonical_prots'}) {
+      if (defined $unique_canprot2sample_cnt{$batch->[$colnameidx{sample_id}]}){
+         $batch->[$idx] = $unique_canprot2sample_cnt{$batch->[$colnameidx{sample_id}]};
+         $batch->[$idx] = $atlas->make_pa_tooltip( tip_text => $batch->[$idx],
+           link_text => "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$build_id&presence_level_constraint=1&".
+                        "redundancy_constraint=4&sample_specific_id=$batch->[$colnameidx{sample_id}]&apply_action=QUERY' target='_blank'>$batch->[$idx]</a>" );
+      }else{
+        $batch->[$idx] = '';
+      }
+    }
+
+    for my $idx ($colnameidx{'sample_tag'}) {
+      $batch->[$idx] = $atlas->make_pa_tooltip( tip_text => $batch->[$idx],
+          link_text => "<a href='$CGI_BASE_DIR/$SBEAMS_PART/ManageTable.cgi?TABLE_NAME=AT_SAMPLE&sample_id=$batch->[1]' target='_blank'>$batch->[$idx]</a>" );
+    }
+    for my $idx ($colnameidx{pubmed_id}) {
+      next if ( ! $batch->[$idx]);
+      my @ids = split(",", $batch->[$idx]);
+      $batch->[$idx] ='';
+      foreach my $id(@ids){
+        if ($id =~ /^\d+$/){
+          $batch->[$idx] .= "<a href='http://www.ncbi.nlm.nih.gov/pubmed/?term=$id' target='_blank'>$id</a>,";
+        }else{
+          $batch->[$idx] .= "<a href='https://doi.org/$id' target='_blank'>$id</a>,";
+        }
+      }
+      $batch->[$idx] =~ s/,$//;
+    }
+    my $annotation_url = '';
+    for my $idx ($colnameidx{'repository_identifiers'}) {
+      next if ( ! $batch->[$idx]);
+      ($batch->[$idx], $annotation_url) = $atlas->get_dataset_url($batch->[$idx]);
+    }
+    push @annotation_urls, $annotation_url;
+    $anno = 1 if ($annotation_url ne '');
+    my @row_data;
+    my $idx = 0;
+    foreach my $col (sort {$colnameidx{$a} <=> $colnameidx{$b}} keys %colnameidx){
+      if (not defined $hidden_cols{$col}){
+         $row_data[$idx] = $batch->[$colnameidx{$col}];
+         $idx++;
+         next if ($col eq 'sample_category_id'); 
+         push @column_names, $column_titles[$colnameidx{$col}] if (! $rownum);
+      }
+    }
+    push @samples, \@row_data; 
+    my @tmp2 = @row_data; 
+    pop @tmp2;
+    push @samples2, \@tmp2;
+    $rownum++;
+  }
+
+  for my $samp ( @samples2 ) {
+    for my $col_name (qw
+		      (n_runs
+		       n_searched_spectra
+		       n_good_spectra
+		       n_distinct_peptides
+		       n_uniq_contributed_peptides
+		       n_progressive_peptides
+		       cumulative_n_peptides
+		       n_canonical_proteins
+		       n_unique_canonical_prots
+		       n_unique_prots
+		       n_added_canonical_prots
+		       cumulative_n_proteins)
+	){
+      $samp->[$colnameidx{$col_name}] = $sbeams->commifyNumber($samp->[$colnameidx{$col_name}]);
+    }
+
+  }
+  ## insert annotation column to second column
+  my @column_names_copy = @column_names;
+  my @align = qw(left left left center center center center center center center center center center center center center);
+  my @noWrap = (3,17,19,20);
+  if ($anno){
+    for (my $i=0; $i<=$#samples2; $i++){
+      splice @{$samples2[$i]}, 1, 0, $annotation_urls[$i];
+    }
+    splice @column_names, 1, 0, 'Experiment Annotation';
+    splice @align, 1, 0, 'center';
+  }
+  my $html = $atlas->create_table (data => \@samples2,
+				   column_names=> \@column_names,
+				   table_name => "Experiment Contribution",
+				   table_id => "exp_contribution",
+           nowrap => \@noWrap, 
+				   align => \@align,
+				   sortable => 0,
+				   download_table => 1);
+
+  push @column_names_copy , "sample_category_id";
+  return ( $html, \@samples, \@column_names_copy);
+}
+
+sub get_dataset_contrib_info {
+  my $build_id = shift;
+
+  # Get a list of accessible project_ids
+  my @project_ids = $sbeams->getAccessibleProjects();
+  my $project_ids = join( ",", @project_ids ) || '0';
+  #### Define some variables needed to build the query
+  my @column_array = (
+      ["repository_identifiers","repository_identifiers","Dataset"],
+      ["n_runs","n_runs", "MS Runs"],
+      ["n_searched_spectra", "n_searched_spectra", "Spectra Searched"],
+      ["n_good_spectra", "n_good_spectra", "Spectra ID'd"],
+      ["per_id", "CASE WHEN n_searched_spectra > 0 THEN FORMAT((n_good_spectra*1.00)/(n_searched_spectra/1.00), 'P2') ELSE '' END", "%Spectra ID'd"],
+      ["n_distinct_peptides", "n_distinct_peptides","Distinct Peptides"],
+      ["n_uniq_contributed_peptides", "n_uniq_contributed_peptides", "Unique Peptides"],
+      ["n_progressive_peptides", "n_progressive_peptides", "Added Peptides"],
+      ["cumulative_n_peptides", "cumulative_n_peptides", "Cumulative Peptides"],
+      ["n_canonical_proteins", "n_canonical_proteins", "Distinct Canonical Proteins"],
+      ["n_uniq_contributed_proteins", "n_uniq_contributed_proteins", "Unique Canonical Proteins"],
+      ["n_progressive_proteins", "n_progressive_proteins", "Added Canonical Proteins"],
+      ["cumulative_n_proteins", "cumulative_n_proteins", "Cumulative Canonical Proteins"]
+    );
+
+  #### Build the columns part of the SQL statement
+  my %colnameidx = ();
+  my @column_titles = ();
+  my $columns_clause = $sbeams->build_SQL_columns_list(
+    column_array_ref=>\@column_array,
+    colnameidx_ref=>\%colnameidx,
+    column_titles_ref=>\@column_titles
+  );
+
+  my $sql =qq~;
+  SELECT $columns_clause
+  FROM $TBAT_DATASET_STATISTICS
+  WHERE ATLAS_BUILD_ID = $build_id 
+  ORDER BY rownum
+  ~;
+  my @info = $sbeams->selectSeveralColumns ( $sql );
+  return '' if (! @info);
+
+  my (@samples);
+  my @annotation_urls;
+  my $anno = 0;
+  for my $batch ( @info ) {
+    for my $idx ($colnameidx{'repository_identifiers'}) {
+      next if ( ! $batch->[$idx]);
+      my $annotation_url = '';
+      ($batch->[$idx], $annotation_url) = $atlas->get_dataset_url($batch->[$idx]);
+      if ($annotation_url ne ''){
+        $anno=1;
+      }
+      push @annotation_urls, $annotation_url;  
+    }
+    push @samples, $batch;
+  }
+
+
+  for my $samp ( @samples ) {
+    for my $col_name (qw
+		      (n_runs
+		       n_searched_spectra
+		       n_good_spectra
+		       n_distinct_peptides
+		       n_uniq_contributed_peptides
+		       n_progressive_peptides
+		       cumulative_n_peptides
+		       n_canonical_proteins
+		       n_uniq_contributed_proteins
+		       n_progressive_proteins
+		       cumulative_n_proteins)
+	){
+      $samp->[$colnameidx{$col_name}] = $sbeams->commifyNumber($samp->[$colnameidx{$col_name}]);
+    }
+
+  }
+  ## insert annotation column to second column
+  my @align = qw(left center center center center center center center center center center center center center center);
+  if ($anno){
+    for (my $i=0; $i<=$#samples; $i++){
+      splice @{$samples[$i]}, 1, 0, $annotation_urls[$i];
+    }
+    splice @column_titles, 1, 0, 'Experiment Annotation';
+    splice @align, 1, 0, 'center';
+  }
+  my $html = $atlas->create_table (data => \@samples,
+                          column_names=> \@column_titles,
+                          table_name => "Dataset Contribution",
+                          table_id => "datasetContri_info",
+                          align => \@align,
+                          sortable => 0,
+                          download_table => 1);
+
+  return $html;
+
+}
+
+sub process_params {
+  my $params = {};
+  $sbeams->parse_input_parameters( q => $q, parameters_ref => $params );
+  $sbeams->processStandardParameters( parameters_ref => $params );
+  return( $params );
+}
+
+sub get_build_path {
+  my %args = @_;
+  return unless $args{build_id};
+  my $path = $atlas->getAtlasBuildDirectory( atlas_build_id => $args{build_id} );
+  $path =~ s/DATA_FILES//;
+  return $path;
+}
+##################################################################################
+### check protein existence in a dataset. 
+##################################################################################
+sub get_dataset_protein_info {
+  my %args = @_;
+  my $atlas_build_id = $args{build_id};
+  my $sql =qq~;
+    SELECT SAMPLE_ID, REPOSITORY_IDENTIFIERS 
+    FROM $TBAT_SAMPLE 
+    WHERE REPOSITORY_IDENTIFIERS IS NOT NULL
+    AND REPOSITORY_IDENTIFIERS != ''
+  ~;
+  my %sample_repository_ids = $sbeams->selectTwoColumnHash($sql);
+
+  $sql = qq~
+     SELECT BS.BIOSEQUENCE_NAME, PR.NAME, S.sample_id
+      FROM $TBAT_BIOSEQUENCE_ID_ATLAS_BUILD_SEARCH_BATCH BIABSB
+      JOIN $TBAT_BIOSEQUENCE BS ON ( BIABSB.BIOSEQUENCE_ID = BS.BIOSEQUENCE_ID )
+      JOIN $TBAT_ATLAS_BUILD_SEARCH_BATCH ABSB
+      ON (ABSB.ATLAS_BUILD_SEARCH_BATCH_ID = BIABSB.ATLAS_BUILD_SEARCH_BATCH_ID
+         AND ABSB.atlas_build_id = $atlas_build_id )
+      JOIN $TBAT_SAMPLE S ON (S.sample_id = ABSB.sample_id)
+     JOIN (
+       SELECT A.NAME, A.ID
+       FROM (
+         SELECT PRL.LEVEL_NAME AS NAME,
+                PID.biosequence_id as ID
+         FROM $TBAT_PROTEIN_IDENTIFICATION PID
+         JOIN  $TBAT_PROTEIN_PRESENCE_LEVEL PRL
+         ON (PID.PRESENCE_LEVEL_ID = PRL.PROTEIN_PRESENCE_LEVEL_ID)
+         WHERE 1 = 1
+               AND atlas_build_id IN ($atlas_build_id)
+         UNION
+         SELECT BRT.RELATIONSHIP_NAME AS NAME,
+                BR.RELATED_BIOSEQUENCE_ID as ID
+         FROM $TBAT_BIOSEQUENCE_RELATIONSHIP BR
+         JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE BRT
+         ON (BR.RELATIONSHIP_TYPE_ID = BRT.BIOSEQUENCE_RELATIONSHIP_TYPE_ID)
+         WHERE 1 = 1
+               AND atlas_build_id IN ($atlas_build_id)
+       ) AS A ) PR  ON (PR.ID = BS.biosequence_id)
+     WHERE 1 = 1
+          AND ABSB.atlas_build_id IN ( $atlas_build_id )
+          AND BS.BIOSEQUENCE_ID NOT IN (
+            SELECT BR.RELATED_BIOSEQUENCE_ID
+             FROM $TBAT_BIOSEQUENCE_RELATIONSHIP BR
+             WHERE RELATIONSHIP_TYPE_ID = 2
+          )
+
+  ~;
+  my @rows = $sbeams->selectSeveralColumns($sql);
+  my %dataset_prot_cnt;
+  my $possibly_distinguished = 0;
+  foreach my $row(@rows){
+    my ($bs_name,$protein_level, $sample_id ) =@$row;
+    next if ($bs_name =~ /(decoy|contam)/i);
+    if ($protein_level =~ /possibly_distinguished/i){
+       $possibly_distinguished++;
+    }
+		$dataset_prot_cnt{$sample_repository_ids{$sample_id}}{$protein_level}{$bs_name} =1;
+  }
+  ## older builds, skip
+  return '' if ($possibly_distinguished > 0);
+  return '' if (scalar keys %dataset_prot_cnt == 0);
+  my $sql =qq~;
+    SELECT LEVEL_NAME AS NAME, PROTEIN_PRESENCE_LEVEL_ID AS ID
+    FROM $TBAT_PROTEIN_PRESENCE_LEVEL
+    UNION
+    SELECT RELATIONSHIP_NAME AS NAME, BIOSEQUENCE_RELATIONSHIP_TYPE_ID AS ID
+    FROM $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE
+  ~;
+  my %protein_level_ids = $sbeams->selectTwoColumnHash($sql);
+
+  my @level_names = ('canonical','noncore-canonical','indistinguishable representative'  ,'representative'
+                     ,'marginally distinguished','weak','insufficient evidence','indistinguishable','subsumed'); 
+
+  my @headings =('Dataset',@level_names);
+  my @sortable=();
+  my @align=();
+  for my $col ( @headings ) {
+    $col =~ s/(\w+)/\u$1/g;
+    push @sortable, $col,$col;
+    push @align, 'center';
+  }
+  $align[0] = 'left';
+  my $headings_ref = $atlas->make_sort_headings( headings => \@sortable);
+  my @records = ();
+  my @annotation_urls;
+  my $anno = 0;
+  foreach my $repository_id (sort {$a cmp $b} keys %dataset_prot_cnt){
+    my @row =();
+    my ($repository_id_w_links, $annotation_url) = $atlas->get_dataset_url($repository_id);
+    push @row , $repository_id_w_links;
+    push @annotation_urls, $annotation_url;
+    $anno = 1 if ($annotation_url ne ''); 
+    foreach my $level_name (@level_names){
+      my $cnt = scalar keys %{$dataset_prot_cnt{$repository_id}{$level_name}} || 0;
+      if ( $cnt){
+         my $level_id = $protein_level_ids{$level_name};
+         my $constraint = '';
+         if($level_name =~ /^indistinguishable$/i){
+            $constraint = "redundancy_constraint=1";
+         }elsif ($level_name =~ /(subsumbed_by|identical)/i){
+            $constraint = "redundancy_constraint=$level_id";
+         }else{
+           $constraint = "presence_level_constraint=$level_id&redundancy_constraint=4";
+        }
+         my $str  = $atlas->make_pa_tooltip( tip_text => $cnt,
+           link_text => "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$atlas_build_id&biosequence_name_constraint=!DECOY%&dataset_id=$repository_id&$constraint&apply_action=QUERY' target='_blank'>$cnt</a>" );
+         push @row , $str;
+      }else{
+         push @row ,'';
+      }
+    }
+    push @records, \@row;
+  }
+  ## insert annotation column to second column
+  if ($anno){
+    for (my $i=0; $i<=$#records; $i++){
+      splice @{$records[$i]}, 1, 0, $annotation_urls[$i];
+    }
+    splice @headings, 1, 0, 'Experiment Annotation';
+    splice @align, 1, 0, 'center';
+  }
+
+  my $html = $atlas->create_table (data => \@records,
+                          column_names=> \@headings,
+                          table_name => "Dataset Protein Info",
+                          table_id => "dataset_protein_info",
+                          align => \@align,
+                          sortable => 0);
+
+  return ($html);
+}
+
+# less informative sample contribution plot
+sub get_build_plots {
+  my %args = @_;
+  my $build_id = $args{build_id};
+  my $sample_array_ref = $args{sample_array_ref};
+  my $column_name_ref = $args{column_name_ref};
+  my $table = "<TABLE WIDTH=800>\n";
+  my ( $tr, $link ) = $sbeams->make_table_toggle( name    => 'build_plot',
+                                                  visible => 1,
+                                                  tooltip => 'Show/Hide Section',
+                                                  imglink => 1,
+                                                  sticky  => 1 );
+
+  $table .= $atlas->encodeSectionHeader(
+      text => 'Experiment Contribution Plots',
+      span => 4,
+      trinfo => "class='hoverable'",
+      LMTABS => 1,
+      divname => 'experiment_contribution_div',
+      no_toggle => 1,
+      link => $link,
+  );
+
+  my $chart = $atlas->displayExperiment_contri_plotly(
+      tr => $tr,
+      data_ref=>$sample_array_ref,
+      column_name_ref => $column_name_ref, 
+  );
+
+ $table .= qq~
+    $chart
+    </TABLE>
+  ~;
+ 
+  return $table;
+}
+##################################################################################
+### peptide charge and length distribution 
+##################################################################################
+sub get_peptide_length_charge_distribution {
+  my %args = @_;
+  my $file = $args{data_path};
+  my @charge_rows = ();
+  my @length_rows=();
+  my @tlength_rows=();
+  my @distinctPlength_rows = ();
+  my @trypPlength_rows = ();
+  my @peptidePerProtein_rows =();
+  open (IN, "$file") or return '';
+  while (my $line =<IN>){
+    chomp $line;
+    if ($line =~ /^length\t(\d+)\t(\d+)$/){ 
+      push @length_rows, [($1, $2)];
+    }elsif($line =~ /^charge\t(\d+)\t(\d+)$/){
+      push @charge_rows, [($1, $2)];
+    }elsif($line =~ /^tlength\t(\d+)\t(\d+)$/){
+      push @tlength_rows, [($1, $2)]; 
+    }elsif($line =~ /^distinctPlength\t(\d+)\t(\d+)$/){
+      push @distinctPlength_rows, [($1, $2)];
+    }elsif($line =~ /^trypPlength\t(\d+)\t(\d+)$/){
+      push @trypPlength_rows, [($1, $2)];
+    }elsif($line =~ /^peptidePerProtein\t(\S+)\t(\d+)$/){
+      push @peptidePerProtein_rows, [($1,$2)];
+    }
+  }
+
+  my $table = "<TABLE WIDTH=800>\n";
+  my ( $tr, $link ) = $sbeams->make_table_toggle( name    => 'pepitde_length_distribution',
+                                                  visible => 1,
+                                                  tooltip => 'show/hide section',
+                                                  imglink => 1,
+                                                  sticky  => 1 );
+  $table .= $atlas->encodeSectionHeader(
+      LMTABS => 1,
+      no_toggle => 1,
+      divname => 'pepitde_length_distribution_div',
+      text => 'Peptide Length Distribution',
+      link => $link,
+      width => 920,
+  );
+  my @names = ('observed distinct peptides (including semi-tryptic and miscleaved peptides)',
+               'observed distinct tryptic no-missed-cleavages peptides',
+               'theoretical distinct tryptic no-missed-cleavages peptides');
+  my @data = ();
+  push @data, [@distinctPlength_rows];
+  push @data, [@trypPlength_rows];
+  push @data, [@tlength_rows];
+  
+  my $chart = $atlas->plotly_barchart (data => \@data,
+                                       names => \@names, 
+				       divName => 'length_distribution_div',
+				       xtitle => 'Peptide Length',
+				       ytitle=> 'Frequency'); 
+
+  @data = ();
+  @names = ();
+  push @data, [@length_rows];
+  push @names , '';
+
+  my $chart2 = $atlas->plotly_barchart (data => \@data,
+                                       names => \@names,
+                                       divName => 'length_vs_psm_div',
+                                       xtitle => 'Peptide Length',
+                                       ytitle=> 'Spectra Count');
+
+
+
+  $table .= qq~
+    <div style="width: 80vw">
+    <div id="length_distribution_div"></div>
+    $chart
+    <div id="length_vs_psm_div"></div>
+    $chart2
+    </div>
+    </TABLE>
+  ~;
+
+  $table .= "<TABLE WIDTH=800>\n";
+  ( $tr, $link ) = $sbeams->make_table_toggle( name    => 'pepitde_charge_distribution',
+                                                  visible => 1,
+                                                  tooltip => 'show/hide section',
+                                                  imglink => 1,
+                                                  sticky  => 1 );
+
+  $table .= $atlas->encodeSectionHeader(
+      LMTABS => 1,
+      no_toggle => 1,
+      divname => 'pepitde_charge_distribution_div',
+      text => 'Peptide Charge Distribution',
+      link => $link,
+      width => 920,
+  );
+  @data = ();
+  @names = ();
+  push @data, [@charge_rows];
+  push @names , 'Charge';
+  $chart = $atlas->plotly_barchart (data =>  \@data,
+                                       names => \@names,
+                                       divName => 'pepitde_charge_distribution_div',
+                                       xtitle => 'Peptide Charge',
+                                       dtick => 1,
+                                       ytitle=> 'Spectra Count');
+
+   $table .= qq~
+    <div style="width: 50vw">
+    <div id="pepitde_charge_distribution_div"></div>
+    $chart
+    </div>
+    </TABLE>
+  ~;
+
+  if (@peptidePerProtein_rows){
+		$table .= "<TABLE WIDTH=800>\n";
+		( $tr, $link ) = $sbeams->make_table_toggle( name    => 'pepitdePepProtein_distribution',
+																										visible => 1,
+																										tooltip => 'show/hide section',
+																										imglink => 1,
+																										sticky  => 1 );
+
+		$table .= $atlas->encodeSectionHeader(
+				LMTABS => 1,
+				no_toggle => 1,
+				divname => 'pepitdePerProtein_distribution_div',
+				text => 'Peptide Per Canonical Protein',
+				link => $link,
+				width => 920,
+		);
+		@data = ();
+		@names = ();
+		push @data, [@peptidePerProtein_rows];
+		push @names , 'Count';
+		$chart = $atlas->plotly_barchart (data =>  \@data,
+																				 names => \@names,
+																				 divName => 'pepitdePerProtein_distribution_div',
+																				 xtitle => 'Peptide/Protein',
+																				 dtick => 5,
+																				 ytitle=> 'Protein Count');
+
+		 $table .= qq~
+			<div style="width: 80vw">
+			<div id="pepitdePerProtein_distribution_div"></div>
+			$chart
+			</div>
+			</TABLE>
+		~;
+  }
+
+  return ($table);
+}
+
+###########################################################################
+### read build_detail_tables.tsv in build directory and create tables######
+###########################################################################
+sub generate_html_from_file {
+  my %args = @_;
+  my $file = $args{file};
+  my $build_id = $args{build_id};
+  my $build_path = $args{build_path};
+
+  my (@sample_array, @column_names); 
+
+  my %table_names = (
+   exp_contrib_table => 'Experiment Contribution',
+   dataset_contrib_table => 'Dataset Contribution',
+   dataset_protein_info => 'Dataset Protein Info',
+   dataset_spec_protein_info => 'Dataset Specific Protein Identification',
+   proteome_coverage => 'Proteome Coverage (exhaustive)',
+   ptm_coverage => 'PTM Coverage',
+ );
+ my %column_align = (
+   exp_contrib_table => [qw(left left left center center center center center center center center center center center center center)], 
+   dataset_contrib_table => [qw(left center center center center center center center center center center center center center center)], 
+   dataset_protein_info => [qw(left center center center center center center center center)], 
+   dataset_spec_protein_info => [qw(left center center center center center center center center)], 
+   proteome_coverage => [qw(left)],
+   ptm_coverage =>  [qw(left)],
+ 
+ );
+
+  open (IN , "<$file") || return '';
+  my ($html, $table, $pre_table);
+  my @data =();
+  my $build_info ={};
+  my $anno =0;
+  while (my $line =<IN>){
+    chomp $line;
+    if ($line =~ /^build_overview/){
+       while ($line =~ /^build_overview/){
+				 $line =~ s/build_overview\|//;
+				 if ($line =~ /Protein Presence Levels\|(.*)\t(\d+)$/){
+						$build_info->{prot_count}->{$1} = $2;
+				 }elsif ($line =~ /PhosphoProteome Summary\|(.*)\t(\d+)$/){
+            $build_info->{phospho_info}->{$1} = $2;
+				 }else{
+           if ($line =~ /pep_count_obs\t(\d+)/){
+              $build_info->{pep_count}{obs} = $1;
+           }elsif($line =~ /pep_count_cnt\t(\d+)/){
+              $build_info->{pep_count}{cnt} = $1;
+           }else{
+						 $line =~ /^(.*)\t(.*)/;
+						 $build_info->{$1} = $2;
+           }
+				 }
+         $line =<IN>;
+       }
+       $html =  build_overview_html (build_info => $build_info);
+       print $html;
+       $html ='';
+    }
+    if($line =~ /what_is_new/){
+      @data =();
+      while ($line =~ /^what_is_new/ && $line !~/sample_ids/){
+         chomp $line;
+         $line =~ s/what_is_new\|//;
+         my @values = split (/\t/, $line, -1);
+         push @data , \@values;
+         $line =<IN>;
+      }
+      $html = '<table>';
+      $html .= $atlas->encodeSectionHeader(
+						LMTABS => 1,
+						no_toggle => 1,
+						text => "What&#39s New"); 
+			$html .= $atlas->encodeSectionTable( rows => \@data,
+						 header => 1,
+						 table_id => 'what_is_new',
+						 align => [ qw(left right right right ) ],
+						 bg_color => '#f3f1e4', #EAEAEA',
+						 has_key => 1,
+						 sortable => 1 );
+      $html .= '</table>';
+      print $html;
+      chomp $line;
+      if ($line =~ /what_is_new\|sample_ids\t(.*)/){
+        $line = $1;
+        $html = $atlas->getProteinSampleDisplay( sample_ids => [($line)], 
+              no_header => 1,
+              rows_to_show => 5,
+              max_rows => 500);
+        $html =$sbeams->make_toggle_section( neutraltext => 'New Experiments',
+             sticky => 1,
+             name => 'getnew_samplelist_div',
+             barlink => 1,
+             visible => 1,
+             content => "<table>$html</table>" );
+
+         print $html;
+         $html ='';
+       }
+       @data =();
+       next;
+    }
+
+    $line =~ /(\S+)\|(.*)/;   
+    $table = $1;
+    $line = $2;
+    if (($table ne $pre_table && $pre_table ne '')){
+       my $headings = shift @data;
+       my $download_table = 0;
+       my @noWrap = (1);
+       @noWrap = (3,17,19,20) if ($pre_table eq 'exp_contrib_table');
+       my $table_width = 800;
+       $table_width = 400 if ($pre_table eq 'proteome_coverage');
+       add_url (table_id => $pre_table,
+                data_ref=>\@data,
+                column_name_ref => $headings,
+                build_id => $build_id,
+                align => $column_align{$pre_table},
+               );
+			 if ($pre_table eq 'exp_contrib_table'){
+					if ($headings->[1] eq 'Experiment Annotation'){
+						 $anno=1;
+					}
+					@sample_array =  map { [@$_] } @data;
+					@column_names = @$headings;
+          ## remove category id column 
+          my $n = $#column_names;
+          if ($column_names[$n] eq 'sample_category_id'){
+						foreach my $row (@data){ 
+							splice @$row, $n;
+						}
+						splice @$headings, $n;
+          }
+          $download_table =1;
+			 }
+       $download_table = 1 if ($pre_table eq 'dataset_contrib_table');
+ 
+       $html = $atlas->create_table (data => \@data,
+                          column_names=> $headings,
+                          table_name => $table_names{$pre_table},
+                          table_id => $pre_table,
+                          nowrap => \@noWrap,
+                          width => $table_width, 
+                          align => $column_align{$pre_table}, 
+                          sortable => 0,
+                          download_table=> $download_table);
+      print "$html";
+      $html ='';
+      @data = (); 
+      my @values = split (/\t/, $line, -1);
+      push @data , \@values;
+    }else{
+      my @values = split (/\t/, $line, -1);
+      push @data,\@values;
+    }
+    $pre_table=$table;
+
+  }
+  my $cat_plot_data; 
+  if ($table eq 'cat_plot'){
+    $cat_plot_data=\@data;
+  }
+
+  $html = get_build_plots ( build_id => $build_id,
+              sample_array_ref => \@sample_array,
+              column_name_ref => \@column_names);
+  print $html;
+
+	my $charge_length_data_path = "$build_path/analysis/peptide_length-charge_dist.tsv";
+	if (-e $charge_length_data_path){
+		$html = get_peptide_length_charge_distribution(data_path=>$charge_length_data_path);
+		print $html;
+	}
+
+  if ($cat_plot_data){
+    $html = $atlas->display_peptide_sample_category_plotly(
+            build_id=>$build_id,
+            sample_array_ref=> \@sample_array,
+            column_name_ref => \@column_names,
+            data_ref=> $cat_plot_data,
+              );
+    print $html;
+  }
+
+  my $col=2; 
+  $col = 3 if ($anno);
+  print $atlas->tableHeatMap(table_id => 'dataset_spec_protein_info', column=>$col, total => $build_info->{prot_count}{canonical});
+  print $atlas->tableHeatMap(table_id => 'dataset_protein_info',column=>$col, total=> $build_info->{prot_count}{canonical}); 
+}
+###########################################################
+## add url to some columns of the tables
+## dataset, Experiment_Tag, Pubmed, and Protein columns
+###########################################################
+sub add_url {
+  my %args = @_;
+  my $data_ref = $args{data_ref};
+  my $build_id = $args{build_id};
+  my $column_name_ref = $args{column_name_ref};
+  my $align_ref = $args{align};
+  my $table_id = $args{table_id};
+  my %cols=();
+  my @annotation_urls =();
+  my $anno =0;
+  my $exp_id_idx = '';
+  my $n = scalar @$column_name_ref;
+
+  my $sql =qq~;
+    SELECT LEVEL_NAME AS NAME, PROTEIN_PRESENCE_LEVEL_ID AS ID
+    FROM $TBAT_PROTEIN_PRESENCE_LEVEL
+    UNION
+    SELECT RELATIONSHIP_NAME AS NAME, BIOSEQUENCE_RELATIONSHIP_TYPE_ID AS ID
+    FROM $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE
+  ~;
+  my %protein_level_ids = $sbeams->selectTwoColumnHash($sql);
+
+  for (my $idx=0; $idx < $n; $idx++){ 
+    if ($column_name_ref->[$idx] =~ /(Dataset|Experiment Tag|Pubmed|^Canonical$|noncore|Indistinguish|Representative|Marginally|Weak|Insufficient|Subsumed|Unique All Proteins|Unique Canonical Proteins)/i){
+			$cols{$idx} = $column_name_ref->[$idx];
+    }
+    if ($column_name_ref->[$idx] =~ /Experiment ID/){
+      $exp_id_idx = $idx;
+    }
+  }
+  foreach my $row (@$data_ref){
+    my $n = scalar @$row;
+    my $repository_id = '';
+    for (my $i=0;$i<$n;$i++){
+      if ($cols{$i}){
+        if ($cols{$i} =~ /Dataset/){
+          my $annotation_url='';
+          $repository_id = $row->[$i];
+          ($row->[$i], $annotation_url) = $atlas->get_dataset_url ($row->[$i]);         
+           $anno = 1 if ($annotation_url ne '');
+           push @annotation_urls, $annotation_url;
+        }elsif($cols{$i} =~ /Experiment Tag/){
+           if ($exp_id_idx){
+              $row->[$i] = '<a href="https://db.systemsbiology.net/sbeams/cgi/PeptideAtlas/ManageTable.cgi?TABLE_NAME=AT_SAMPLE&sample_id=' .
+                           $row->[$exp_id_idx] . '">'. $row->[$i] ."</a>\n";
+           }
+        }elsif($cols{$i} =~ /Pubmed/){
+          my @ids = split(",", $row->[$i]);
+          $row->[$i] = '';
+					foreach my $id(@ids){
+						if ($id =~ /^\d+$/){
+							$row->[$i] .= "<a href='http://www.ncbi.nlm.nih.gov/pubmed/?term=$id' target='_blank'>$id</a>,";
+						}else{
+							$row->[$i] .= "<a href='https://doi.org/$id' target='_blank'>$id</a>,";
+						}
+					}
+          $row->[$i] =~ s/,$//;
+        }elsif ($cols{$i} =~ /(^Canonical$|noncore|Indistinguish|Representative|Marginally|Weak|Insufficient|Subsumed)/i){
+          my $level_id = $protein_level_ids{lc($cols{$i})};
+          my $level_name = $cols{$i};
+					my $constraint = '';
+					if($level_name =~ /^indistinguishable$/i){
+							$constraint = "redundancy_constraint=1";
+					}elsif ($level_name =~ /(subsumbed_by|identical)/i){
+							$constraint = "redundancy_constraint=$level_id";
+					}else{
+						 $constraint = "presence_level_constraint=$level_id&redundancy_constraint=4";
+				  }
+          if ($repository_id){
+            if ($table_id eq 'dataset_protein_info'){ 
+					    $row->[$i] = "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$build_id&dataset_id=$repository_id&$constraint&apply_action=QUERY' target='_blank'>$row->[$i]</a>";
+            }elsif($table_id eq 'dataset_spec_protein_info'){
+              $row->[$i] = "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$build_id&dataset_specific_id=$repository_id&biosequence_name_constraint=!DECOY%&$constraint&apply_action=QUERY' target='_blank'>$row->[$i]</a>";
+
+            }
+          }
+        }elsif($cols{$i} eq 'Unique All Proteins' and $table_id eq 'exp_contrib_table'){
+            $row->[$i] = "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$build_id&".
+                          "sample_specific_id=$row->[$exp_id_idx]&apply_action=QUERY' target='_blank'>$row->[$i]</a>";
+        }elsif($cols{$i} eq 'Unique Canonical Proteins' && $table_id eq 'exp_contrib_table'){
+            $row->[$i] = "<a href='$CGI_BASE_DIR/PeptideAtlas/GetProteins?atlas_build_id=$build_id&".
+                          'presence_level_constraint=1&redundancy_constraint=4&' .
+                          "sample_specific_id=$row->[$exp_id_idx]&apply_action=QUERY' target='_blank'>$row->[$i]</a>";
+
+        } 
+      }##cols[$i]
+    }##for
+  }## data_ref   
+	## add dataset annotation column
+	if ($anno){
+    my $n_rows = scalar @$data_ref;
+		for (my $i=0; $i< $n_rows; $i++){
+			splice @{$data_ref->[$i]}, 1, 0, $annotation_urls[$i];
+		}
+		splice @$column_name_ref, 1, 0, 'Experiment Annotation';
+    splice @$align_ref, 1, 0, 'center';
+	}
+}

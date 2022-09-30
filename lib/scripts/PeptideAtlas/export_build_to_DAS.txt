@@ -1,0 +1,22 @@
+
+Notes exporting PeptideAtlas Builds to DAS server (ProServer):
+
+setenv SBEAMS /net/dblocal/www/html/devZS/sbeams
+setenv PAexport $SBEAMS/lib/scripts/PeptideAtlas/export_build_to_DAS.pl
+
+GET 'http://www.peptideatlas.org/das/dsn'
+
+$PAexport --list
+
+## add
+$PAexport --add --atlas_build_name 'Human PeptideAtlas 2009-06'
+
+## delete
+$PAexport --delete --atlas_build_name 'Human PeptideAtlas 2009-06'
+
+Test:
+
+GET 'http://www.peptideatlas.org/das/dsn'
+GET 'http://www.peptideatlas.org/das/PeptideAtlasdb_Human_PeptideAtlas_2009-06/features?segment=2:215996318,215996321'
+
+GET 'http://www.peptideatlas.org/das/PeptideAtlasdb_Human_PeptideAtlas_2009-06/features?segment=2:215937925,215937953'

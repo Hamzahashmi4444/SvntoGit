@@ -1,0 +1,496 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# $Id$
+#
+# Description : This script authenticates the user, and then
+#               displays the opening access page.
+#
+# SBEAMS is Copyright (C) 2000-2021 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+#
+###############################################################################
+
+
+###############################################################################
+# Get the script set up with everything it will need
+###############################################################################
+use strict;
+use vars qw ($q $sbeams $atlas $PROG_NAME
+             $current_contact_id $current_username);
+use lib qw (../../lib/perl);
+use CGI::Carp qw(fatalsToBrowser croak);
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::DataTable;
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::TabMenu;
+
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::PeptideAtlas::BestPeptideSelector;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas;
+
+###############################################################################
+# Global Variables
+###############################################################################
+$PROG_NAME = 'ViewSRMBuild';
+$SBEAMS_SUBDIR = 'PeptideAtlas';
+
+
+$sbeams = new SBEAMS::Connection;
+$atlas = new SBEAMS::PeptideAtlas;
+$atlas->setSBEAMS($sbeams);
+my $peptide_selector = new SBEAMS::PeptideAtlas::BestPeptideSelector;
+$peptide_selector->setAtlas( $atlas );
+$peptide_selector->setSBEAMS( $sbeams );
+my $GV = SBEAMS::Connection::GoogleVisualization->new();
+
+
+my $instrument_map = $peptide_selector->getInstrumentMap();
+$instrument_map->{Any} = 0;
+my %code2instrument = reverse( %{$instrument_map} );
+
+# Coverage hash keyed by build_id
+my %builds;
+my %current_build;
+my %parameters;
+
+main();
+
+
+###############################################################################
+# Main Program:
+#
+# Call $sbeams->Authentication and stop immediately if authentication
+# fails else continue.
+###############################################################################
+sub main
+{
+    # Do the SBEAMS authentication and exit if a username is not returned
+    exit unless ($current_username = $sbeams->Authenticate(
+        permitted_work_groups_ref=>['PeptideAtlas_user','PeptideAtlas_admin',
+        'PeptideAtlas_readonly', 'PeptideAtlas_exec'],
+        #connect_read_only=>1,
+        allow_anonymous_access=>1,
+    ));
+    $sbeams->setSessionAttribute( key => 'PA_resource', value => 'SRMAtlas' );
+
+
+    # Read in the default input parameters
+    my $n_params_found = $sbeams->parse_input_parameters(
+        q=>$q,
+        parameters_ref=>\%parameters
+        );
+    # Process generic "state" parameters before we start
+    $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+    # This will look for mod-specific params and do the right thing
+    $atlas->processModuleParameters(parameters_ref=>\%parameters);
+    $parameters{cov_level} ||= 'cov_3';
+
+    # get project_id
+    my $project_id = $atlas->getProjectID(
+        atlas_build_name => $parameters{atlas_build_name},
+        atlas_build_id => $parameters{atlas_build_id}
+        );
+
+    $atlas->display_page_header(project_id => $project_id);
+
+  my $atlas_build_id = $atlas->getCurrentAtlasBuildID(
+    parameters_ref => \%parameters,
+  );
+	$parameters{atlas_build_id} = $atlas_build_id;
+
+  # Will use passed build_id if any, then cached (cookie) id, then default
+  # If user passed bogus value it should get sorted out here.
+	my $pabst_build_id = $peptide_selector->get_pabst_build( %parameters );
+	$parameters{pabst_build_id} = $pabst_build_id;
+
+  #### Get the HTML to display the tabs
+  my $tabMenu = $atlas->getTabMenu(
+    parameters_ref => \%parameters,
+    program_name => $PROG_NAME,
+  );
+  if ($sbeams->output_mode() eq 'html') {
+    print "<script>document.title = 'SRMAtlas Builds list';</script>";
+    print $tabMenu->asHTML();
+    print "<BR>\n";
+  }
+
+
+    my $content = '';
+		$content .= get_build_list(%parameters);
+    $content .= "<BR>\n";
+    $content .= $sbeams->makeInfoText( "Charts shows detailed coverage plots for selected build, use radio buttons in table (above) to switch <BR>" ); 
+		$content .= get_build_details(%parameters);
+
+    print "$content";
+
+    $atlas->display_page_footer();
+    $sbeams->setSessionAttribute( key => 'PA_resource', value => '' );
+
+
+} # end main
+
+
+###############################################################################
+# Show the main welcome page
+###############################################################################
+sub get_build_details {
+  my %parameters = @_;
+
+  my $section_header = $atlas->encodeSectionHeader(
+    LMTABS => 1,
+    no_toggle => 1,
+    text => "SRMAtlas Build: $builds{$parameters{pabst_build_id}}->{name} ($parameters{pabst_build_id})"
+  );
+
+  my @instruments = sort {$a <=> $b} keys( %{$builds{$parameters{pabst_build_id}}->{instruments}} );
+  push @instruments, shift( @instruments );
+
+  print "<PRE>";
+#  print Dumper( @instruments );
+  print "</PRE>";
+
+  my @samples;
+  my @csamples;
+
+  if ( $current_build{instruments}->{0}->{cov_any} < 500 ) {
+    $current_build{bioseq_cnt} = $current_build{instruments}->{0}->{cov_any};
+  }
+
+  for my $instrument ( @instruments ) {
+    my @inst_row = ( $code2instrument{$instrument} );
+    my @cumulative_row = ( $code2instrument{$instrument} );
+
+    my $cov_0 = $current_build{instruments}->{$instrument}->{cov_0};
+
+
+    if ( $current_build{bioseq_cnt} < 1000 ) {
+      $cov_0 = $current_build{instruments}->{$instrument}->{cov_any} - $current_build{bioseq_cnt};
+      $cov_0 = 0 if $cov_0 < 1;
+    }
+    # Format
+    $cov_0 = sprintf( "%0.1f", 100*($cov_0/$current_build{bioseq_cnt})) if $cov_0;
+
+    push @inst_row, $cov_0;
+    push @cumulative_row, $cov_0;
+
+    my $cumulative;
+    my @individual;
+    my @cumulative;
+    for my $cov ( reverse( qw( cov_1 cov_2 cov_3 cov_4 cov_5 ) ) ) {
+      $cumulative += $current_build{instruments}->{$instrument}->{$cov};
+
+      my $currcum = ( $cumulative ) ? sprintf( "%0.1f", 100*($cumulative/$current_build{bioseq_cnt}) ) : 0;
+      push @cumulative, $currcum;
+
+      my $currval = $current_build{instruments}->{$instrument}->{$cov};
+      $currval = sprintf( "%0.1f", 100*($currval/$current_build{bioseq_cnt}) ) if $currval;
+      push @individual, $currval; 
+    }
+    push @inst_row, reverse( @individual );
+    push @cumulative_row, reverse( @cumulative );
+    push @samples, \@inst_row;
+    push @csamples, \@cumulative_row;
+  }
+
+  my $ichart = make_individual_chart_function( \@samples );
+  my $cchart = make_cumulative_chart_function( \@csamples );
+
+	my $header = $GV->getHeaderInfo();
+
+  my $content = qq~
+  <TABLE width="600">
+  $section_header
+  </TABLE>
+  $header
+  <BR>
+  <H4>Percent peptide per protein coverage (cumulative) for $builds{$parameters{pabst_build_id}}->{name}</H4>
+  $cchart
+  <BR>
+  <BR>
+  <H4>Percent peptide per protein coverage (detailed) for $builds{$parameters{pabst_build_id}}->{name}</H4>
+  $ichart
+  ~;
+#  <TR><TD><TABLE>
+#  </TD></TR></TABLE>
+
+  return "$content";
+}
+
+sub make_individual_chart_function {
+	my $samples = shift || return '';
+
+  my ( $chart ) = $GV->setDrawBarChart(  samples => $samples,
+                                    	data_types => [ 'string', 'number', 'number', 'number', 'number', 'number', 'number' ],
+                                      	headings => [ 'Instrument', '0', '1', '2', '3', '4', '5+' ],
+                                      show_table => 0,
+                                 truncate_labels => 24,
+                                         options =>  "hAxis: {title: 'Percentage'}"
+
+ 	);
+  return ( $chart );
+}
+
+sub make_cumulative_chart_function {
+	my $samples = shift || return '';
+
+  my ( $chart ) = $GV->setDrawBarChart(  samples => $samples,
+                                    	data_types => [ 'string', 'number', 'number', 'number', 'number', 'number', 'number' ],
+                                      	headings => [ 'Instrument', '0', '1+', '2+', '3+', '4+', '5+' ],
+                                      show_table => 0,
+                                 truncate_labels => 24
+ 	);
+  return ( $chart );
+}
+
+
+
+sub get_build_list {
+  my %parameters = @_;
+  my $content = '';
+
+  my $atlas_build_id = $parameters{atlas_build_id};
+
+  #### Read in the standard form values
+  my $apply_action  = $parameters{'action'} || $parameters{'apply_action'};
+  my $TABLE_NAME = $parameters{'QUERY_NAME'};
+
+
+  #### Set some specific settings for this program
+  my $PROGRAM_FILE_NAME = $PROG_NAME;
+  my $base_url = "$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME";
+  my $help_url = "$CGI_BASE_DIR/help_popup.cgi";
+
+
+  #### Get a list of accessible project_ids
+  my @accessible_project_ids = $sbeams->getAccessibleProjects();
+  my $accessible_project_ids = join( ",", @accessible_project_ids ) || '0';
+
+  # Get and cache all build stats
+  my $stats_sql = qq~
+  SELECT PBS.* 
+  FROM $TBAT_PABST_BUILD_STATISTICS PBS
+  JOIN $TBAT_PABST_BUILD PB
+    ON PB.pabst_build_id = PBS.build_id
+  WHERE project_id IN ( $accessible_project_ids )
+  ~;
+
+  my $sth = $sbeams->get_statement_handle( $stats_sql );
+  use Data::Dumper;
+  my %f;
+  my $cnt;
+  for my $f ( @{$sth->{NAME}} ) {
+    $f{$f} = $cnt++;
+  }
+#  die Dumper( %f );
+
+# builds is a global object
+#  my %builds;
+
+  my %cover;
+	while ( my $row = $sth->fetchrow_hashref() ) {
+    $builds{$row->{build_id}} ||= {};
+    $builds{$row->{build_id}}->{bioseq_id} = $row->{ref_db};
+    $builds{$row->{build_id}}->{bioseq_cnt} = $row->{ref_db_cnt};
+    $builds{$row->{build_id}}->{instruments} ||= {}; 
+    $builds{$row->{build_id}}->{instruments}->{$row->{instrument_id}} ||= {};;
+
+    for my $cov ( qw( cov_0 cov_1 cov_2 cov_3 cov_4 cov_5 cov_any ) ) {
+      $cover{$cov} ||= {};
+      $cover{$cov}->{$row->{instrument_id}} ||= {};
+      $cover{$cov}->{$row->{instrument_id}}->{$row->{build_id}} = $row->{$cov};
+      $builds{$row->{build_id}}->{instruments}->{$row->{instrument_id}}->{$cov} = $row->{$cov};
+    }
+
+  }
+
+  # Copy data prior to making it 'cumulative'
+  my $curr = $builds{$parameters{pabst_build_id}};
+  $current_build{bioseq_id} = $curr->{bioseq_id};
+  $current_build{bioseq_cnt} = $curr->{bioseq_cnt};
+  $current_build{instruments} = {};
+  for my $inst ( keys( %{$curr->{instruments}} ) ) {
+    for my $cov (  qw( cov_0 cov_1 cov_2 cov_3 cov_4 cov_5 cov_any ) ) { 
+      $current_build{instruments}->{$inst}->{$cov} = $curr->{instruments}->{$inst}->{$cov};
+    }
+  }
+
+
+
+  for my $bid ( keys( %builds ) ) {
+    for my $instr ( keys( %{$builds{$bid}->{instruments}} ) ) {
+      my $above = 0;
+      for my $cov ( qw( cov_5 cov_4 cov_3 cov_2 cov_1 ) ) {
+        my $incr = $above;
+        $above += $builds{$bid}->{instruments}->{$instr}->{$cov};
+        $builds{$bid}->{instruments}->{$instr}->{$cov} += $incr if $incr;
+      }
+    }
+  }
+  my @instruments = sort {$a <=> $b} keys( %{$cover{cov_any}} );
+  push @instruments, shift( @instruments );
+
+  my $sql = qq~
+    SELECT pabst_build_id, build_name, build_comment
+		FROM $TBAT_PABST_BUILD PB 
+		JOIN $TB_ORGANISM O ON O.organism_id = PB.organism_id
+    WHERE PB.project_id IN ( $accessible_project_ids )
+    ORDER BY organism_name ASC, build_name ASC
+    ~;
+    my @atlas_builds = $sbeams->selectSeveralColumns($sql);
+
+    #### If the output_mode is HTML, then display the form
+    if ($sbeams->output_mode() eq 'html') {
+
+    $content .= qq~
+      <script LANGUAGE="Javascript">
+        function switchBuild() {
+          document.BuildList.apply_action.value = "GO";
+          document.BuildList.submit();
+        }
+      </script>
+      ~;
+
+    $content .= $q->start_form(-method=>"POST",
+                           -action=>"$base_url",
+		                         -name=>"BuildList",
+                          );
+    }
+
+
+    my $table = SBEAMS::Connection::DataTable->new();
+
+    my @inst_headings = @code2instrument{@instruments};
+    my $headings = [ '', 'Build Name', 'RefDB proteins', @inst_headings, 'Comment' ];
+    my $heading_defs = { '' => 'Build Selector', 'Build Name' => 'Name of SRMAtlas build',
+                'RefDB proteins' => 'Number of entries in source proteome - some builds cover only a sub-proteome',
+                   'Comment' => 'Description of SRMAtlas build' };
+
+    for my $inst ( @instruments ) {
+      $heading_defs->{$code2instrument{$inst}} = "Number of proteins seen with $code2instrument{$inst} at specified coverage";
+    }
+
+    my $full_headings = $atlas->make_annotation_text( label_hash => $heading_defs, label_order => $headings );
+
+    my %cov_defs = ( cov_1 => "Proteins covered by 1 or more peptides on specified instrument",
+                     cov_2 => "Proteins covered by 2 or more peptides on specified instrument",
+                     cov_3 => "Proteins covered by 3 or more peptides on specified instrument",
+                     cov_4 => "Proteins covered by 4 or more peptides on specified instrument",
+                     cov_5 => "Proteins covered by 5 or more peptides on specified instrument" );
+ 
+    $content .= $sbeams->makeInfoText( "Table shows $cov_defs{$parameters{cov_level}}, coverage can be changed using SELECT list below the table.<BR>" );
+        
+
+    my $help_text = $atlas->make_table_help( 
+                                               entries => $full_headings,
+                                          );
+#                                               footnote => $cover_def
+    $content .= $help_text;
+
+    my $bioseq_sets = $atlas->getBiosequenceSets();
+
+    my @builds = ( $headings );
+    # build has id, name, comment
+    # %builds has the rest, keyed by build_id->instr->cov_depth
+    foreach my $build ( @atlas_builds ) {
+#			next unless $build->[9];
+# [ '', 'Build Name', 'RefDB', 'RefDB proteins', @inst_headings, 'Comment' ];
+
+      $builds{$build->[0]}->{name} = $build->[1];
+      my $selected = '';
+      my $bgcolor = '#dddddd';
+      if ($build->[0] == $parameters{pabst_build_id} ) {
+        $selected = 'CHECKED ';
+      }
+      my $radio = qq~
+        <INPUT $selected TYPE="radio" NAME="pabst_build_id" VALUE="$build->[0]" onClick=blur() onChange="switchBuild()">
+      ~;
+
+      $build->[2] = $sbeams->truncateStringWithMouseover( len => 60, 
+                                                       string => $build->[2],
+                                                  add_elipses => 1,
+                                               suppress_class => 1 );
+
+#          $bioseq_sets->{$builds{$build->[0]}->{bioseq_id}},
+
+      my $ref_db_cnt = $builds{$build->[0]}->{bioseq_cnt};
+      my $ref_supp = '';
+      # Sub proteome!
+      if ( $builds{$build->[0]}->{instruments}->{0}->{cov_any} < 1000 ) {
+        $ref_db_cnt = $builds{$build->[0]}->{instruments}->{0}->{cov_any};
+        $builds{$build->[0]}->{bioseq_cnt} = $ref_db_cnt;
+        $ref_supp = ' (sub-proteome)';
+      }
+
+      my @build_row = ( $radio, $build->[1], $ref_db_cnt . $ref_supp );
+
+      print "<PRE>";
+      for my $id ( @instruments ) {
+        my $cnt = '&nbsp;-&nbsp;';
+        if ( $builds{$build->[0]}->{instruments}->{$id} ) {
+#          print "we have $id for $build->[0]\n";
+          if ( $builds{$build->[0]}->{instruments}->{$id}->{$parameters{cov_level}} ) {
+#            print "we have $parameters{cov_level}!!\n";
+#            $cnt = sprintf( "%0.1f", 100*$builds{$build->[0]}->{instruments}->{$id}->{$parameters{cov_level}}/$ref_db_cnt ) . '%'; 
+            $cnt = sprintf( "%0.1f", 100*$builds{$build->[0]}->{instruments}->{$id}->{$parameters{cov_level}}/$ref_db_cnt ) . '%'; 
+          }
+        }
+        push @build_row, $cnt;
+      }
+#      print "build is $build->[0], cov is $parameters{cov_level}";
+#      print Dumper( $builds{$build->[0]} );
+      print "</PRE>";
+
+      push @build_row, $build->[2];
+
+      push @builds, \@build_row;
+    }
+
+    my ( $html, $rs_name ) = $atlas->encodeSectionTable( header => 1,
+                                                        width => '600',
+                                                         rows => \@builds,
+                                                 rows_to_show => 5000,
+                                                     max_rows => 5000,
+                                                    help_text => '',
+                                                        align => [ qw( center left right right right right right right right left ) ],
+                                                     bg_color => '#EAEAEA',
+                                                     sortable => 0,
+                                                     table_id => 'SRMAtlas',
+                                                     );
+
+#   $table->setColAttr(  COLS => [2..8], ROWS => [1..$table->getRowNum()], ALIGN => 'RIGHT' );
+#  $html =~ s/TABLE NOOP/TABLE style="display:none" NOOP/gm;
+
+
+  $content .= "<TABLE>$html</TABLE>";
+
+  $content .= get_cover_select(); 
+  $content .= $q->hidden( "apply_action", '');
+  $content .= $q->end_form;
+
+  return $content;
+} # get_build_list 
+
+sub get_cover_select {
+
+  my %selected = ( cov_1 => '', cov_2 => '', cov_3 => '', cov_4 => '', cov_5 => '' );
+  $selected{$parameters{cov_level}} = 'selected';
+
+  my $select = qq~
+  <SELECT NAME=cov_level onChange="submit()">
+  <OPTION VALUE=cov_1 $selected{cov_1}> Covered by one or more peptide(s) </OPTION>
+  <OPTION VALUE=cov_2 $selected{cov_2}> Covered by two or more peptides </OPTION>
+  <OPTION VALUE=cov_3 $selected{cov_3}> Covered by three or more peptides </OPTION>
+  <OPTION VALUE=cov_4 $selected{cov_4}> Covered by four or more peptides </OPTION>
+  <OPTION VALUE=cov_5 $selected{cov_5}> Covered by five or more peptides </OPTION>
+  </SELECT>
+  ~;
+  return $select;
+}

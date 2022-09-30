@@ -1,0 +1,171 @@
+<!-- <script type="text/javascript" src="../../../usr/javascript/chromavis/js/visquick-core-1.0/google-code.js"></script> -->
+<script type="text/javascript" src="../../usr/javascript/chromavis/js/visquick-core-1.0/protovis-r3.3.1.js"></script>
+<script type="text/javascript" src="../../usr/javascript/chromavis/js/visquick-core-1.0/visquick-utils.js"></script>
+    <script type="text/javascript" language="javascript" src="../../usr/javascript/chromavis/js/chromavis.js"></script>
+    <script type="text/javascript" language="javascript" src="../../usr/javascript/chromavis/js/jx.js"></script>
+
+
+
+<script type="text/javascript">
+
+    var x_lock = true;
+    var y_lock = true;
+    var chromavis_left=new vq.ChromaVis();
+    var chromavis_right=new vq.ChromaVis();
+    function toggle_y_axis() {
+        y_lock = !y_lock;
+	document.getElementById('yaxis_toggle').innerHTML =
+	  'Y&nbsp;<img border=0 src=../../images/' +
+	  (!y_lock ? 'unlocked' : 'locked') +
+	  '.bmp alt=\'Y-Axis ' +
+	  (!y_lock ? 'Unlocked' : 'Locked') +
+	  '\'>';
+        updateConnections();
+    }
+
+    function toggle_x_axis() {
+        x_lock = !x_lock;
+	document.getElementById('xaxis_toggle').innerHTML =
+	  'X&nbsp;<img border=0 src=../../images/' +
+	  (!x_lock ? 'unlocked' : 'locked') +
+	  '.bmp alt=\'X-Axis ' +
+	  (!x_lock ? 'Unlocked' : 'Locked') +
+	  '\'>';
+        updateConnections();
+    }
+
+    function updateConnections() {
+        chromavis_right.unSlaveFrom(chromavis_left.uuid());
+        chromavis_left.unSlaveFrom(chromavis_right.uuid());
+        chromavis_right.slaveTo(chromavis_left.uuid(),x_lock,y_lock);
+        chromavis_left.slaveTo(chromavis_right.uuid(),x_lock,y_lock);
+    }
+
+    function toggle_autoscale_y(checked) {
+        chromavis_left.auto_update_scale_y(checked);
+        chromavis_right.auto_update_scale_y(checked);
+        max_y_axis_value.disabled = checked;
+        return false;
+    }
+
+    function defaultConfig() {
+        return  {
+            DATATYPE : "vq.models.ChromaVisData",
+            CONTENTS :{
+                PLOT : {
+                    container :document.getElementById("chromavis_right"),
+                    width : 400,
+                    height: 300,
+                    auto_scale_x : true,
+                    auto_scale_y : true,
+                    auto_update_scale_y : auto_scale_y.checked,
+                    min_y_axis_value : 0,
+                    vertical_padding : 20,
+                    horizontal_padding: 10,
+                    legend_width : 100,
+		     eri_gauge : true,
+                    font :"10px sans"
+                },
+                data_array : [],
+                vertical_marker_array : [{id:'Retention Time', value:2800}],
+                data_contents_id : 'data',
+                data_label : 'label',
+                x_axis_label: 'Time(min)',
+                y_axis_label: 'Intensity',
+                x_column_id: 'time',
+                y_column_id: 'intensity',
+                dispatch_events : true,
+                line_width : 2,
+		eri_bubble_max: 1,
+		eri_id : 'eri',
+                tooltip_items : {Label : function(c,d) {return d['label']},Time : 'time' , Intensity : 'intensity'},
+                stroke_style : pv.Colors.category10().by(function() {return this.index;})
+            }
+        };
+    }
+
+    function update_chromavis(id,side)     {
+              jx.load('getChromatogramInfo?SEL_chromatogram_id=' + id, function(response){
+                  renderChromavis(response,side);
+              },'json');
+        }
+
+        function renderChromavis(json,side) {
+            var chromavis = side == 'left' ? chromavis_left : chromavis_right;
+             var config = defaultConfig();
+
+	     var info_html = "<span style='font-size:12px'>";
+	     info_html += json.info[0].top_html;
+	     info_html += "</span>";
+	    document.getElementById(side+"_info").innerHTML=info_html;
+
+	    var labels = pv.map(json.data_json, function(data){ return data.label;});
+	    var labels_html = " <span style='font-size:9px'>";
+	    labels.forEach(function(data){ 
+		labels_html += data+"<br>";})
+	      labels_html += "</span>";
+	    document.getElementById(side+"_legend").innerHTML=labels_html;
+
+	    json.data_json.forEach(function(data){ 
+		data.label=data.label.split(" ")[0];})
+
+            config.CONTENTS.PLOT.container = document.getElementById("chromavis_" + side);
+            config.CONTENTS.data_array = json.data_json;
+	    config.CONTENTS.PLOT.auto_update_scale_y = auto_scale_y.checked;
+            config.CONTENTS.vertical_marker_array = json.vmarker_json;
+            chromavis.draw(config);
+            updateConnections();
+        }
+
+
+    function renderChromatogram(){
+        var plotListener = function(x) { var array_str='';
+            for (var key in x) {
+                if (!key) {continue;}
+                array_str += key; array_str += ": "; array_str+=x[key] + ", ";
+            }
+            console.log('Clicked on object with data: ' + array_str)
+        };
+
+    }
+
+
+</script>
+<br/>
+<div id="instructions">Select left and right chromatograms from the Results
+  tab.<br> Drag the red area over the context panel to shift the focus panel.  When the cursor is a crosshair, you may
+  draw a new context window.
+  Lock/unlock X and Y axes as desired.<br>&nbsp;<br></div>
+<div style="width:900px;display:block">
+
+  <div id="chromavis_left_parent"  style="width:435px;display:inline-block;">
+    <div id="left_info">
+    </div>
+    <div id="chromavis_left">
+    </div>
+    <div id="left_legend">
+    </div>
+  </div>
+
+    <div style="top:0;width:30px;display:inline-block;"><a id="yaxis_toggle" href="#" onclick="toggle_y_axis();return false;">Y&nbsp;<img border=0 src=../../images/locked.bmp alt=\'Y-Axis Locked\'></a><br/><br/>
+      <a  id="xaxis_toggle"  href="#" onclick="toggle_x_axis();return false;">X&nbsp;<img border=0 src=../../images/locked.bmp alt=\'X-Axis Locked\'></a>
+    </div>
+
+  <div id="chromavis_right_parent"  style="width:435px;display:inline-block;">
+    <div id="right_info">
+    </div>
+    <div id="chromavis_right">
+    </div>
+    <div id="right_legend">
+    </div>
+  </div>
+</div>
+
+<br>
+<input type="checkbox" id="auto_scale_y" onchange="toggle_autoscale_y(this.checked);">
+Auto Scale Y Axis
+</input>
+<br/>
+Max Y Value:&nbsp;&nbsp;&nbsp;<input type="range" id="max_y_axis_value" min="10" max="3000" step="10"
+                                     onchange="chromavis_left.max_y_axis_value(this.value);y_val_label.innerHTML = this.value; chromavis_left.drawPanel.render();return false;" />
+<span id ="y_val_label"></span>

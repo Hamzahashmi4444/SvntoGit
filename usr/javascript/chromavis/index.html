@@ -1,0 +1,140 @@
+<!-- Begin Chromavis index.html -->
+<script type="text/javascript"
+  src="../../usr/javascript/chromavis/js/visquick-core-1.0/google-code.js"></script>
+<script type="text/javascript" src="../../usr/javascript/chromavis/js/visquick-core-1.0/protovis-r3.3.1.js"></script>
+<script type="text/javascript" src="../../usr/javascript/chromavis/js/visquick-core-1.0/visquick-utils.js"></script>
+    <script type="text/javascript" language="javascript" src="../../usr/javascript/chromavis/js/chromavis.js"></script>
+    <script type="text/javascript" language="javascript" src="../../usr/javascript/chromavis/js/jx.js"></script>
+
+<!--[if lt IE 9]>      
+    <script type="text/javascript"
+     src="../../usr/javascript/chromavis/js/CFInstall.min.js"></script>
+
+    <style>
+     .chromeFrameInstallDefaultStyle {
+       width: 100%; /* default is 800px */
+       border: 5px solid blue;
+     }
+    </style>
+            <div id="notice"></div>
+            <div id="prompt"></div>
+
+    <script>
+          function displayGCFText() {
+            document.getElementById('notice').innerHTML = "Internet Explorer has been detected." +
+            "Please install the Google Chrome Frame if it is not already installed.  This will enable" +
+            "HTML5 features necessary for the web application.<p>"+
+            "If the install panel does not appear, please enable Compatibility mode in your browser and reload this page.";
+            };
+     // The conditional ensures that this code will only execute in IE,
+     // Therefore we can use the IE-specific attachEvent without worry
+     window.attachEvent("onload", function() {
+       CFInstall.check({
+         mode: "inline", // the default
+         node: "prompt"
+       });
+     });
+    </script>
+  <![endif]-->
+
+
+<div id="masterContainer"  style="display:block;float:none;"></div>
+<div id="scrollContainer" style="display:block;float:none;"></div>
+
+<script type="text/javascript">
+
+    var chromavis;
+
+    <!-- placeholder string is replaced with multi-line json object -->
+    <!-- in traces2json() in Chromatogram.pm -->
+    var json_string =  
+      JSON_PLACEHOLDER 
+    ; 
+    var default_smooth_width=DEFAULT_SMOOTHING_PH;
+
+    function renderChromatogram(smooth_width){
+	  chromavis = new vq.ChromaVis();
+	  var vmarker_json = json_string.vmarker_json;
+	  var auto_scale = document.getElementById('auto_scale_y').checked;
+	  JSON.clone = function (obj) {
+	    return JSON.parse( JSON.stringify( obj ) );
+	  };
+	  var data_json = JSON.clone(json_string.data_json);
+	  smoothChromatogram(data_json,smooth_width);
+	  var data = {
+	    DATATYPE : "vq.models.ChromaVisData",
+	    CONTENTS : {
+	         PLOT: {
+			container :document.getElementById("masterContainer"),
+			width : 700,
+			height: 400,
+      X_AXIS_PLACEHOLDER
+			auto_scale_y : true, 
+			auto_update_scale_y : auto_scale,
+			min_y_axis_value : 0,
+			vertical_padding : 20,
+                        horizontal_padding: 40,
+                        legend_width : 130,
+                        context_height : 50,
+                        eri_gauge : true
+                        },
+                    data_array : data_json,
+                    data_label : 'label',
+                    vertical_marker_array : vmarker_json,
+                    x_axis_label: 'Time(min)',
+                    y_axis_label: 'Intensity',
+                    data_contents_id : 'data',
+                    x_column_id: 'time',
+                    y_column_id: 'intensity',
+		    eri_bubble_max: 1,
+                    line_width : 2,
+                    eri_id : 'eri',
+                    tooltip_items : {Time : 'time', Intensity : 'intensity'},
+                    stroke_style : pv.Colors.category10().by(function() {return this.index;})
+            }
+        };
+
+        chromavis.draw(data);
+      
+    }
+
+    function smoothChromatogram(data_array,smooth_width) {
+      if ((smooth_width == 0) || (smooth_width == 1)) return;
+      var ntraces = data_array.length;
+      var halfwidth = (smooth_width-1)/2;
+      for (i = 0; i < ntraces; i++ ) {
+	trace = data_array[i];
+	var ntimepoints = trace.data.length;
+	for (j = halfwidth; j < ntimepoints-halfwidth; j++) {
+	  var timepoint = trace.data[j];
+	  var sum_intensity_over_width = 0;
+	  for (k = j-halfwidth; k <= j+halfwidth; k++) {
+	    sum_intensity_over_width += trace.data[k].intensity;
+	  }
+	  var smoothed_intensity = sum_intensity_over_width / smooth_width;
+	  timepoint.intensity = smoothed_intensity;
+	}
+      }
+    }
+
+    
+google.setOnLoadCallback(function() {renderChromatogram(default_smooth_width);})
+
+</script>
+
+<div id="instructions">Drag the red area over the context panel to shift the focus panel.  When the cursor is a crosshair, you may
+draw a new context window.</div>
+<br/>
+
+<!-- put forms between the rows of an empty table to force them not to stack vertically -->
+<table><tr><td></td></tr>
+<input type="checkbox" id="auto_scale_y" onchange="chromavis.auto_update_scale_y(this.checked); return false;">Auto Scale Y Axis</input>
+&nbsp;&nbsp;
+&nbsp;&nbsp;
+&nbsp;&nbsp;Smoothing width:
+<form>
+  SMOOTHING_SELECT_PH 
+</form>
+<tr><td></td></tr></table>
+
+<!-- End Chromavis index.html -->

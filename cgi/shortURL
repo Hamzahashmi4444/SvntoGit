@@ -1,0 +1,112 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : main.cgi
+# Author      : Eric Deutsch <edeutsch@systemsbiology.org>
+# $Id: shortURL 5692 2008-07-08 17:17:27Z dcampbel $
+#
+# Description : implements caching of (potentially long) urls and retrieval
+# via 10 character alphanumeric 'url_key'
+#
+# SBEAMS is Copyright (C) 2000-2005 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+###############################################################################
+
+
+use strict;
+use FindBin;
+use lib "$FindBin::Bin/../lib/perl";
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::SBPage;
+use SBEAMS::Connection::Tables;
+
+{  # 'Main' block
+
+  my $sbeams = new SBEAMS::Connection;
+
+  exit unless $sbeams->Authenticate( allow_anonymous_access => 1 );
+
+  # Read cgi parameters
+  my %params;
+  $sbeams->parse_input_parameters( q => $q, parameters_ref => \%params );
+
+  die ( "missing required parameter key" ) unless $params{key};
+
+  my $sql = "SELECT URL from $TB_SHORT_URL WHERE url_key = '$params{key}'";
+
+  my ( $url ) = $sbeams->selectOneColumn( $sql );
+
+  # our version of DBD::Sybase doesn't support bind params, so we may have been
+  # forced to substitute in two single quotes for each one in the url.  Fix if
+  # and when it becomes feasible, patch with this hack for now:
+  $url =~ s/\'\'/\'/g;
+
+  # HTML page to return;
+  my $page;
+
+  if ( $url ) {
+
+    # Should we implement a 'post_only' for URLs that we don't want to expose?
+    
+    if ( $url !~ /\?/ || $params{get_only} || length($url) < 2080 ) {
+      # URL but no params, or manageable url => simple redirect.
+      $sbeams->sbeams_redirect( uri => $url );
+      exit;  # superfluous?
+    }
+    
+
+    # Otherwise, make an autosubmit form page.
+    $page = SBEAMS::Connection::SBPage->new( user_context => 0,
+                                                   sbeams => $sbeams,
+                                                  minimal => 1,
+                                                   onload => "document.shortform.submit()" );
+    my $form =  getPOSTForm( $url );
+    $page->addContent( $form );
+
+  } else { 
+
+    $page = SBEAMS::Connection::SBPage->new( user_context => 1,
+                                                      sbeams => $sbeams );
+
+    $page->addContent( <<"    END" );
+      <FONT COLOR=RED ><B> Error: </B></FONT>
+      The specified url key ($params{url_key}) wasn't found in the database
+    END
+  }
+  $page->printPage(); 
+
+} # end main
+
+#
+# A little dicey, but we are trying to parse params and pass them as hidden
+# parameters in a form that gets submitted on load.
+#
+sub getPOSTForm { 
+  my $url = shift || die "Missing required parameter: URL";
+
+  my ( $action, $querystring ) = split( /\?/, $url);
+
+  return $action unless $querystring;
+
+  my $form = "<FORM ACTION='$action' NAME=shortform METHOD=POST >\n";
+
+  my @args = split "&", $querystring;
+  for my $arg ( @args ) {
+    my @opts = split ";", $arg;
+    for my $param ( @opts ) {
+      my ($name, $value) = split("=", $param);
+      for my $var ( $name, $value ) {
+        $var = $q->unescape( $var );
+        $var =~ s/\ /\+/g;
+      }
+      
+      $form .= "<INPUT TYPE=HIDDEN NAME='$name' VALUE='$value'>\n";
+    }
+  }
+  $form .= "<FORM>\n";
+  return $form;
+}
+

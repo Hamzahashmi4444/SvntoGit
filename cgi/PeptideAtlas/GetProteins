@@ -1,0 +1,2041 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : GetProteins
+# Author      : Eric Deutsch <edeutsch@systemsbiology.org>
+# $Id: GetPeptides 5436 2007-07-03 23:56:02Z sloeveni $
+#
+# Description : This program that allows users to
+#               get proteins from the PeptideAtlas based on various criteria.
+#
+# SBEAMS is Copyright (C) 2000-2021 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+#
+###############################################################################
+
+
+###############################################################################
+# Set up all needed modules and objects
+###############################################################################
+use strict;
+use Getopt::Long;
+use FindBin;
+use Data::Dumper;
+
+use lib "$FindBin::Bin/../../lib/perl";
+use vars qw ($sbeams $sbeamsMOD $q $current_contact_id $current_username
+             $accessible_project_ids 
+             $PROG_NAME $USAGE %OPTIONS $QUIET $VERBOSE $DEBUG $DATABASE
+             $TABLE_NAME $PROGRAM_FILE_NAME $CATEGORY $DB_TABLE_NAME
+             @MENU_OPTIONS);
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::TabMenu;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::BioLink::Tables;
+
+#use lib "$FindBin::Bin";     # I'm 90% sure we don't need these
+#use lib "/net/db/projects/PeptideAtlas/pipeline/bin";
+use lib "/net/db/projects/PeptideAtlas/pipeline/lib/ensembl/modules";
+use DBI;
+
+use Bio::Graphics::Panel;
+use Bio::SeqFeature::Generic;
+use Bio::EnsEMBL::Registry;
+
+$sbeams = new SBEAMS::Connection;
+$sbeamsMOD = new SBEAMS::PeptideAtlas;
+$sbeamsMOD->setSBEAMS($sbeams);
+$sbeams->setSBEAMS_SUBDIR($SBEAMS_SUBDIR);
+
+
+###############################################################################
+# Set program name and usage banner for command line use
+###############################################################################
+$PROG_NAME = $FindBin::Script;
+$USAGE = <<EOU;
+Usage: $PROG_NAME [OPTIONS] key=value key=value ...
+Options:
+  --verbose n         Set verbosity level.  default is 0
+  --quiet             Set flag to print nothing at all except errors
+  --debug n           Set debug flag
+
+ e.g.:  $PROG_NAME [OPTIONS] [keyword=value],...
+
+EOU
+
+#### Process options
+unless (GetOptions(\%OPTIONS,"verbose:s","quiet","debug:s")) {
+  print "$USAGE";
+  exit;
+}
+
+$VERBOSE = $OPTIONS{"verbose"} || 0;
+$QUIET = $OPTIONS{"quiet"} || 0;
+$DEBUG = $OPTIONS{"debug"} || 0;
+if ($DEBUG) {
+  print "Options settings:\n";
+  print "  VERBOSE = $VERBOSE\n";
+  print "  QUIET = $QUIET\n";
+  print "  DEBUG = $DEBUG\n";
+}
+
+
+###############################################################################
+# Set Global Variables and execute main()
+###############################################################################
+main();
+exit(0);
+
+
+###############################################################################
+# Main Program:
+#
+# Call $sbeams->Authenticate() and exit if it fails or continue if it works.
+###############################################################################
+sub main {
+
+  #### Do the SBEAMS authentication and exit if a username is not returned
+  exit unless ($current_username = $sbeams->Authenticate(
+    #permitted_work_groups_ref=>['PeptideAtlas_user','PeptideAtlas_admin'],
+    # connect_read_only=>1,
+    allow_anonymous_access=>1,
+  ));
+
+
+  #### Read in the default input parameters
+  ### TMF: these are input via the form, which is defined
+  ###   in PeptideAtlas_table_column.txt under GetProteins.
+  my %parameters;
+
+  $parameters{uploaded_file_not_saved} = 1;
+
+  my $n_params_found = $sbeams->parse_input_parameters(
+    q=>$q,parameters_ref=>\%parameters);
+     #$sbeams->printDebuggingInfo($q);
+
+  #### Process generic "state" parameters before we start
+  $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+  if($parameters{n_observations_constraint} ne ''){
+    if($parameters{n_observations_constraint} =~ /([><=]+)/){
+      
+      $parameters{n_observations_constraint_sign} = $1;
+      $parameters{n_observations_constraint_sign} =~ s/$1//;
+    }else{
+       $parameters{n_observations_constraint_sign} = " == ";
+    }
+  }
+  if($parameters{n_distinct_peptides_constraint} ne ''){
+    if($parameters{n_distinct_peptides_constraint} =~ /([><=]+)/){
+
+      $parameters{n_distinct_peptides_constraint_sign} = $1;
+      $parameters{n_distinct_peptides_constraint_sign} =~ s/$1//;
+    }else{
+      $parameters{n_distinct_peptides_constraint_sign} = " == ";
+    }
+  }
+ 
+ 
+  #### Decide what action to take based on information so far
+  if ($parameters{action} eq "???") {
+
+    # Some action
+
+  } else {
+
+    my $project_id = $sbeamsMOD->getProjectID(
+        atlas_build_id => $parameters{atlas_build_id}
+        );
+
+
+    $sbeamsMOD->display_page_header(
+      project_id => $project_id,
+      use_tabbed_panes=> '1',
+    );
+
+    handle_request(ref_parameters=>\%parameters);
+
+    $sbeamsMOD->display_page_footer(
+      use_tabbed_panes=> '1',
+    );
+
+  }
+
+
+
+} # end main
+
+
+###############################################################################
+# Handle Request
+###############################################################################
+sub handle_request {
+  my %args = @_;
+
+  #### Process the arguments list
+  my $ref_parameters = $args{'ref_parameters'}
+
+    || die "ref_parameters not passed";
+  my %parameters = %{$ref_parameters};
+
+  #### Declare some variables
+  my ($chrom_num, $genetic_locus, $stend_option, $no_coord_count, $pid, $map, $file_name, $tmp_img_path);
+  my $get_coverage_density_only = 0;
+
+  #### Show current user context information
+  #$sbeams->printUserContext();
+
+  #### Get the HTML to display the tabs
+  my $tabMenu = $sbeamsMOD->getTabMenu(
+    parameters_ref => \%parameters,
+    program_name => $PROG_NAME,
+  );
+  if ( $sbeams->output_mode() eq 'html' ) {
+    print $tabMenu->asHTML();
+    print "<script>document.title = 'PeptideAtlas: Get Proteins';</script>";
+    if ( my $msg = $q->cookie( 'SubmitMessage' ) ) {
+      print qq~
+      <br>
+      <div class=info_box id=gt_info>$msg</div>
+      <script type="text/javascript">
+        setTimeout(function() {
+          var gt_info = document.getElementById( 'gt_info' );
+          gt_info.style.display = 'none';
+        }, 10000);
+      </script>
+      <br>
+      ~
+    }
+  }
+
+
+  #### Get the current atlas_build_id based on parameters or session
+  my $atlas_build_id = $sbeamsMOD->getCurrentAtlasBuildID(
+    parameters_ref => \%parameters,
+  );
+  if (defined($atlas_build_id) && $atlas_build_id < 0) {
+    return;
+  }
+  $parameters{atlas_build_id} = $atlas_build_id;
+
+  ### Get atlas build name.
+   my $sql = qq~
+    SELECT atlas_build_name
+    FROM $TBAT_ATLAS_BUILD
+    WHERE atlas_build_id = $atlas_build_id
+    ~;
+  my ($atlas_build_name) = $sbeams->selectOneColumn($sql);
+  #### Define some generic variables
+  my ($i,$element,$key,$value,$line,$result,$sql);
+
+
+  #### Define some variables for a query and resultset
+  my %resultset = ();
+  my $resultset_ref = \%resultset;
+  my (%url_cols,%hidden_cols,%max_widths,$show_sql);
+
+  #### Read in the standard form values
+  my $apply_action  = $parameters{'action'} || $parameters{'apply_action'};
+
+  # for some reason, this returns nothing.
+  # Used to return GetProteins instead of GetProteins_beta
+  my $TABLE_NAME = $parameters{'QUERY_NAME'};
+
+  #### Set some specific settings for this program
+  my $CATEGORY="Get Proteins";
+  $TABLE_NAME="AT_GetProteins" unless ($TABLE_NAME);
+  ($PROGRAM_FILE_NAME) =
+    $sbeamsMOD->returnTableInfo($TABLE_NAME,"PROGRAM_FILE_NAME");
+  my $base_url = "$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME";
+
+  #### Print link to old GetProteins cgi -- DISABLED 5/2021 LM
+  if (0) {  #$sbeams->output_mode() eq 'html') {
+    my $BYPEP_TABLE_NAME="AT_GetProteinsByPep";
+    my ($BYPEP_PROGRAM_FILE_NAME) =
+      $sbeamsMOD->returnTableInfo($BYPEP_TABLE_NAME,"PROGRAM_FILE_NAME");
+    my $alt_base_url = "$CGI_BASE_DIR/$SBEAMS_SUBDIR/$BYPEP_PROGRAM_FILE_NAME";
+    my $getProteinsByPep_call = 
+	"\"$alt_base_url\?atlas_build_id=$parameters{atlas_build_id}\&input_form_format=minimum_detail\"";
+    print "<p><b><a href=$getProteinsByPep_call>Pre-2010 version</a></b> provides Best Peptide Probability, N Protein Mappings, N Genome Locations and Sample  constraints, but no protein presence level information.</p>";
+  }
+
+  #### Get the columns and input types for this table/query
+  ### TMF:
+  ### At this point, $TABLE_NAME is AT_GetProteins,
+  ### @columns contains the user-specifiable constraints
+  ### and I will need to modify it to constrain the display
+
+  # debugging
+  my @columns = $sbeamsMOD->returnTableInfo($TABLE_NAME,"ordered_columns");
+  if (0) {
+    for my $col (@columns) {
+      print "$col\n";
+    }
+  }
+
+  ### TMF: hash column name => text, optionList, etc.
+  my %input_types = 
+    $sbeamsMOD->returnTableInfo($TABLE_NAME,"input_types");
+
+
+  #### Read the input parameters for each column
+  my $n_params_found = $sbeams->parse_input_parameters(
+    q=>$q,parameters_ref=>\%parameters,
+    columns_ref=>\@columns,input_types_ref=>\%input_types);
+   #$sbeams->printDebuggingInfo($q);
+
+
+  #### If the apply action was to recall a previous resultset, do it
+  my %rs_params = $sbeams->parseResultSetParams(q=>$q);
+  if ($apply_action =~ /VIEWRESULTSET|VIEWPLOT/ ) {
+    $sbeams->readResultSet(
+        resultset_file=>$rs_params{set_name},
+        resultset_ref=>$resultset_ref,
+        query_parameters_ref=>\%parameters
+    );
+    $n_params_found = 99;
+  }
+
+
+  #### Set some reasonable defaults if no parameters supplied
+  unless ($n_params_found) {
+    $parameters{input_form_format} = "minimum_detail";
+    $parameters{presence_level_constraint} = "1";
+    $parameters{redundancy_constraint} = "4";
+    $parameters{protein_properties_constraint} = "2";
+    $parameters{covering_constraint} = "0";
+  }
+
+
+
+  #### Apply any parameter adjustment logic
+  # None
+  if($atlas_build_name =~/Origene/i){
+    my %hidden_parameters=();
+    my %display_parameters = ();
+    foreach my $p (qw(start_in_chromosome 
+                      protein_group_representative_constraint
+                      chromosome
+                      redundancy_constraint
+                      end_in_chromosome
+                      presence_level_constraint
+                      strand
+                      genetic_locus
+                      covering_contraint
+                      protein_probability_constraint
+                      gene_annotation_level_constraint
+                      covering_constraint
+                      protein_property_constraint  
+                      )){
+          
+      $hidden_parameters{$p} = 1;
+    }
+    $display_parameters{tube_constraint} = 1;
+    $display_parameters{sku_constraint} = 1;
+    my $atlas = new SBEAMS::PeptideAtlas;
+    #### Display the user-interaction input form
+    $atlas->display_input_form(
+      TABLE_NAME=>$TABLE_NAME,
+      CATEGORY=>$CATEGORY,
+      apply_action=>$apply_action,
+      PROGRAM_FILE_NAME=>$PROG_NAME,
+      parameters_ref=>\%parameters,
+      input_types_ref=>\%input_types,
+      hidden_parameter_ref => \%hidden_parameters,
+      display_parameters_ref => \%display_parameters,
+      mask_user_context=> '1',
+      use_tabbed_panes=> '1',
+    );
+
+  }else{
+
+    #### Display the user-interaction input form
+    $sbeams->display_input_form(
+      TABLE_NAME=>$TABLE_NAME,
+      CATEGORY=>$CATEGORY,
+      apply_action=>$apply_action,
+      PROGRAM_FILE_NAME=>$PROG_NAME,
+      parameters_ref=>\%parameters,
+      input_types_ref=>\%input_types,
+      mask_user_context=> '1',
+      use_tabbed_panes=> '1',
+    );
+  }
+  #### Display the form action buttons
+  $sbeams->display_form_buttons(
+    TABLE_NAME=>$TABLE_NAME,
+    use_tabbed_panes=> '1',
+  );
+
+
+  #### Finish the upper part of the page and go begin the full-width
+  #### data portion of the page
+  $sbeams->display_page_footer(
+    close_tables=>'NO',
+    separator_bar=>'NO',
+    display_footer=>'NO',
+    use_tabbed_panes=> '1',
+  );
+
+
+  #########################################################################
+  #### Process all the constraints
+
+  #### If no atlas_build_id was selected, stop here
+  unless ($parameters{atlas_build_id}) {
+    $sbeams->reportException(
+      state => 'ERROR',
+      type => 'INSUFFICIENT CONSTRAINTS',
+      message => 'You must select at least one Atlas Build',
+    );
+    return;
+  }
+
+  my $n_sub_queries = 3;
+
+  my @primary_bioseq;
+  $primary_bioseq[0] = "BS_REF";
+  $primary_bioseq[1] = "BS_REL";
+  $primary_bioseq[2] = "BS_INDIS";
+
+  #### Build ATLAS_BUILD constraint
+  my $atlas_build_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"AB.atlas_build_id",
+    constraint_type=>"int_list",
+    constraint_name=>"Atlas Build",
+    constraint_value=>$parameters{atlas_build_id} );
+  return if ($atlas_build_clause eq '-1');
+
+  #### Build clauses that are specific to a sub-query
+  my @biosequence_name_clauses;
+  my @biosequence_gene_name_clauses;
+  my @biosequence_desc_clauses;
+  for (my $i = 0; $i < $n_sub_queries; $i++ ){
+    #### Build BIOSEQUENCE_NAME constraints
+    $biosequence_name_clauses[$i] = $sbeams->parseConstraint2SQL(
+      constraint_column=>"$primary_bioseq[$i].biosequence_name",
+      constraint_type=>"plain_text",
+      constraint_name=>"BioSequence Name",
+      constraint_value=>$parameters{biosequence_name_constraint} );
+    return if ($biosequence_name_clauses[$i] eq '-1');
+
+    #### Build BIOSEQUENCE_GENE_NAME constraints
+    $biosequence_gene_name_clauses[$i] = $sbeams->parseConstraint2SQL(
+      constraint_column=>"$primary_bioseq[$i].biosequence_gene_name",
+      constraint_type=>"plain_text",
+      constraint_name=>"BioSequence Gene Name",
+      constraint_value=>$parameters{biosequence_gene_name_constraint} );
+    return if ($biosequence_gene_name_clauses[$i] eq '-1');
+
+    #### Build BIOSEQUENCE_DESC constraints
+    $biosequence_desc_clauses[$i] = $sbeams->parseConstraint2SQL(
+      constraint_column=>"$primary_bioseq[$i].biosequence_desc",
+      constraint_type=>"plain_text",
+      constraint_name=>"BioSequence Description",
+      constraint_value=>$parameters{biosequence_desc_constraint} );
+    return if ($biosequence_desc_clauses[$i] eq '-1');
+  }
+
+  #### Build PROBABILITY constraint
+  my $probability_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"PID.probability",
+    constraint_type=>"flexible_float",
+    constraint_name=>"Protein Probability",
+    constraint_value=>$parameters{protein_probability_constraint} );
+  return if ($probability_clause eq '-1');
+
+  #### Build N_OBSERVATIONS constraint
+  my $n_observations_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"PID.n_observations",
+    constraint_type=>"flexible_int",
+    constraint_name=>"Number of Observations",
+    constraint_value=>$parameters{n_observations_constraint} );
+  return if ($n_observations_clause eq '-1');
+
+  #### Build CHROMOSOME constraint
+  my $chromosome_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"BPS.chromosome",
+    constraint_type=>"plain_text",
+    constraint_name=>"Chromosome",
+    constraint_value=>$parameters{chromosome} );
+  return if ($chromosome_clause eq '-1');
+
+  #### Build GENETIC_LOCUS constraint
+  my $genetic_locus_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"BPS.genetic_locus",
+    constraint_type=>"plain_text",
+    constraint_name=>"Genetic Locus",
+    constraint_value=>$parameters{genetic_locus} );
+  return if ($genetic_locus_clause eq '-1');
+
+  #### Build START_IN_CHROMOSOME constraint
+  my $start_in_chromosome_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"BPS.start_in_chromosome",
+    constraint_type=>"flexible_int",
+    constraint_name=>"Start in Chromosome",
+    constraint_value=>$parameters{start_in_chromosome} );
+  return if ($start_in_chromosome_clause eq '-1');
+
+  #### Build END_IN_CHROMOSOME constraint
+  my $end_in_chromosome_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"BPS.end_in_chromosome",
+    constraint_type=>"flexible_int",
+    constraint_name=>"end in Chromosome",
+    constraint_value=>$parameters{end_in_chromosome} );
+  return if ($end_in_chromosome_clause eq '-1');
+
+  #### Build STRAND constraint
+  my $strand_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"BPS.strand",
+    constraint_type=>"plain_text",
+    constraint_name=>"Strand",
+    constraint_value=>$parameters{strand} );
+  return if ($chromosome_clause eq '-1');
+
+  #### Build ESTIMATED_NG_PER_ML constraint
+  my $estimated_ng_per_ml_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"PID.estimated_ng_per_ml",
+    constraint_type=>"flexible_float",
+    constraint_name=>"Estimated ng/ml",
+    constraint_value=>$parameters{estimated_ng_per_ml_constraint} );
+  return if ($estimated_ng_per_ml_clause eq '-1');
+
+  #### Build N_DISTINCT_PEPTIDES constraint
+  my $n_distinct_peptides_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"PID.n_distinct_peptides",
+    #constraint_column=>"SUM(PID.n_distinct_peptides)",
+    constraint_type=>"flexible_int",
+    constraint_name=>"Number of Distinct Peptides",
+    constraint_value=>$parameters{n_distinct_peptides_constraint} );
+  return if ($n_distinct_peptides_clause eq '-1');
+
+  #### Build PROTEIN_GROUP_NUMBER constraint
+  my $protein_group_number_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"PID.protein_group_number",
+    constraint_type=>"plain_text",
+    constraint_name=>"Protein Group Number",
+    constraint_value=>$parameters{protein_group_number_constraint} );
+  return if ($protein_group_number_clause eq '-1');
+
+
+  #### Build PROTEIN_GROUP_REPRESENTATIVE constraint
+  my $protein_group_representative_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"BS_REP.biosequence_name",
+    constraint_type=>"plain_text",
+    constraint_name=>"Protein Group",
+    constraint_value=>$parameters{protein_group_representative_constraint} );
+  return if ($protein_group_representative_clause eq '-1');
+
+  #### Build PRESENCE_LEVEL constraint
+  my $presence_level_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"PPL.protein_presence_level_id",
+    constraint_type=>"int_list",
+    constraint_name=>"Protein Presence Level",
+    constraint_value=>$parameters{presence_level_constraint} );
+  return if ($presence_level_clause eq '-1');
+
+  #### Build REDUNDANCY constraint
+  my $redundancy_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"BRT.biosequence_relationship_type_id",
+    constraint_type=>"int_list",
+    constraint_name=>"Redundancy",
+    constraint_value=>$parameters{redundancy_constraint} );
+  return if ($redundancy_clause eq '-1');
+
+  #### Build IS_COVERING constraint
+  my $is_covering_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"PID.is_covering",
+    constraint_type=>"plain_text",
+    constraint_name=>"Is Covering",
+    constraint_value=>$parameters{covering_constraint} );
+  return if ($is_covering_clause eq '-1');
+  $is_covering_clause =~ s/LIKE 'on'/= 1/;
+
+  #### Build PROTEIN_PROPERTIES constraint
+  my $protein_properties_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"QO.protein_property",
+    constraint_type=>"plain_text",
+    constraint_name=>"Protein Properties",
+    constraint_value=>$parameters{protein_properties_constraint} );
+  return if ($protein_properties_clause eq '-1');
+
+
+  ## get organism_id to pass on to url_cols
+  my $tsql = qq~
+      SELECT BS.organism_id
+      FROM $TBAT_BIOSEQUENCE_SET BS
+      JOIN $TBAT_ATLAS_BUILD AB
+      ON (AB.biosequence_set_id = BS.biosequence_set_id)
+      where AB.atlas_build_id ='$parameters{atlas_build_id}'
+      ~;
+ 
+   my ($organism_id) = $sbeams->selectOneColumn($tsql) or
+       die "\nERROR: Unable to find the organism_id" .
+       " with $tsql\n\n";
+
+  $parameters{organism_id} = $organism_id;
+
+  ## get list of protein property column names from query_options table
+  my $tsql = qq~
+      SELECT option_key
+      FROM $TBAT_QUERY_OPTION
+      WHERE option_type = 'protein_property'
+      ~;
+ 
+  my @protein_properties_available = $sbeams->selectOneColumn($tsql) or
+      die "\nERROR: Unable to find any protein properties" .
+      " with $tsql\n\n";
+
+  $protein_properties_clause = "JOIN ";
+  for my $prop (@protein_properties_available) {
+  }
+
+  #exit;
+
+  ## handle file upload and clause for sql for $parameters{upload_file}
+  my @biosequence_names_clauses;
+  my %protein_hash;
+  if ( $parameters{upload_file} )
+  {
+     ## upload the file to a file handler
+     my $fh = $q->upload('upload_file');
+
+     if (!$fh && $q->cgi_error)
+     {
+       print $q->header(-status=>$q->cgi_error);
+     } elsif (!$fh) {
+       # We get here when, after successfully uploading, we sort by column.
+       #print "Could not create file handle for $parameters{upload_file}!\n"
+     }
+
+     # if file is a text file and is not too big, upload
+     if ( (-T $fh) && (-s $fh < 1000000)) ##size constraint of 10 MB, restrict $count < 30000
+     {
+       my $count = 0;
+       my $read_file=0;
+       my $prt;
+       ## protein list
+       while ($prt=<$fh>)
+       {
+         chomp($prt);
+         $prt =~ s/\s+$//;
+         if ($prt)
+         {
+             $protein_hash{$prt} = $prt;
+             $count = $count + 1;
+         }
+         last if ($count > 30000);
+      }
+    }
+    ## join with a commas:
+    my $protein_list = "";
+    foreach my $pr (keys %protein_hash)
+    {
+       $protein_list = "'$protein_hash{$pr}',$protein_list"; 
+    }
+    ## trim off last comma:
+    $protein_list =~ s/(.*)(,)$/$1/;
+
+    ## create three different clauses
+    for (my $ii = 0; $ii < $n_sub_queries; $ii++ ){
+      if ($protein_list =~ m/%/) {
+	  my @tmp = split("," , $protein_list);
+	  $biosequence_names_clauses[$ii] =
+	    "   AND ( $primary_bioseq[$ii].biosequence_name LIKE  $tmp[0] ";
+	  for (my $i = 1; $i < scalar(@tmp); $i++ ){
+	    if (  $tmp[$i] ){
+	      $biosequence_names_clauses[$ii] .= 
+		 "   OR $primary_bioseq[$ii].biosequence_name LIKE $tmp[$i]  ";
+	      } 
+	  }
+	  $biosequence_names_clauses[$ii] .=  " ) --end";
+
+      } else {
+	  $log->debug(" in unless % ") ;
+	  $biosequence_names_clauses[$ii] =
+	    "   AND $primary_bioseq[$ii].biosequence_name IN ( $protein_list )";
+      }
+    }
+  } # if upload file
+
+
+  #### Build ROWCOUNT constraint
+  $parameters{row_limit} = 5000
+    unless ($parameters{row_limit} > 0 && $parameters{row_limit}<=1000000);
+  my $limit_clause = "TOP $parameters{row_limit}";
+  #### Disable row limits
+  $limit_clause = "";
+
+
+  #### Define some variables needed to build the query
+  my @column_array_refs;
+
+  #### This query is a union of multiple sub-queries. Define stuff specific
+  #### to each sub-query.
+  my @biosequence_id_sql;
+  my @biosequence_name_sql;
+  my @is_covering_sql;
+  my @pct_coverage_sql;
+  my @presence_level_sql;
+  my @probability_sql;
+  my @confidence_sql;
+  my @relationship_phrase_sql;
+  my @n_observations_sql;
+  my @published_ng_per_ml_sql;
+  my @pub_ng_ml_source_sql;
+  my @estimated_ng_per_ml_sql;
+  my @abundance_uncertainty_sql;
+  my @norm_PSMs_per_100K_sql;
+  my @n_distinct_peptides_sql;
+  my @relationship_sort_order_sql;
+  my @presence_level_sort_order_sql;
+  my @reference_biosequence_sql;
+  my @represented_by_biosequence_sql;
+  my @group_number_sql;
+  my @seq_unique_prots_sql;
+  my @is_keratin_sql;
+  my @is_immunoglobulin_sql;
+  my @biosequence_description_sql;
+  my @sample_specific_id_clause;
+  my @dataset_specific_id_clause;
+  # Define subqueries for protein properties; they are the same for
+  # all clauses of the union.
+  my $is_keratin_or_immunoglobulin_sql=qq~
+		SELECT  
+			PID.BIOSEQUENCE_ID, 
+			CASE WHEN SUM(CAST (BPS.IS_KERATIN AS INTEGER)) OVER (PARTITION BY PID.REPRESENTED_BY_BIOSEQUENCE_ID) > 0  THEN 'ker' ELSE '' END AS "is_keratin",
+			CASE WHEN SUM (CAST (BPS.is_immunoglobulin AS INTEGER)) OVER (PARTITION BY PID.REPRESENTED_BY_BIOSEQUENCE_ID) > 0  THEN 'Ig' ELSE '' END AS "is_immunoglobulin"
+		FROM $TBAT_PROTEIN_IDENTIFICATION  PID
+		JOIN $TBAT_BIOSEQUENCE_PROPERTY_SET BPS ON (BPS.BIOSEQUENCE_ID = PID.BIOSEQUENCE_ID ) 
+		WHERE PID.ATLAS_BUILD_ID =$atlas_build_id
+    AND (BPS.IS_KERATIN != null or BPS.is_immunoglobulin != null)
+  ~;
+
+  # Define SQL specific for displaying protein identifications
+  $biosequence_id_sql[0] = "BS_REF.biosequence_id";
+  $biosequence_name_sql[0] = "BS_REF.biosequence_name";
+  $is_covering_sql[0] = "(CASE WHEN PID.is_covering=1 THEN 'C' ELSE '' END)";
+  $pct_coverage_sql[0] = "PID.percentage_coverage";
+  $presence_level_sql[0] = "PPL.level_phrase";
+  $probability_sql[0] = "STR(PID.probability,7,3)";
+  $confidence_sql[0] = "STR(PID.confidence,7,3)";
+  $n_observations_sql[0] = "PID.n_observations";
+  $estimated_ng_per_ml_sql[0] = "CONVERT(CHAR,PID.estimated_ng_per_ml,0)";
+  $published_ng_per_ml_sql[0] = "CONVERT(CHAR,BPS.published_ng_per_ml,0)";
+  $pub_ng_ml_source_sql[0] = "BPS.pub_ng_ml_source";
+  $abundance_uncertainty_sql[0] = "PID.abundance_uncertainty";
+  $norm_PSMs_per_100K_sql[0] = "STR(PID.norm_PSMs_per_100K,7,3)";
+  $n_distinct_peptides_sql[0] = "PID.n_distinct_peptides";
+  $relationship_phrase_sql[0] = "NULL";
+  $relationship_sort_order_sql[0] = "NULL";
+  $presence_level_sort_order_sql[0] = "PPL.sort_order";
+  $reference_biosequence_sql[0] = "BS_SUBSUMED_BY.biosequence_name";
+  $represented_by_biosequence_sql[0] = "BS_REP.biosequence_name";
+  $group_number_sql[0] = "PID.protein_group_number";
+  $seq_unique_prots_sql[0] = "PID.seq_unique_prots_in_group";
+  $is_keratin_sql[0]="NULL";
+  $is_immunoglobulin_sql[0]="NULL";
+  $biosequence_description_sql[0] = "CAST(BS_REF.biosequence_desc AS varchar(255))";
+  $sample_specific_id_clause[0]  = "AND PID.sample_specific_id in ($parameters{sample_specific_id})" if (defined $parameters{sample_specific_id});
+  $dataset_specific_id_clause[0]  = "AND PID.dataset_specific_id in ('$parameters{dataset_specific_id}')" if (defined $parameters{dataset_specific_id});
+ 
+
+  # Define SQL specific for displaying indistinguishables, identicals
+  # relative to protein identifications
+  $biosequence_id_sql[1] = "BS_REL.biosequence_id";
+  $biosequence_name_sql[1] = "BS_REL.biosequence_name";
+  $is_covering_sql[1] = "NULL";
+  $pct_coverage_sql[1] = "BR.related_biosequence_percentage_coverage"; 
+  $presence_level_sql[1] = "NULL";
+  $probability_sql[1] = "NULL";
+  $confidence_sql[1] = "NULL";
+  $n_observations_sql[1] = "NULL";
+  $estimated_ng_per_ml_sql[1] = "NULL";
+  $published_ng_per_ml_sql[1] = "NULL";
+  $pub_ng_ml_source_sql[1] = "NULL";
+  $abundance_uncertainty_sql[1] = "NULL";
+  $norm_PSMs_per_100K_sql[1] = "NULL";
+  $n_distinct_peptides_sql[1] = "NULL";
+  $relationship_phrase_sql[1] = "BRT.relationship_phrase";
+  $relationship_sort_order_sql[1] = "BRT.sort_order";
+  $presence_level_sort_order_sql[1] = "PPL.sort_order";
+  $reference_biosequence_sql[1] = "BS_REF.biosequence_name";
+  $represented_by_biosequence_sql[1] = "BS_REP.biosequence_name";
+  $group_number_sql[1] = "PID.protein_group_number";
+  $seq_unique_prots_sql[1] = "PID.seq_unique_prots_in_group";
+  $is_keratin_sql[1]="NULL";
+  $is_immunoglobulin_sql[1]="NULL";
+  $biosequence_description_sql[1] = "CAST(BS_REL.biosequence_desc AS varchar(255))";
+  $sample_specific_id_clause[1]  = "AND BR.sample_specific_id in ($parameters{sample_specific_id})" if (defined $parameters{sample_specific_id});
+  $dataset_specific_id_clause[1]  = "AND BR.dataset_specific_id in ('$parameters{dataset_specific_id}')" if (defined $parameters{dataset_specific_id});
+
+  # Define SQL specific for displaying biosequences identical to
+  # indistinguishables
+  $biosequence_id_sql[2] = "BS_INDIS.biosequence_id";
+  $biosequence_name_sql[2] = "BS_INDIS.biosequence_name";
+  $is_covering_sql[2] = "NULL";
+  $pct_coverage_sql[2] = "BR_INDIS.related_biosequence_percentage_coverage";
+  $presence_level_sql[2] = "NULL";
+  $probability_sql[2] = "NULL";
+  $confidence_sql[2] = "NULL";
+  $n_observations_sql[2] = "NULL";
+  $estimated_ng_per_ml_sql[2] = "NULL";
+  $published_ng_per_ml_sql[2] = "NULL";
+  $pub_ng_ml_source_sql[2] = "NULL";
+  $abundance_uncertainty_sql[2] = "NULL";
+  $norm_PSMs_per_100K_sql[2] = "NULL";
+  $n_distinct_peptides_sql[2] = "NULL";
+  $relationship_phrase_sql[2] = "BRT.relationship_phrase";
+  $relationship_sort_order_sql[2] = "BRT.sort_order";
+  $presence_level_sort_order_sql[2] = "PPL.sort_order";
+  $reference_biosequence_sql[2] = "BS_REL.biosequence_name";
+  $represented_by_biosequence_sql[2] = "BS_REP.biosequence_name";
+  $group_number_sql[2] = "PID.protein_group_number";
+  $seq_unique_prots_sql[2] = "PID.seq_unique_prots_in_group";
+  $is_keratin_sql[2]="NULL";
+  $is_immunoglobulin_sql[2]="NULL";
+  $biosequence_description_sql[2] =
+        "CAST(BS_INDIS.biosequence_desc AS varchar(255))";
+  $sample_specific_id_clause[2]  = "AND BR_INDIS.sample_specific_id in ($parameters{sample_specific_id})" if (defined $parameters{sample_specific_id});
+
+  $dataset_specific_id_clause[2]  = "AND BR_INDIS.dataset_specific_id in ('$parameters{dataset_specific_id}')" if (defined $parameters{dataset_specific_id});
+
+  if($atlas_build_name =~/Origene/i){                                        
+      my  @column_array =(
+        ["SKU","BPS.origene_SKU","SKU"],                                                       
+        ["tube","BPS.origene_tube","Tube"],                                              
+        ["biosequence_name","BS.biosequence_name","Biosequence Name"],           
+        ["biosequence_gene_name","BS.biosequence_gene_name","Biosequence Gene Name"],
+        ["group_number","PID.protein_group_number","Group Number"],
+        ["expected_prot","case When Pid.biosequence_id = bps.biosequence_id then 'YES' else 'NO' end","Expected"],                                     ["observed_in","NULL","Observed in"],                                  
+        ["n_observations","PID.n_observations","N Obs"],                                          
+        ["n_distinct_peptides","PID.n_distinct_peptides","N Distinct Peptides"],
+        ["protein_content","PID.origenetube_emPAI","mol % (emPAI)"],                       
+        ["sequence_coverage","PID.sequence_coverage","Sequence Coverage %"],                         
+        ["seq_unique_prots_in_group","PID.seq_unique_prots_in_group", "Seq Uniq Prots in Grp"], 
+        ["protein_group_seq_align_link","NULL","Protein Group Seq Alignmt"],   
+        ["biosequence_description","CAST(BS.biosequence_desc AS varchar(255))","Protein Description"],
+    );
+    $column_array_refs[0] = \@column_array;
+    $n_sub_queries = 1;
+
+  }else{    
+   for (my $i=0; $i<$n_sub_queries; $i++) {
+    my (@abundance_columns, @GO_columns);
+    if ( $parameters{display_options} =~ /ShowAbundances/ ) {
+      @abundance_columns = (
+			["published_ng_per_ml",$published_ng_per_ml_sql[$i],"Published plasma ng/ml"],
+			["pub_ng_ml_source",$pub_ng_ml_source_sql[$i],"Source"],
+			["estimated_ng_per_ml",$estimated_ng_per_ml_sql[$i],"Estimated ng/ml"],
+			["abundance_uncertainty",$abundance_uncertainty_sql[$i],"Uncertainty ng/ml"],
+      );
+    } else {
+      @abundance_columns = ();
+    }
+    if ( $parameters{display_options} =~ /ShowGOColumns/ ){
+      @GO_columns = (
+      ["molecular_function","MFA.annotation","Molecular Function"],
+      #["molecular_function_GO","MFA.external_accession","molecular_function_GO"],
+      ["biological_process","BPA.annotation","Biological Process"],
+      #["biological_process_GO","BPA.external_accession","biological_process_GO"],
+      ["cellular_component","CCA.annotation","Cellular Component"],
+      #["cellular_component_GO","CCA.external_accession","cellular_component_GO"],
+      #["interpro_protein_domain","IPDA.annotation","InterPro Protein Domain"],
+      #["interpro_protein_domain_GO","IPDA.external_accession","interpro_protein_domain_GO"],
+      )
+    } else{
+       @GO_columns =();
+    }
+
+     my  @column_array =(
+        ["biosequence_id",$biosequence_id_sql[$i],"Biosequence ID"],
+        ["biosequence_name",$biosequence_name_sql[$i],"Biosequence Name"],
+        ["is_covering",$is_covering_sql[$i],"Cover ing Set"],
+        ["pct_coverage",$pct_coverage_sql[$i],"Percent Coverage"],
+        ["presence_level",$presence_level_sql[$i],"Presence Level"],
+        ["probability",$probability_sql[$i],"Protein Prophet Prob"],
+        ["confidence",$confidence_sql[$i],"Mult Hyp Test Prob"],
+        ["n_observations",$n_observations_sql[$i],"N Obs"],
+        ["norm_PSMs_per_100K",$norm_PSMs_per_100K_sql[$i],"Norm Obs per 100K"],
+        ["n_distinct_peptides",$n_distinct_peptides_sql[$i],"N Distinct Peptides"],
+        ["chromosome","BPS.chromosome", "Chromosome"],
+        ["genetic_locus","BPS.genetic_locus", "Genetic Locus"],
+        ["start_in_chromosome","BPS.start_in_chromosome","Start in Chrom"],
+        ["end_in_chromosome","BPS.end_in_chromosome","End in Chrom"],
+        ["strand","BPS.strand","Strand"],
+        @abundance_columns,
+        ["relationship_phrase",$relationship_phrase_sql[$i],"Redundancy Relationship"],
+        ["reference_biosequence",$reference_biosequence_sql[$i], "Redundant With Respect To"],
+        ["represented_by_biosequence_id", "$represented_by_biosequence_sql[$i]", "Protein Group"],
+        ["group_number","$group_number_sql[$i]","Group Number"],
+        ["seq_unique_prots_in_group","$seq_unique_prots_sql[$i]", "Seq Uniq Prots in Grp"],
+        @GO_columns,
+        ["protein_group_seq_align_link","NULL","Protein Group Seq Alignmt"],
+        ["is_keratin",$is_keratin_sql[$i],"Keratin"],
+        ["is_immunoglobulin",$is_immunoglobulin_sql[$i],"Ig"],
+        ["biosequence_description",$biosequence_description_sql[$i],"Protein Description"],
+        ["biosequence_accessor","DBX.accessor","biosequence_accessor"],
+        ["biosequence_accessor_suffix","DBX.accessor_suffix","biosequence_accessor_suffix"],
+        ["biosequence_accession","BS_REF.biosequence_accession","biosequence_accession"],
+        ["organism_full_name","O.full_name","Organism"],
+        ["ppl_sort_order",$presence_level_sort_order_sql[$i], "ppl_sort_order"],
+        ["brt_sort_order",$relationship_sort_order_sql[$i],"brt_sort_order"],
+      );
+     $column_array_refs[$i] = \@column_array;
+    }
+  }
+  #### Set flag to display SQL statement if user selected
+  if ( $parameters{display_options} =~ /ShowSQL/ ) {
+    $show_sql = 1;
+  }
+  
+  #### Build the columns parts of the SQL statement
+  my %colnameidx = ();
+  my @column_titles = ();
+  my @columns_clause;
+  ## Sends @column_array_ref to build_SQL_columns_list, which
+  ## (1) appends the 2nd element in array to $columns_clause
+  ## (2) fills %colnameidx as a hash with key = 1st element
+  ## and value = column number (start w/0), and (3) fills @column_titles_ref
+  ## array with the 3rd element
+  for (my $i=0; $i<$n_sub_queries; $i++) {
+    $columns_clause[$i] =
+      $sbeams->build_SQL_columns_list(
+			column_array_ref=>$column_array_refs[$i],
+			colnameidx_ref=>\%colnameidx,
+			column_titles_ref=>\@column_titles
+      );
+  }
+  my @pre_joins;
+  my @post_joins;
+
+  my $GO_join = "";
+  $parameters{gene_annotation_level_constraint} = 'leaf' ## zhi might need to change
+  unless ($parameters{gene_annotation_level_constraint});
+  my $gene_annotation_level_clause = $sbeams->parseConstraint2SQL(
+    constraint_column=>"hierarchy_level",
+    constraint_type=>"plain_text",
+    constraint_name=>"Gene Annotation Level Constraint",
+    constraint_value=>$parameters{gene_annotation_level_constraint} );
+  return if ($gene_annotation_level_clause eq '-1');
+ 
+  if ( $parameters{display_options} =~ /ShowGOColumns/ ){
+    $GO_join = qq~
+        LEFT JOIN $TBAT_BIOSEQUENCE_ANNOTATED_GENE AG ON ( BS_REF.biosequence_id = AG.biosequence_id )
+        LEFT JOIN $TBBL_GENE_ANNOTATION MFA ON ( AG.annotated_gene_id = MFA.annotated_gene_id
+                   AND MFA.gene_annotation_type_id = 1 AND MFA.idx = 0
+                   AND MFA.hierarchy_level = '$parameters{gene_annotation_level_constraint}' )
+        LEFT JOIN $TBBL_GENE_ANNOTATION BPA ON ( AG.annotated_gene_id = BPA.annotated_gene_id
+                   AND BPA.gene_annotation_type_id = 2 AND BPA.idx = 0
+                   AND BPA.hierarchy_level = '$parameters{gene_annotation_level_constraint}' )
+        LEFT JOIN $TBBL_GENE_ANNOTATION CCA ON ( AG.annotated_gene_id = CCA.annotated_gene_id
+                   AND CCA.gene_annotation_type_id = 3 AND CCA.idx = 0
+                   AND CCA.hierarchy_level = '$parameters{gene_annotation_level_constraint}' )
+    ~;
+  }
+
+ 
+  # Define joins specific for protein identifications
+  $pre_joins[0] = qq~
+  ~;
+  $post_joins[0] = qq~
+		 LEFT JOIN $TBAT_BIOSEQUENCE BS_SUBSUMED_BY ON ( BS_SUBSUMED_BY.biosequence_id = PID.subsumed_by_biosequence_id )
+		 AND ( BS_SUBSUMED_BY.biosequence_set_id = BSS.biosequence_set_id)
+		 LEFT JOIN $TBAT_BIOSEQUENCE_PROPERTY_SET BPS ON ( BPS.biosequence_id = PID.biosequence_id )
+  ~;
+
+  # Define joins specific for indistinguishables, identicals
+  # relative to protein identifications
+  $pre_joins[1] = qq~
+		 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP BR ON ( BR.reference_biosequence_id = PID.biosequence_id 
+					 AND BR.atlas_build_id = PID.atlas_build_id )
+  ~;
+  $post_joins[1] = qq~
+	 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE BRT ON ( BRT.biosequence_relationship_type_id = BR.relationship_type_id )
+	 LEFT JOIN $TBAT_BIOSEQUENCE BS_REL ON ( BS_REL.biosequence_id = BR.related_biosequence_id )
+				AND ( BS_REL.biosequence_set_id = BSS.biosequence_set_id )
+	 LEFT JOIN $TBAT_BIOSEQUENCE_PROPERTY_SET BPS ON ( BPS.biosequence_id = BS_REL.biosequence_id )
+  ~;
+
+  # Define joins specific for biosequences identical to
+  # indistinguishables
+  $pre_joins[2] = qq~
+		INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP BR ON ( BR.reference_biosequence_id = PID.biosequence_id
+					 AND BR.atlas_build_id = PID.atlas_build_id )
+		INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP BR_INDIS ON ( BR_INDIS.reference_biosequence_id = BR.related_biosequence_id 
+					 AND BR_INDIS.atlas_build_id = PID.atlas_build_id )
+  ~;
+  $post_joins[2] = qq~
+	 INNER JOIN $TBAT_BIOSEQUENCE_RELATIONSHIP_TYPE BRT ON ( BRT.biosequence_relationship_type_id = BR_INDIS.relationship_type_id )
+	 LEFT JOIN $TBAT_BIOSEQUENCE BS_INDIS ON ( BR_INDIS.related_biosequence_id = BS_INDIS.biosequence_id )
+				AND ( BS_INDIS.biosequence_set_id = BSS.biosequence_set_id)
+	 LEFT JOIN $TBAT_BIOSEQUENCE BS_REL ON ( BS_REL.biosequence_id = BR_INDIS.reference_biosequence_id  )
+  			AND ( BS_REL.biosequence_set_id = BSS.biosequence_set_id)
+	 LEFT JOIN $TBAT_BIOSEQUENCE_PROPERTY_SET BPS ON ( BPS.biosequence_id = BS_INDIS.biosequence_id )
+  ~;
+
+  my @special_clauses;
+  $special_clauses[0] = $is_covering_clause;
+  $special_clauses[1] = $redundancy_clause;
+  $special_clauses[2] = $redundancy_clause;
+
+  my @select_clause;
+  for (my $i=0; $i<3; $i++) {
+    $select_clause[$i] = qq~
+     ( SELECT $limit_clause $columns_clause[$i]
+       FROM $TBAT_PROTEIN_IDENTIFICATION PID
+         $pre_joins[$i] 
+	 INNER JOIN $TBAT_ATLAS_BUILD AB ON ( AB.atlas_build_id = PID.atlas_build_id )
+	 INNER JOIN $TBAT_BIOSEQUENCE_SET BSS ON ( BSS.biosequence_set_id = AB.biosequence_set_id )
+	 INNER JOIN $TB_ORGANISM O ON ( O.organism_id = BSS.organism_id )
+	 INNER JOIN $TBAT_BIOSEQUENCE BS_REF ON ( BS_REF.biosequence_id = PID.biosequence_id )
+         AND ( BS_REF.biosequence_set_id = BSS.biosequence_set_id)
+	 INNER JOIN $TBAT_BIOSEQUENCE BS_REP ON ( BS_REP.biosequence_id = PID.represented_by_biosequence_id )
+         AND ( BS_REP.biosequence_set_id = BSS.biosequence_set_id)
+	 LEFT JOIN $TB_DBXREF DBX ON ( DBX.dbxref_id = BS_REF.dbxref_id )
+	 INNER JOIN $TBAT_PROTEIN_PRESENCE_LEVEL PPL ON ( PPL.protein_presence_level_id = PID.presence_level_id )
+         $post_joins[$i]
+         $GO_join
+       WHERE 1 = 1
+         $atlas_build_clause
+         $biosequence_name_clauses[$i]
+         $biosequence_names_clauses[$i]
+         $biosequence_gene_name_clauses[$i]
+         $biosequence_desc_clauses[$i]
+         $n_observations_clause
+         $n_distinct_peptides_clause
+         $chromosome_clause
+         $genetic_locus_clause
+         $start_in_chromosome_clause
+         $end_in_chromosome_clause
+         $strand_clause
+         $estimated_ng_per_ml_clause
+         $probability_clause
+         $protein_group_representative_clause
+         $protein_group_number_clause
+         $presence_level_clause
+         $special_clauses[$i]
+         $sample_specific_id_clause[$i]
+         $dataset_specific_id_clause[$i]
+       )
+    ~;
+  }
+
+
+  #### Define the SQL statement
+  # ordering could be improved
+  my $sql = 'SELECT ';
+  ## remove biosequence_id column
+  delete $colnameidx{biosequence_id};
+  foreach my $key (sort {$colnameidx{$a} <=> $colnameidx{$b}}keys %colnameidx){
+    if ($key !~ /(is_keratin|is_immunoglobulin)/){
+      $sql .="PROT.$key,\n";
+    }else{
+      $sql .="IS_KER_IG.$key,\n";
+    }
+    $colnameidx{$key} -=1 
+  }
+  $sql =~ s/,$//g;
+  shift @column_titles;
+
+  if (! $parameters{presence_level_constraint} && $parameters{dataset_specific_id}){
+    $sql .= qq~
+      FROM (
+      $select_clause[1]
+         UNION
+      $select_clause[2]
+      )PROT 
+    ~;
+  }else{
+		$sql .= qq~
+      FROM (
+			$select_clause[0]
+				 UNION
+			$select_clause[1]
+				 UNION
+			$select_clause[2]
+      ) PROT 
+		~;
+  }
+  $sql .= "LEFT JOIN ($is_keratin_or_immunoglobulin_sql)IS_KER_IG ON (IS_KER_IG.biosequence_id = PROT.biosequence_id)";
+  
+  if ($parameters{dataset_id}){
+    $sql .= qq~
+      WHERE PROT.biosequence_id in (
+			SELECT BIABSB.BIOSEQUENCE_ID
+			FROM $TBAT_BIOSEQUENCE_ID_ATLAS_BUILD_SEARCH_BATCH BIABSB
+			JOIN $TBAT_ATLAS_BUILD_SEARCH_BATCH ABSB
+			ON (ABSB.ATLAS_BUILD_SEARCH_BATCH_ID = BIABSB.ATLAS_BUILD_SEARCH_BATCH_ID AND ABSB.atlas_build_id = $atlas_build_id)
+			JOIN $TBAT_SAMPLE S ON (S.sample_id = ABSB.sample_id)
+			WHERE S.repository_identifiers = '$parameters{dataset_id}'
+      ) 
+	 ~;
+  }
+  $sql .= qq~
+     ORDER BY
+        group_number,
+        ppl_sort_order,
+        reference_biosequence,
+        brt_sort_order,
+        biosequence_name
+  ~;
+
+  #$sbeams->display_sql(
+  #     sql=>$sql,
+  #     use_tabbed_panes=> '1',
+  #    );
+
+
+  #### Certain types of actions should be passed to links
+  my $pass_action = "QUERY";
+  $pass_action = $apply_action if ($apply_action =~ /QUERY/i); 
+
+
+  #### Pass nearly all of the constraints down to a child query
+  my @parameters_to_pass;
+  my $parameters_list = '';
+  while ( ($key,$value) = each %input_types ) {
+    if ($key ne 'sort_order' && $key ne 'display_options') {
+      if ($parameters{$key}) {
+        push(@parameters_to_pass,"$key=$parameters{$key}");
+      }
+    }
+  }
+  if (@parameters_to_pass) {
+    $parameters_list = join('&',@parameters_to_pass);
+  }
+
+
+  ## tailor the chromosomal url link to a genome browser by the organism name:
+  ## April 2010 TMF adjust the below!
+  my $organism_full_name = getOrganismFullName(organism_id => $organism_id);
+
+  my $chrom_url_link;
+
+  if ($organism_full_name =~ /^Halobacterium/)
+  {
+      $chrom_url_link = "http://www.genome.jp/kegg-bin/show_genomemap?ORG=hal&ACCESSION=\%$colnameidx{biosequence_name}V";
+  } else 
+  { ## assume it's an organism supported by Ensembl
+      $chrom_url_link = "http://www.ensembl.org/$organism_full_name/contigview?c=\%$colnameidx{chromosome}V\:\%$colnameidx{start_in_chromosome}V&w=10000";
+  }
+
+
+
+  #### Define the hypertext links for columns that need them
+  # %NV inserts the value of column N
+  %url_cols = (
+          'Biosequence Name' => "$CGI_BASE_DIR/PeptideAtlas/GetProtein?atlas_build_id=$atlas_build_id&protein_name=\%$colnameidx{biosequence_name}V&apply_action=$pass_action",
+          'SKU' =>  "http://www.origene.com/protein/\%$colnameidx{SKU}V/B2M.aspx",
+          #'Tube' 
+          'Biosequence Name_ATAG' => 'TARGET="Win1" ONMOUSEOVER="window.status=\'Show more information about this protein\'; return true"',
+          #'Group Representative' => "$CGI_BASE_DIR/PeptideAtlas/GetProteins_beta?protein_group_number_constraint=\%$colnameidx{group_number}V&apply_action=$pass_action",
+          'Protein Group' => "$CGI_BASE_DIR/PeptideAtlas/GetProteins?protein_group_representative_constraint=\%$colnameidx{protein_group_representative}V&apply_action=$pass_action",
+          'Protein Group_ATAG' => 'TARGET="Win1" ONMOUSEOVER="window.status=\'Display all biosequences in this group\'; return true"',
+          'Protein Group Seq Alignmt' => "$CGI_BASE_DIR/PeptideAtlas/compareProteins?protein_group_number=\%$colnameidx{group_number}V&apply_action=$pass_action",
+          'Protein Group Seq Alignmt_ATAG' => 'TARGET="Win1" ONMOUSEOVER="window.status=\'Display alignment of all biosequences in this group\'; return true"',
+          'Protein Group Seq Alignmt_ISNULL' => '<IMG BORDER="0" SRC="/sbeams/images/compareProteins.png">',
+          'Protein Group Seq Alignmt_OPTIONS' => {embed_html=>1},
+          'Related to' => "$CGI_BASE_DIR/PeptideAtlas/GetProtein?=\%$colnameidx{reference_biosequence_name}V&apply_action=$pass_action",
+          'Related to_ATAG' => 'TARGET="Win1" ONMOUSEOVER="window.status=\'Show more information about this protein\'; return true"',
+         
+         'Molecular Function' => "http://www.ebi.ac.uk/ego/GSearch?q=\%$colnameidx{molecular_function_GO}V",
+				 'Molecular Function_ATAG' => 'TARGET="WinExt"',
+				 'Molecular Function_OPTIONS' => {semicolon_separated_list=>1},
+				 'Biological Process' => "http://www.ebi.ac.uk/ego/GSearch?q=\%$colnameidx{biological_process_GO}V",
+				 'Biological Process_ATAG' => 'TARGET="WinExt"',
+				 'Biological Process_OPTIONS' => {semicolon_separated_list=>1},
+				 'Cellular Component' => "http://www.ebi.ac.uk/ego/GSearch?q=\%$colnameidx{cellular_component_GO}V",
+				 'Cellular Component_ATAG' => 'TARGET="WinExt"',
+				 'Cellular Component_OPTIONS' => {semicolon_separated_list=>1},
+      ); 
+
+  
+  if($atlas_build_name =~/Origene/i){
+    $url_cols{'Biosequence Name'} = "$CGI_BASE_DIR/PeptideAtlas/GetProtein?protein_name=\%$colnameidx{biosequence_name}".
+                                    "V&ori_sku=\%$colnameidx{SKU}V&ori_tube=\%$colnameidx{tube}".
+                                    "V&ori_expected_prot=\%$colnameidx{expected_prot}".
+                                    "V&apply_action=$pass_action";
+  }
+  #### Define columns that should be hidden in the output table
+  # biosequence_accessor is prefix to compose URL
+  # biosequence_accessor_suffix is suffix for same
+
+  %hidden_cols = (
+                  'Mod Pep' => 1,
+                  'Spectrum Name'=> 1,
+                  'Origene Accession' => 1,
+                  'Group Number' => 1,
+                  'Chromosome' => 1,
+		  'biosequence_accession' => 1,
+		  'biosequence_accessor' => 1,
+		  'biosequence_accessor_suffix' => 1,
+	          'ppl_sort_order' => 1,
+                  'brt_sort_order' => 1,
+                  'Organism' => 1,
+  );
+
+  
+  if($atlas_build_name =~/Origene/i){
+  
+    $parameters{gene_annotation_level_constraint} = '';
+    #### Build BIOSEQUENCE_GENE_NAME constraints
+    my $biosequence_gene_name_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"BS.biosequence_gene_name",
+      constraint_type=>"plain_text",
+      constraint_name=>"BioSequence Gene Name",
+      constraint_value=>$parameters{biosequence_gene_name_constraint} );
+    return if ($biosequence_gene_name_clause eq '-1');
+
+    #### Build BIOSEQUENCE_DESC constraints
+    my $biosequence_desc_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"BS.biosequence_desc",
+      constraint_type=>"plain_text",
+      constraint_name=>"BioSequence Description",
+      constraint_value=>$parameters{biosequence_desc_constraint} );
+    return if ($biosequence_desc_clause eq '-1');
+
+    my $biosequence_name_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"BS.biosequence_name",
+      constraint_type=>"plain_text",
+      constraint_name=>"BioSequence Name",
+      constraint_value=>$parameters{biosequence_name_constraint} );
+    return if ($biosequence_name_clause eq '-1');
+   
+    my $sku_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"BPS.origene_SKU",
+      constraint_type=>"plain_text",
+      constraint_name=>"sku_constraint",
+      constraint_value=>$parameters{sku_constraint} );
+    return if ($sku_clause eq '-1');
+
+
+    my $tube_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"BPS.origene_tube",
+      constraint_type=>"plain_text",
+      constraint_name=>"tube_constraint",
+      constraint_value=>$parameters{tube_constraint} );
+    return if ($tube_clause eq '-1');
+
+
+
+    $sql=qq~
+       SELECT distinct $columns_clause[0]
+			 FROM  $TBAT_BIOSEQUENCE_PROPERTY_SET BPS
+       LEFT JOIN $TBAT_PROTEIN_IDENTIFICATION PID ON (BPS.ORIGENE_TUBE = PID.OBSERVED_IN_ORIGENETUBE)
+			 LEFT JOIN  $TBAT_BIOSEQUENCE BS ON (BS.BIOSEQUENCE_ID = PID.BIOSEQUENCE_ID)
+       WHERE 1 = 1 AND PID.atlas_build_id IN ( $atlas_build_id )
+         $biosequence_name_clause
+         $biosequence_gene_name_clause
+         $biosequence_desc_clause
+         $tube_clause
+         $sku_clause
+         $n_distinct_peptides_clause
+         $n_observations_clause 
+         AND BS.biosequence_name not like 'DECOY%'
+       ORDER BY BPS.ORIGENE_TUBE
+      ~;
+   } 
+
+
+  #########################################################################
+  #### If QUERY or VIEWRESULTSET was selected, display the data
+  if ($apply_action =~ /QUERY/i || $apply_action =~ /VIEWRESULTSET|VIEWPLOT/ ) {
+    #### If the action contained QUERY, then fetch the results from
+    #### the database
+    if ($apply_action =~ /QUERY/i) {
+      #### Show the SQL that will be or was executed
+      $sbeams->display_sql(
+	     sql=>$sql,
+	     use_tabbed_panes=> '1',
+      )if ($show_sql);
+      #### Fetch the results from the database server
+      $sbeams->fetchResultSet(
+        sql_query=>$sql,
+        resultset_ref=>$resultset_ref,
+        use_caching => 1
+      );
+       
+      if ( $resultset_ref->{from_cache} ) {
+        $log->info( "Skipping post processing with cached RS" );
+      } elsif ($atlas_build_name =~ /Origene/i){
+				 postProcessResultset_Origene(
+					rs_params_ref=>\%rs_params,
+					resultset_ref=>$resultset_ref,
+					query_parameters_ref=>\%parameters,
+					column_titles_ref=>$column_array_refs[0],
+				);
+      }else{
+        #### Post process the resultset
+        postProcessResultset(
+          rs_params_ref=>\%rs_params,
+          resultset_ref=>$resultset_ref,
+          query_parameters_ref=>\%parameters,
+          column_titles_ref=>\@column_titles,
+        ); 
+      }
+ 
+    }
+
+
+    #### Draw the protein and gene location graph
+    #### Determine whether or not there are any user inputted constraint values that would interfere with drawing the graph, and if so don't draw the graph
+    $chrom_num = $parameters{chromosome};
+
+    if ( ($organism_id == 2) && $chrom_num) {
+      ## Do everything invovled with drawing the graph
+      #### Connect to Ensembl database
+      my $host = 'mysql';
+      my $user = 'guest';
+      my $password = 'guest';
+  
+      my $registry = 'Bio::EnsEMBL::Registry';
+      $registry->load_registry_from_db(
+            -host => $host,
+            -user => $user,
+            -pass => $password,
+        );
+  
+      ####read passed args, set up variables
+      my %args = @_;
+  
+      #### Get input from PeptideAtlas
+      my @acclist;
+      my @coord1_list;
+      my @coord2_list;
+      my @strand_list;
+      #my $header = (<>);  gives benign errors in csv/tsv mode.
+      my $row;
+  
+      for my $row ( 0 .. scalar @{$resultset_ref->{data_ref}} - 1) {
+        {my $data_item = $resultset_ref->{data_ref}->[$row]->[0];
+        push @acclist, $data_item;
+        }
+        {my $data_item = $resultset_ref->{data_ref}->[$row]->[10];
+        push @coord1_list, $data_item;
+        }
+        {my $data_item = $resultset_ref->{data_ref}->[$row]->[11];
+        push @coord2_list, $data_item;
+        }
+        {my $data_item = $resultset_ref->{data_ref}->[$row]->[12];
+        push @strand_list, $data_item;
+        }
+      }
+  
+      #### Match Swiss-Prot proteins to Ensembl identical matches
+  
+      #### Initiate variables, read start/end user input values
+      my @gene_list;
+      my @matchgene_list;
+      my $chrom;
+      my $chunk_name;
+      my $chromlen;
+    
+      my $start_bp;
+      my $st_modifier;
+      my $end_bp;
+      my $end_modifier;
+  
+      my $kband_st;
+      my $kband_end;
+      my $genetic_locus;
+ 
+      my $start_chunk = $parameters{start_in_chromosome};
+      my $end_chunk = $parameters{end_in_chromosome};
+      my $input_genetic_locus = $parameters{genetic_locus};
+      my $input_strand = $parameters{strand};
+  
+      if ($start_chunk eq '') {
+        $start_bp = '';
+        $st_modifier = '';
+      } else {
+        $start_chunk =~ /(\D*)(\d+)/;
+        $st_modifier = $1;
+        $start_bp = $2;
+      }
+  
+      if ($end_chunk eq '') {
+        $end_bp = '';
+        $end_modifier = '';
+      } else {
+        $end_chunk =~ /(\D*)(\d+)/;
+        $end_modifier = $1;
+        $end_bp = $2;
+      }
+
+      if ($input_genetic_locus ne '') {
+        $input_genetic_locus =~ /(\w+)(p|q)(.*)/;
+        $genetic_locus = "$2$3";
+      }
+
+      if (($start_bp eq '') and ($end_bp eq '') and ($genetic_locus eq '')) {
+        $stend_option = 'aaa';
+      } elsif (($start_bp ne '') and ($st_modifier eq '>') and ($end_bp eq '') and ($genetic_locus eq '')) {
+        $stend_option = 'bbb';
+      } elsif (($start_bp eq '') and ($end_bp ne '') and ($end_modifier eq '<') and ($genetic_locus eq '')) {
+        $stend_option = 'ccc';
+      } elsif (($start_bp ne '') and ($st_modifier eq '>') and ($end_bp ne '') and ($end_modifier eq '<') and ($genetic_locus eq '')) {
+        $stend_option = 'ddd';
+      } elsif ($genetic_locus ne '') {
+        $stend_option = 'eee';
+      } else {
+        $stend_option = 'fff';
+      }
+  
+      my $slice_adaptor = $registry->get_adaptor( 'Human', 'Core', 'Slice' );
+      my $gene_adaptor = $registry->get_adaptor('Human', 'Core', 'Gene' );
+      my $kary_adaptor = $registry->get_adaptor('Human', 'Core', 'KaryotypeBand' );
+  
+      #### If zooming by karyotype band, read band start and end coordinates
+      if ($input_genetic_locus ne '') {
+        my $chr = $slice_adaptor->fetch_by_region('chromosome', $chrom_num);
+        my $kary_data = $kary_adaptor->fetch_all_by_Slice($chr);
+        while ( my $kary_datum = shift @{$kary_data} ) {
+          my $kary_datum_name = $kary_datum->name();
+          if ($genetic_locus eq $kary_datum_name) {
+            $kband_st = $kary_datum->start();
+            $kband_end = $kary_datum->end();
+          }
+        }
+      }
+  
+      #### Initialize gene data from Ensembl database
+      if ($stend_option eq 'aaa') {
+        $chrom = $slice_adaptor->fetch_by_region( 'chromosome', $chrom_num);
+        $chunk_name = "Entire";
+      } elsif ($stend_option eq 'bbb') {
+        $chrom = $slice_adaptor->fetch_by_region('chromosome', $chrom_num, $start_bp + 1); 
+        $chunk_name = "$start_bp bp to End";
+      } elsif ($stend_option eq 'ccc') {
+        $chrom = $slice_adaptor->fetch_by_region( 'chromosome', $chrom_num, 1, $end_bp + 1);
+        $chunk_name = "Start to $end_bp bp";
+      } elsif ($stend_option eq 'ddd') {
+        $chrom = $slice_adaptor->fetch_by_region('chromosome', $chrom_num, $start_bp + 1, $end_bp + 1); 
+        $chunk_name = "$start_bp bp to $end_bp bp";
+      } elsif ($stend_option eq 'eee') {
+        $chrom = $slice_adaptor->fetch_by_region('chromosome', $chrom_num, $kband_st + 1, $kband_end + 1);
+        $chunk_name = "Genetic Locus $genetic_locus ($kband_st bp to $kband_end bp)"
+      } elsif ($stend_option eq 'fff') {
+        $chrom = $slice_adaptor->fetch_by_region( 'chromosome', $chrom_num);
+        $chunk_name = "Entire";
+      }
+  
+      #### Read PeptideAtlas protein information
+      sub create_peptideatlas_feature($$$$);
+  
+      my $p;
+      my $protein_acc;
+      my $protein_start;
+      my $protein_stop;
+      my $protein_strand;
+      my $protein_strand_num;
+      my $num_protein;
+      my $acclist = scalar @acclist;
+         $no_coord_count = 0;
+      my @protein_list;
+  
+      #### Variables for computing coverage densities
+      my @obs_prots_per_megabase;
+      my @genes_per_megabase;
+
+ 
+      LINE: for $num_protein (0 .. ($acclist - 1)) {
+        $protein_acc  =  $acclist[$num_protein];
+        $protein_start = $coord1_list[$num_protein];
+        $protein_stop =  $coord2_list[$num_protein];
+        if ($protein_start == 0) {
+          $no_coord_count ++;
+          next LINE;
+          }
+        # add to coverage density tally
+        if ($get_coverage_density_only) {
+          my $mb = int($protein_start/1000000);
+          $obs_prots_per_megabase[$mb]++;
+          print "$mb: $protein_acc\n";
+        }
+  
+        if (($stend_option eq 'bbb') or ($stend_option eq 'ddd')) {
+          $protein_start -= $start_bp;
+          $protein_stop -= $start_bp;
+        } elsif ($stend_option eq 'eee') {
+          $protein_start -= $kband_st;
+          $protein_stop -= $kband_st;
+        }
+  
+        my $p = Bio::SeqFeature::Generic->new(
+			-start => $protein_start, 
+			-end => $protein_stop,
+			-score => 1000,
+			-display_name => $protein_acc );
+        push @protein_list, $p;
+      }
+  
+      #### Grab gene data from Ensembl
+      my $genes = $gene_adaptor->fetch_all_by_Slice($chrom);
+  
+      GENE: while ( my $gene = shift @{$genes} ) {
+        my $gene_start     = $gene->start();
+        my $gene_end       = $gene->end();
+        my $gene_strand    = $gene->strand();
+        my $gene_type      = $gene->biotype();
+        my $gene_name      = $gene->stable_id();
+  
+        if (($input_strand eq '+') and ($gene_strand == -1)) {
+          next GENE;
+        } elsif (($input_strand eq '-') and ($gene_strand == 1)) {
+          next GENE;
+        }
+  
+        if ($gene_type eq 'protein_coding') {
+          my $g = Bio::SeqFeature::Generic->new(
+  			-start => $gene_start,
+  			-end   => $gene_end,
+  			-score => 1000,
+  			-display_name => $gene_name );
+          push @gene_list, $g;
+ 
+          # store start location for computing coverage densities
+          if ($get_coverage_density_only) {
+            $genes_per_megabase[int($gene_start/1000000)]++;
+          }
+ 
+          PROT: for $num_protein (0 .. ($acclist - 1)) {
+            $protein_acc  =  $acclist[$num_protein];
+            $protein_start = $coord1_list[$num_protein];
+            $protein_stop =  $coord2_list[$num_protein];
+            $protein_strand = $strand_list[$num_protein];
+            if ($protein_start == 0) {
+              next PROT;
+            }
+  
+            if (($stend_option eq 'bbb') or ($stend_option eq 'ddd')) {
+              $protein_start -= $start_bp;
+              $protein_stop -= $start_bp;
+            } elsif ($stend_option eq 'eee') {
+              $protein_start -= $kband_st;
+              $protein_stop -= $kband_st;
+            }
+            
+  
+            if ($protein_strand eq '+') {
+  	      $protein_strand_num = 1;
+  	    } else {
+  	      $protein_strand_num = -1;
+  	    }
+  
+            if (($protein_start >= $gene_start) and ($protein_stop <= $gene_end)) {
+  	      if ($gene_strand == $protein_strand_num) {
+  
+  	        my $match_gene = Bio::SeqFeature::Generic->new(
+  			-start => $gene_start,
+  			-end   => $gene_end,
+  			-score => 1000 ,
+  			-display_name => $gene_name);
+  	        push @matchgene_list, $match_gene;
+  	        next GENE;
+  	      } else {
+  	        next PROT;
+  	      }
+            }
+          }
+        }
+      }
+  
+      #### Grab karyotype band data from Ensembl database
+      my @kary_list;
+      my $kary_end;
+      my @kary_end_list;
+      my $karyotypes = $kary_adaptor->fetch_all_by_Slice($chrom);
+      while ( my $kary = shift @{$karyotypes} ) {
+        my $kary_start  = $kary->start();
+           $kary_end    = $kary->end();
+        my $kary_name   = $kary->name();
+        my $kary_stain  = $kary->stain();
+        my $k;
+
+        if ($kary_stain =~ /gneg/ ) {
+          $k = Bio::SeqFeature::Generic->new(
+			-start => $kary_start,
+  			-end   => $kary_end,
+  			-display_name => $kary_name,
+  			-score => 400 );
+        } elsif ($kary_stain =~ /gpos../ ) {
+          $k = Bio::SeqFeature::Generic->new(
+  			-start => $kary_start,
+  			-end   => $kary_end,
+  			-display_name => $kary_name,
+  			-score => 800 );
+        } elsif ($kary_stain =~ /acen/ ) {
+          $k = Bio::SeqFeature::Generic->new(
+  			-start => $kary_start,
+  			-end   => $kary_end,
+  			-display_name => $kary_name,
+  			-score => 1000 );
+        } else {
+          $k = Bio::SeqFeature::Generic->new(
+  			-start => $kary_start,
+  			-end   => $kary_end,
+  			-display_name => $kary_name,
+  			-score => 200 );
+        }
+  
+        push @kary_end_list, $kary_end;
+        push @kary_list, $k;
+      }
+  
+      my @sorted_kary_end = sort {$a <=> $b} @kary_end_list;
+  
+      if ($stend_option eq 'ccc') {
+        $chromlen = $end_bp;
+      } elsif ($stend_option eq 'ddd') {
+        $chromlen = $end_bp - $start_bp;
+      } elsif ($stend_option eq 'eee') {
+        $chromlen = $kband_end - $kband_st;
+      } else {
+        $chromlen = @sorted_kary_end[(scalar @kary_end_list) - 1];
+      }
+ 
+      # compute and print coverage densities
+      if ($get_coverage_density_only &&
+      ( ( $sbeams->output_mode() eq 'csv' ) ||
+       ( $sbeams->output_mode() eq 'tsv' ) ) ) {
+
+        ### TMF: hand calculated for build 242; see work notes
+        my $meanDensity = 0.341;
+
+        #print "chrom $chrom_num:  $chromlen bp\n";
+        printf " %-4.4s %-4.4s  %-6.6s  %-6.6s  %-5.5s  %-5.5s  %s\n",
+            'Chr', 'Mb', 'Nswiss', 'Ngenes', 'densit', 'error', 'sig';
+
+        for (my $i=0; $i < int($chromlen/1000000); $i++) {
+          my $density = -1;
+          my $error=1.0;
+          my $significance=0;
+          my $n_obs_prots =  $obs_prots_per_megabase[$i];
+          my $n_genes = $genes_per_megabase[$i];
+          my $n_obs_prots_for_error = $n_obs_prots;
+          $n_obs_prots_for_error = 1 if ($n_obs_prots == 0);
+
+          if ($n_genes > 0) {
+            $density = $n_obs_prots / $n_genes;
+            $error = sqrt($n_obs_prots_for_error) / $n_genes;
+          }
+
+          my $diff_from_mean = $density-$meanDensity;
+          if ($n_genes > 0) {
+            if ($diff_from_mean > 0) {
+              $significance = 1 if ($diff_from_mean-$error > 0);
+            } elsif ($diff_from_mean < 0) {
+              $significance = -1 if ($diff_from_mean+$error < 0);
+            }
+          }
+
+            printf " %4.4s %4d  %6d  %6d  %5.2f  %5.2f  %2d\n",
+              $chrom_num, $i, $obs_prots_per_megabase[$i],
+              $genes_per_megabase[$i], $density, $error, $significance;
+          }
+        }
+ 
+      #### Initialize main panel, track sequence, and track ruler
+      my $panel = Bio::Graphics::Panel->new( 
+			-'length'    => $chromlen,
+  			-key_style => 'between',
+			-width     => 1600,
+			-empty_tracks => 'suppress',
+			-pad_top   => 10,
+			-pad_bottom => 10,
+			-pad_left  => 40,
+			-pad_right => 20 );
+  
+      my $ruler = Bio::SeqFeature::Generic->new( 
+			-end => $chromlen,
+			-start => 2);
+  
+      my $sequence = Bio::SeqFeature::Generic->new( 
+			-end => $chromlen,
+			-start => 1);
+  
+      #### Add all the tracks to the panel
+      ## Add chromosome track
+      $panel->add_track( $sequence,
+			-glyph  => 'segments',
+			-bgcolor => 'black',
+  			-key  => "Chromosome $chrom_num -- $chunk_name",
+  			-tick   => 2,
+  			-min_score => 0,
+  			-max_score => 1000 );
+  
+      ## Add observed protein track
+      $panel->add_track( \@protein_list,
+			-glyph     => 'graded_segments',
+			-bgcolor   => 'firebrick',
+			-key       => 'Protein Location',
+			-bump      => 1,
+			-height    => 8 );
+  
+      ## Add ruler track
+      $panel->add_track( $ruler,
+		    	-glyph  => 'anchored_arrow',
+			-tick   => 2,
+			-height => 8,
+			-key  => 'Chromosome Length (relative to requested section)');
+  
+      ## Add karyotype banding track
+      $panel->add_track( \@kary_list,
+			-glyph     => 'graded_segments',
+			-bgcolor   => 'black',
+			-font      => 'gdTinyFont',
+			-key       => 'Karyotypic Banding',
+	    		-bump      => 0,
+			-height    => 6,
+  			-label     => 1,
+  			-min_score => 0,
+  			-max_score => 1000 );
+  
+      ## Add yes_genes track
+      $panel->add_track( \@matchgene_list,
+			-glyph     => 'graded_segments',
+			-bgcolor   => '#BA55D3',
+			-key     => 'Location of genes covered by PeptideAtlas',
+			-bump      => 1,
+			-height    => 8,
+			-label     => 0 ); 
+  
+      ## Add genes track
+      $panel->add_track( \@gene_list,
+			-glyph     => 'graded_segments',
+			-bgcolor   => 'cornflowerblue',
+			-key       => 'Gene Location',
+			-bump      => 1,
+			-height    => 8,
+	    		-label     => 0 ); 
+
+      #### Create mouseovers and links for protein and gene bars
+      $pid = $$;
+      $map = "<MAP NAME='$pid'>\n";
+      my $link;
+      my @objects = $panel->boxes();
+
+      for my $obj (@objects) {
+        my $key_name = $obj->[0]->display_name();
+        my $coords = join( ", ", @$obj[1..4] );
+        if ($key_name =~ /^A|B|C|O|P|Q|ENSP|IPI/) { 
+          $link = "https://db.systemsbiology.net/sbeams/cgi/PeptideAtlas/GetProtein?protein_name=$key_name&apply_action=QUERY";
+          $map .= "<AREA SHAPE='RECT' COORDS='$coords' TITLE='$key_name' HREF='$link'>\n";
+        } elsif ($key_name =~ /^ENSG/) {
+          $link = "http://uswest.ensembl.org/Homo_sapiens/Gene/Summary?g=$key_name";
+          $map .= "<AREA SHAPE='RECT' COORDS='$coords' TITLE='$key_name' HREF='$link'>\n";
+        }
+      }
+      $map .= '</MAP>';
+
+      #### Create image file
+      $file_name = $pid . "GetProteinsChromosome.png";
+      $tmp_img_path = "images/tmp";
+      my $img_file = "$PHYSICAL_BASE_DIR/$tmp_img_path/$file_name";
+
+      open( OUT, ">$img_file" ) || die "$!: $img_file";
+      binmode(OUT);
+      print OUT $panel->png;
+      $panel->finished;
+      close OUT;
+    }
+
+    #### Store the resultset and parameters to disk resultset cache
+    $rs_params{set_name} = "SETME";
+ 
+    my %write_params = ( rs_table => $TBAT_ATLAS_BUILD,
+                        key_field => 'atlas_build_id',
+                        key_value => $atlas_build_id );
+
+
+    $sbeams->writeResultSet(
+      resultset_file_ref=>\$rs_params{set_name},
+      resultset_ref=>$resultset_ref,
+      query_parameters_ref=>\%parameters,
+      resultset_params_ref=>\%rs_params,
+      query_name=>"$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME",
+      column_titles_ref=>\@column_titles,
+      %write_params
+    );
+
+
+    #### Construct table help
+    my $obs_help = get_table_help( 'proteins' );
+
+    #### Display the resultset
+    if (! $get_coverage_density_only) {
+    $sbeams->displayResultSet(
+      resultset_ref=>$resultset_ref,
+      query_parameters_ref=>\%parameters,
+      rs_params_ref=>\%rs_params,
+      url_cols_ref=>\%url_cols,
+      hidden_cols_ref=>\%hidden_cols,
+      max_widths=>\%max_widths,
+      column_titles_ref=>\@column_titles,
+      column_help=>$obs_help,
+      base_url=>$base_url,
+      use_tabbed_panes=>'1',
+    );
+    }
+    #### Display Graphic and/or various error messages if unable to draw full graphic
+    if ($sbeams->output_mode() eq 'html') {
+      if ($organism_id != 2) {
+	print "<p>Unable to draw chromosome map for non-human builds</p>\n";
+      } else {
+	print "<p>Unable to draw standard chromosome map within these constraints</p>\n" if ($stend_option eq 'fff') ;
+	if ($chrom_num ne '' ) {
+	  print "<p>No coordinates available for $no_coord_count proteins</p>\n" if ($no_coord_count != 0);
+	  my $imgsrcbuffer = "<IMG SRC=\"$HTML_BASE_DIR/$tmp_img_path/$file_name\" ISMAP USEMAP='#$pid' ALT=\"Graphical Depiction of Proteins and Genes for Selected Chromosome\">";
+	  print "<p>$imgsrcbuffer $map</p>";
+	}
+      }
+    }
+
+    #### Display the resultset controls
+    $sbeams->displayResultSetControls(
+      resultset_ref=>$resultset_ref,
+      query_parameters_ref=>\%parameters,
+      rs_params_ref=>\%rs_params,
+      base_url=>$base_url,
+      use_tabbed_panes=>'1',
+    );
+
+#    die ( Dumper( $resultset_ref->{column_hash_ref} ) );
+
+    #### Display a plot of data from the resultset
+    $sbeams->displayResultSetPlot_plotly(
+      rs_params_ref=>\%rs_params,
+      resultset_ref=>$resultset_ref,
+      query_parameters_ref=>\%parameters,
+      column_titles_ref=>\@column_titles,
+      mouseover_column => 'biosequence_name',
+      mouseover_url => $url_cols{'Biosequence Name'},
+      mouseover_tag => '%0V',
+      base_url=>$base_url,
+      use_tabbed_panes=>'1',
+    );
+
+  #### If QUERY was not selected, then tell the user to enter some parameters
+  } else {
+    if ($sbeams->invocation_mode() eq 'http') {
+      print "<H4>Select parameters above and press QUERY</H4>\n";
+    } else {
+      print "You need to supply some parameters to constrain the query\n";
+    }
+  }
+
+
+} # end handle_request
+
+
+
+###############################################################################
+# evalSQL
+#
+# Callback for translating Perl variables into their values,
+# especially the global table variables to table names
+###############################################################################
+sub evalSQL {
+  my $sql = shift;
+
+  return eval "\"$sql\"";
+
+} # end evalSQL
+
+
+
+sub postProcessResultset_Origene {
+  my %args = @_;
+
+  my ($i,$element,$key,$value,$line,$result,$sql);
+
+  #### Process the arguments list
+  my $resultset_ref = $args{'resultset_ref'};
+  my $rs_params_ref = $args{'rs_params_ref'};
+  my $query_parameters_ref = $args{'query_parameters_ref'};
+  my $column_titles_ref = $args{'column_titles_ref'};
+
+  my %rs_params = %{$rs_params_ref};
+  my %parameters = %{$query_parameters_ref};
+
+  my $n_rows = scalar(@{$resultset_ref->{data_ref}});
+
+  my $cols = $resultset_ref->{column_hash_ref};                          
+  my $atlas_build_id = $parameters{atlas_build_id};
+  my $sql = qq~
+    SELECT DISTINCT BS.BIOSEQUENCE_NAME , PI.OBSERVED_IN_ORIGENETUBE
+    FROM $TBAT_BIOSEQUENCE_PROPERTY_SET BPS 
+    JOIN $TBAT_PROTEIN_IDENTIFICATION PI ON (BPS.BIOSEQUENCE_ID = PI.BIOSEQUENCE_ID)
+    JOIN $TBAT_BIOSEQUENCE BS ON (PI.BIOSEQUENCE_ID = BS.BIOSEQUENCE_ID AND 
+         BS.BIOSEQUENCE_SET_ID = (SELECT AB.BIOSEQUENCE_SET_ID 
+                                  FROM $TBAT_ATLAS_BUILD AB
+                                  WHERE AB.ATLAS_BUILD_ID = $atlas_build_id)
+         ) 
+    WHERE PI.ATLAS_BUILD_ID = $atlas_build_id;
+  ~;
+  my @rows = $sbeams->selectSeveralColumns($sql);
+  my %obs;
+  foreach my $row (@rows){
+    my ($prot, $t ) = @$row;
+    $obs{$prot}{$t} = 1;
+  }
+
+  $resultset_ref->{types_list_ref}->[$cols->{observed_in}] = 'string';
+  $resultset_ref->{precisions_list_ref}->[$cols->{observed_in}] = 20;
+ 
+  for (my $i=0; $i<$n_rows; $i++) {                                      
+    my $prot = $resultset_ref->{data_ref}->[$i]->[$cols->{biosequence_name}];
+    my $observed_in = lc(join(",", keys %{$obs{$prot}}));
+    $observed_in =~ s/(.{450}[^,]+).*/$1.../;
+    $observed_in =~ s/^isbhot00?//;
+    $observed_in =~ s/,isbhot00?/,/g;
+    $resultset_ref->{data_ref}->[$i]->[$cols->{observed_in}] = $observed_in;
+  }
+  return 1;
+} # end postProcessResult
+ 
+
+###############################################################################
+# postProcessResultset
+#
+# Perform some additional processing on the resultset that would otherwise
+# be very awkward to do in SQL.
+###############################################################################
+sub postProcessResultset {
+  my %args = @_;
+
+  my ($i,$element,$key,$value,$line,$result,$sql);
+
+  #### Process the arguments list
+  my $resultset_ref = $args{'resultset_ref'};
+  my $rs_params_ref = $args{'rs_params_ref'};
+  my $query_parameters_ref = $args{'query_parameters_ref'};
+  my $column_titles_ref = $args{'column_titles_ref'};
+
+  my %rs_params = %{$rs_params_ref};
+  my %parameters = %{$query_parameters_ref};
+
+  my $n_rows = scalar(@{$resultset_ref->{data_ref}});
+
+  my $cols = $resultset_ref->{column_hash_ref};                                                                                                   
+                                                                         
+  my $peptide_accession;                                                 
+  my $nprot;                                                             
+  my $nloc;                                                              
+                                                                         
+  #### TMF 06/23/09: seems that peptide_accession, n_protein_mappings,   
+  ####  and n_genome locations fields all contain biosequence_name       
+  #### I think this was copied from GetPeptides and is obsolete.         
+  for (my $i=0; $i<$n_rows; $i++) {                                      
+    $peptide_accession = $resultset_ref->{data_ref}->[$i]->[$cols->{peptide_accession}];
+    $nprot = $resultset_ref->{data_ref}->[$i]->[$cols->{n_protein_mappings}];
+    $nloc = $resultset_ref->{data_ref}->[$i]->[$cols->{n_genome_locations}];
+                                                                         
+    if ($nprot > 1) {                                                    
+      if ($nloc > 1) {                                                   
+  $peptide_accession .= "(degen_NLoc=$nloc)";                            
+      } else {                                                           
+  $peptide_accession .= "(degen)";                            
+      }
+
+      $resultset_ref->{data_ref}->[$i]->[$cols->{peptide_accession}] = $peptide_accession;
+
+    } elsif ($nloc > 1) {
+      die("ERROR: nprot <=2 but $nloc > 1. This is wrong. Please report this error.");
+    }
+
+  }
+
+  return 1;
+
+} # end postProcessResult
+ 
+
+
+#######################################################################
+sub getOrganismFullName 
+{
+    my %args = @_;
+    
+    my $organism_id = $args{organism_id};
+
+    my $sql = qq~
+        SELECT full_name
+        FROM $TB_ORGANISM
+        WHERE organism_id = '$organism_id'
+        AND record_status != 'D'
+    ~;
+
+    my ($full_name) = $sbeams->selectOneColumn($sql);
+
+    ## replace spaces with _
+    $full_name =~ s/ /\_/g;
+
+    return $full_name;
+}
+
+
+#######################################################################
+sub get_table_help {
+  my $name = shift;
+  return '' unless $name;
+  my @entries;
+  my $hidetext;
+  my $showtext;
+  my $heading;
+  my $description;
+  if ( $name eq 'proteins' ) {
+    @entries = (
+      { key => 'Biosequence Name', value => 'Sequence database accession' },
+      { key => 'Covering Set', value => 'Whether this sequence is part of a minimal set explaining all observed peptides' },
+      { key => 'Presence Level', value => 'canonical=member of minimally redundant set<br>possibly distinguished=at least one pep diff from all canonicals<br>subsumed=all peps contained in a canon. or poss. dist.<br>ntt-subsumed=subsumed and >=1 pep lacks tryptic terminus' },
+      { key => 'Protein Prophet Prob', value => 'Probability this protein exists in sample, according to Protein Prophet.' },
+      { key => 'Norm Obs per 100K', value => 'N Obs, normalized to number of observable peptides in protein, expressed per 100K total observations' },
+      { key => 'Published plasma ng/ml', value => 'Physiological concentration in human plasma' },
+
+      { key => 'Mult Hyp Test Prob', value => 'Probability this protein exists in sample, according to States, et al., Nat Biotechnol, 2006' },
+      { key => 'N Obs', value => 'ProteinProphet adjusted PSM (peptide-spectrum match) count, usually lower than actual PSM count' },
+      { key => 'N Distinct Peptides', value => 'Number of sequence-distinct peptides' },
+      { key => 'Genetic Locus', value => 'Provided when available' },
+      { key => 'Start/End in Chrom', value => 'Starting/ending base number in chromosome' },
+      { key => 'Strand', value => 'Which strand of chromosome' },
+      { key => 'Source', value => 'Literature source for published ng/ml; one of Hortin, et al., Clin Chem, 2008; Polanski & Anderson, Biomarker Insights, 2006; Haab, et al., Proteomics, 2005' },
+      { key => 'Estimated ng/ml', value => 'Estimated physiological concentration, by spectral counting (only available for some builds)' },
+      { key => 'Uncertainty ng/ml', value => 'About 2/3 of estimated concentrations are within +/- this multiplicative factor' },
+      { key => 'Redundancy Relationship', value => 'This protein sequence has exactly the same peptides as a sequence with a Presence Level. "identical" if sequence-identical, else "indistinguishable"' },
+      { key => 'Redundant With Respect To', value => 'Sequence that this entry is indistinguishable from or identical to' },
+      { key => 'Protein Group', value => 'Sequence belongs to protein group of this name. Click here to see all group members.' },
+      { key => 'Seq Uniq Prots in Grp', value => 'Number of sequence-unique protein sequences in this group' },
+      { key => 'Protein Group Seq Alignmt', value => 'Click to see a sequence alignment for this protein group' },
+      { key => 'Keratin', value => 'Is keratin according to description, or is in same group as a keratin' },
+      { key => 'Ig', value => 'Is immunoglobulin according to description, or is in same group as an immunoglobulin' },
+      { key => 'Protein Description', value => 'Description as taken from sequence database fasta file' },
+    );
+    
+    $showtext = 'show column descriptions';
+    $hidetext = 'hide column descriptions';
+    $heading = 'Identified Proteins';
+    $description= 'Protein sequences mapped to by identified peptides';
+    
+  }
+
+  return unless @entries;
+  my $help = $sbeamsMOD->get_table_help_section( name => $name,
+  description => $description,
+  heading => $heading,
+  entries => \@entries,
+  showtext => $showtext,
+  hidetext => $hidetext  );
+  return $help;
+    
+} # end get_table_help

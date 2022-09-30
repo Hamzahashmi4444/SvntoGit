@@ -1,0 +1,54 @@
+The following changes to the core SBEAMS database should be made when
+upgrading SBEAMS
+
+from version 0.22
+  to 0.23 (development branch)
+     0.24 (next release)
+     or later
+
+---------------
+
+2006-07-13
+
+Remove some obsolete fields from query forms. Have been replaced
+with a new widget
+
+DELETE FROM table_column WHERE column_name = 'input_form_format'
+
+---------------
+
+2007-05-23
+
+Added index to table short_url:
+
+CREATE INDEX idx_url_key ON short_url ( url_key );
+
+---------------
+
+2008-07-24
+
+Altered column definitions in the $SBEAMS/lib/conf/Core/Core_table_columns.txt
+file to reflect current values in production db.  All changes occured in the 
+table_columns table.
+column_name went from VARCHAR(50) to VARCHAR(255)
+column_title went from VARCHAR(50) to VARCHAR(255)
+is_display_column went from CHAR(1) to VARCHAR(50)
+
+ALTER TABLE table_column DROP COLUMN column_name
+ALTER TABLE table_column ADD column_name VARCHAR(255)
+
+ALTER TABLE table_column DROP COLUMN column_title
+ALTER TABLE table_column ADD column_title VARCHAR(255)
+
+ALTER TABLE table_column DROP COLUMN is_display_column
+ALTER TABLE table_column ADD is_display_column VARCHAR(50)
+
+Note you will have to run update_driver_tables.pl Core_table_columns.txt after these changes.
+
+
+
+
+
+
+
+

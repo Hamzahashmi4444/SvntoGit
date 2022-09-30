@@ -1,0 +1,3214 @@
+#!/usr/local/bin/perl
+#
+
+###############################################################################
+# Program     : GetTransitions
+#
+# Description : page retrieve peptides and MS/MS fragment ions from PABST
+#               and PATR tables 
+###############################################################################
+
+$|++;
+
+## Setup objects and globals 
+use strict;
+use Getopt::Long;
+use FindBin;
+use Data::Dumper;
+
+
+use lib "$FindBin::Bin/../../lib/perl";
+use vars qw ( $q $current_contact_id $current_username
+$PROG_NAME $USAGE %OPTIONS $QUIET $VERBOSE $DEBUG $DATABASE
+$TABLE_NAME $PROGRAM_FILE_NAME $CATEGORY $DB_TABLE_NAME
+@MENU_OPTIONS);
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::Settings ( qw( :default ) );
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::TabMenu;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::PeptideAtlas::BestPeptideSelector;
+use SBEAMS::PeptideAtlas::ConsensusSpectrum;
+use SBEAMS::Proteomics::PeptideMassCalculator;
+
+my $massCalculator = new SBEAMS::Proteomics::PeptideMassCalculator;
+
+use constant ROW_LIMIT => 50000;
+use constant MZ_TOLERANCE => 0.005;
+
+
+# Set up Atlas objects
+my $sbeams = new SBEAMS::Connection;
+my $atlas = new SBEAMS::PeptideAtlas;
+$atlas->setSBEAMS($sbeams);
+$sbeams->setSBEAMS_SUBDIR( 'PeptideAtlas' );
+my $best_peptide = new SBEAMS::PeptideAtlas::BestPeptideSelector;
+$best_peptide->setAtlas( $atlas );
+$best_peptide->setSBEAMS( $sbeams );
+$PROG_NAME = 'GetTransitions';
+my $consensus = new SBEAMS::PeptideAtlas::ConsensusSpectrum;
+$consensus->setSBEAMS( $sbeams );
+my $pabst_build_id;
+my $akey = $sbeams->getRandomString( num_chars => 30 );
+
+# Params are global - is this a problem?
+my %parameters = ( prefetch => 0 );
+my %rs_params;
+
+my $is_html = 0;
+my $base_url = "$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME";
+
+my $guest = 1;
+my $super_guest = 0;
+my $SRMAuth;
+my $isAuthorized;
+
+main();
+#$sbeams->profile_sql( list => 1 );
+exit(0);
+
+# Main Program
+sub main {
+  $sbeams->time_stmt( "in main" );
+
+  # Authenticate and exit if a username is not returned
+  my $current_username = $sbeams->Authenticate( allow_anonymous_access => 1 );
+  exit unless $current_username;
+
+  #### Read in the default input parameter_onlys
+  $parameters{uploaded_file_not_saved} = 1;
+  my $n_params_found = $sbeams->parse_input_parameters( q=>$q,parameters_ref=>\%parameters);
+
+  %rs_params = $sbeams->parseResultSetParams(q=>$q);
+
+  # Process generic "state" parameters before we start
+  $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+  # This will look for mod-specific params and do the right thing
+  $atlas->processModuleParameters(parameters_ref=>\%parameters);
+
+  $is_html = ( $sbeams->output_mode() eq 'html' ) ? 1 : 0;
+  $sbeams->setSessionAttribute( key => 'PA_resource', value => 'SRMAtlas' ) if $is_html;
+
+  $guest = $sbeams->isGuestUser();
+  if ( !$guest ) {
+    $parameters{pabst_build_id} ||= '';
+#   $parameters{pabst_build_id} = 146 if $parameters{pabst_build_id} eq 'specialaccess';
+  }
+  $parameters{apply_action_hidden} ||= '';
+  my $referrer = $q->referer();
+#  if ( $referrer =~ /https*:\/\/db\.systemsbiology\./ &&
+#     ( $referrer =~ /MapSearch|proteinList/ || ( $q->request_method() eq 'POST' && $parameters{apply_action_hidden} =~ /HPPBD/ ) ) ) {
+#    if ( $guest ) {
+#      $super_guest = 1;
+#      $parameters{apply_action_hidden} ||= '<INPUT TYPE="hidden" NAME="apply_action_hidden" VALUE="HPPBD"\>';
+#      if ( !$parameters{pabst_build_id} && ( $parameters{organism_name} && $parameters{organism_name} =~ /Human/i ) ) {
+#        $parameters{pabst_build_id} = 146;
+#      }
+#    }
+#  } elsif ( is_srma_preview_site( $referrer ) ) {
+#    if ( $guest ) {
+#      $super_guest = 1;
+#      $parameters{apply_action_hidden} ||= "<INPUT TYPE='hidden' NAME='apply_action_hidden' VALUE='$referrer'\>";
+#      if ( !$parameters{pabst_build_id} && ( $parameters{organism_name} && $parameters{organism_name} =~ /Human/i ) ) {
+#        $parameters{pabst_build_id} = 146;
+#      }
+#    }
+#  }
+
+# Wrap this in a warn level... IDEA!
+#  my $paramstr = join( ',', %parameters );
+#  $log->logCGI( paramstr => $paramstr, mode => 'start' );
+
+
+  $sbeams->time_stmt( "Set target" );
+  # Set default target instrument
+  if ( !$parameters{target_instrument} ) {
+    my ( $qqq ) = $sbeams->selectrow_array( "SELECT instrument_type_id FROM $TBAT_INSTRUMENT_TYPE WHERE instrument_type_name = 'QQQ'" );
+    $parameters{target_instrument} = $qqq;
+    $q->param( target_instrument => $qqq );
+  }
+
+  my $all_params = qq~
+https://db.systemsbiology.net/devDC/sbeams/cgi/PeptideAtlas/GetTransitions?pabst_build_id=164&protein_name_constraint=P00533&protein_file=&peptide_sequence_constraint=&peptide_file=&peptide_length=&n_highest_intensity_fragment_ions=4&n_peptides_per_protein=5&target_instrument=2&exclusion_range=&SwissProt=on&4H=1&5H=1&Hper=1&ssr_p=0.5&C=1&D=1&M=1&P=1&R=1&S=1&W=1&nQ=1&NxST=1&nE=1&nM=1&Xc=1&nX=1&BA=1&obs=2&PATR=10&min_l=7&min_p=0.2&max_l=25&max_p=0.2&cmod_opts=light&min_mz=&max_mz=&speclinks=on&rt_type=7&y_ions=on&b_ions=on&C[160]=on&N[115]=on&set_current_work_group=&set_current_project_id=&QUERY_NAME=AT_GetTransitions&apply_action_hidden=&action=QUERY
+  ~;
+
+  if ( !$parameters{pabst_build_id} && $parameters{SBEAMSentrycode} && $parameters{SBEAMSentrycode} == 'SRM73sFPASS1' ) {
+    $parameters{pabst_build_id} = 164;
+    $parameters{protein_name_constraint} ||= 'P00533';
+    $parameters{SwissProt} ||= 'checked';
+    $parameters{action} ||= 'QUERY';
+    $parameters{rt_type} ||= 7;
+    $parameters{y_ions} ||= 'on';
+    $parameters{b_ions} ||= 'on';
+    $parameters{'C[160]'} ||= 'on';
+    $parameters{'N[115]'} ||= 'on';
+    $parameters{'N[115]'} ||= 'on';
+  }
+
+  # Fetch pabst_build_id based on params. 
+  # 1 - passed pabst_build_id param
+  # 2 - passed organism
+  # 3 - cached pabst_build_id cookie
+  # 4 - global default
+  $pabst_build_id = $best_peptide->get_pabst_build( %parameters );
+
+  my $project_id = $atlas->getProjectID(
+    atlas_build_id => $parameters{atlas_build_id}
+  );
+  $atlas->display_page_header(project_id => $project_id);
+
+  my $restricted_protein_clause = '';
+  my $restricted_peptide_clause = '';
+
+  my $bad_build_specified = 0;
+  my $special_access_ok = 0;
+
+  if ( $parameters{pabst_build_id} && $parameters{pabst_build_id} != $pabst_build_id ) {
+#    my $auth_path = get_auth_path();
+#
+#    # Remove any expired auth files
+#    clear_auth( $auth_path );
+#
+#    $SRMAuth = $q->cookie( 'SRMAtlasAuthorized' );
+#    if ( $guest && !$super_guest && $SRMAuth && ($parameters{pabst_build_id} == 146 || $parameters{pabst_build_id} eq 'specialaccess' ) ) {
+#      $parameters{pabst_build_id} = 146;
+#
+#      # This mechanism supercedes the restricted proteins mechanism
+#      $restricted_protein_clause = '';
+#
+#      if ( -e "$auth_path/$SRMAuth" ) {
+#        $isAuthorized++;
+#        unlink( "$auth_path/$SRMAuth" );
+#        $super_guest++;
+#        $pabst_build_id = $parameters{pabst_build_id};
+#        print qq~
+#        <p>
+#        <br>
+#        <span class=info_box>You are being allowed access to the Complete Human SRMAtlas subject to the provisional license agreement</span>
+#        <br>
+#        </p>
+#        ~ if $is_html;
+#        $special_access_ok++;
+#      } else {
+##        die "auth don't exist SRMA is $SRMAuth, auth path is $auth_path";
+#        $bad_build_specified++ unless $super_guest;
+#      }
+#    } else {
+##      die "not guest($guest) and not super($super_guest), etc.SRMA is $SRMAuth, auth path is $auth_path";
+      $bad_build_specified++ unless $super_guest;
+#    }
+  }
+
+#  if ( $super_guest ) {
+#    $pabst_build_id = ( $parameters{pabst_build_id} == 146 ) ? 146 : $pabst_build_id;
+# }
+
+  $parameters{organism} ||= $best_peptide->getBuildOrganism( pabst_build_id => $pabst_build_id );
+	$parameters{build_bss_id} = $best_peptide->get_pabst_bss_id( pabst_build_id => $pabst_build_id );  
+
+  $sbeams->time_stmt( "Go build, organism, etc." );
+
+  # Some users have access to a subset of certain builds
+  # FIXME - don't add if already there.  Also, multiple lists?
+  my $restricted_build_js = ''; 
+
+  # provisional access issue
+  if ( $parameters{pabst_build_id} && $parameters{pabst_build_id} !~ /^\d+$/ ){ 
+    die "illegal build specified: $parameters{pabst_build_id}";
+  }
+
+  my $protein_list_info = $atlas->getProteinListInfo( username => $current_username, build_id => $parameters{pabst_build_id} );
+
+  my $pl_auth = 0;
+#  if ( $protein_list_info->{build_ok} && ( !$guest ) ) {
+#    $restricted_build_js = qq~
+#    var pb_select=document.getElementById("pabst_build_id");
+#    var new_option=document.createElement("option");
+#    new_option.text="$protein_list_info->{build_name}";
+#    new_option.value="$protein_list_info->{build_id}";
+#    pb_select.add(new_option,pb_select.options[null]);
+#    var last_idx = pb_select.length - 1;
+#    pb_select.selectedIndex=last_idx;
+#    ~;
+#    $restricted_build_js = ''; 
+#    # Protein list access superceded by preview access
+#
+#    if ( !$parameters{pabst_build_id} ) {
+#      # Assume that this is the best build, unless they've specified another
+#      $pabst_build_id = $protein_list_info->{build_id};
+#    } elsif ( $parameters{pabst_build_id} eq $protein_list_info->{build_id} ) {
+#      # They specified a build that is legal based on protein list.  Let it be. 
+#      $log->info( "looks like a valid build_id" );
+#      $pl_auth++;
+#      $pabst_build_id = $parameters{pabst_build_id};
+#    }
+#}
+
+
+
+#  # This might have gotten overridden due to permissions.
+#  if ( $protein_list_info->{build_ok} &&
+#       $pabst_build_id == 146         &&
+#       !is_srma_preview_site()        &&
+#       $pl_auth  ) {
+#
+#    # Could be allowed via a protein list
+#    if ( scalar( keys( %{$protein_list_info->{proteins}} ) ) ) {
+#      $restricted_protein_clause = " AND biosequence_name IN ( '" . join( "','", keys( %{$protein_list_info->{proteins}} ) ) . " ' ) \n";
+#      $log->info( "Allowed access for $current_username to build $pabst_build_id proteins $restricted_protein_clause" );
+#    }
+#    if ( scalar( keys( %{$protein_list_info->{peptides}} ) ) ) {
+#      $restricted_peptide_clause = " AND peptide_sequence IN ( '" . join( "','", keys( %{$protein_list_info->{peptides}} ) ) . " ' ) \n";
+#      $log->info( "Allowed access for $current_username to build $pabst_build_id peptides $restricted_peptide_clause" );
+#    }
+#    $bad_build_specified = 0;
+#  }
+#  $restricted_protein_clause = '' if $special_access_ok;
+
+  # Decide what action to take based on information so far
+
+  # set up some defaults, only in command-line mode, to time queries/operations
+  if ( !$parameters{action} && !$is_html ) {
+    $log->debug( "in the auto-setting mode, command-line only!"  . time());
+    $parameters{n_highest_intensity_fragment_ions} = 4;
+    $parameters{n_peptides_per_protein} = 5;
+    $parameters{protein_name_constraint} = 'YAL003W%';
+    $parameters{QUERY_NAME} = 'AT_GetTransitions';
+    $parameters{action} = 'QUERY';
+    $parameters{pabst_build_id} = 12;
+  }
+  if ( $parameters{default_search} ) {
+    $parameters{y_ions} ||= 'on';
+    $parameters{b_ions} ||= 'on';
+    $parameters{'C[160]'} ||= 'on';
+    $parameters{speclinks} ||= 'on';
+    $parameters{SwissProt} ||= 'checked';
+  }
+
+  # Add select list javascript
+  if ( $is_html ) {
+    print "<script>document.title = 'Query Transitions from SRMAtlas';</script>";
+    print qq~
+      <link rel="stylesheet" href="//code.jquery.com/ui/1.10.4/themes/smoothness/jquery-ui.css">
+       <script src="//code.jquery.com/jquery-1.9.1.js"></script>
+<script src="//code.jquery.com/ui/1.10.4/jquery-ui.js"></script>
+    ~;
+
+    print q~
+    <style text/css>
+     .ui-dialog-titlebar-close { visibility: hidden; }
+     .ui-widget-overlay { opacity: .30; filter: Alpha(Opacity=30); background: #AAA }
+    </style>
+
+
+<script type="text/javascript" charset="utf-8">
+$(document).ready(function() {
+  window.onload = function() {
+
+ // Set cookie value to false with each page load
+     var cookie = document.cookie;
+     var regex = new RegExp( "SRMAtlasAuthorized=([^;]+)" );
+     cookie = "SRMAtlasAuthorized=XXX";
+     document.cookie = cookie;
+
+    var build_option = document.getElementById( 'pabst_build_id' );
+    var special_option = 0;
+    for (var i = 0; i < build_option.length; i++){
+      if( build_option.options[i].value == 'specialaccess' ) {
+        var new_idx = i + 1;
+        build_option.selectedIndex = new_idx
+      }
+    }
+
+    ~;
+    print "$restricted_build_js\n";
+    print q~
+
+    $.getJSON("AJAXClient.cgi",{pabst_build_id: $("select#pabst_build_id").val(), source: 'GetTransitions_Gradient_doc'}, function(j){
+       document.getElementById("gradient_doc").innerHTML = j['url'];
+    })
+
+
+    $.getJSON("AJAXClient.cgi",{pabst_build_id: $("select#pabst_build_id").val(), source: 'GetTransitions_SourceSelect'}, function(j){
+      var options = '';
+      for (var i = 0; i < j.length; i++) {
+        options += '<option value="' + j[i].optionValue + '">' + j[i].optionText + '</option>';
+      }
+     $("select#source_instrument_type_id").html(options);
+    })
+
+    $.getJSON("AJAXClient.cgi",{pabst_build_id: $("select#pabst_build_id").val(), source: 'GetTransitions_ElutionTimeSelect'}, function(j){
+      var options = '';
+      for (var i = 0; i < j.length; i++) {
+        options += '<option value="' + j[i].optionValue + '">' + j[i].optionText + '</option>';
+      }
+     $("select#rt_type").html(options);
+    })
+
+
+  }
+
+  $("select#pabst_build_id").change(function() {
+
+    $.getJSON("AJAXClient.cgi",{pabst_build_id: $("select#pabst_build_id").val(), source: 'GetTransitions_Gradient_doc'}, function(j){
+       document.getElementById("gradient_doc").innerHTML = j['url'];
+//      $("div#gradient_doc").html = j['url'];
+    })
+
+    var elution_time_option = document.getElementById( 'rt_type' );
+    elution_time_option.selectedIndex = 9999;
+    $.getJSON("AJAXClient.cgi",{pabst_build_id: $(this).val(), source: 'GetTransitions_ElutionTimeSelect'}, function(j){
+      var options = '';
+      for (var i = 0; i < j.length; i++) {
+        options += '<option value="' + j[i].optionValue + '">' + j[i].optionText + '</option>';
+      }
+     $("select#rt_type").html(options);
+    })
+
+    $.getJSON("AJAXClient.cgi",{pabst_build_id: $(this).val(), source: 'GetTransitions_SourceSelect'}, function(j){
+      var options = '';
+      for (var i = 0; i < j.length; i++) {
+        options += '<option value="' + j[i].optionValue + '">' + j[i].optionText + '</option>';
+      }
+     $("select#source_instrument_type_id").html(options);
+    })
+
+    $.getJSON("AJAXClient.cgi",{pabst_build_id: $(this).val(), source: 'GetTransitions_NamespaceFilters'}, function(j){
+      var options = '';
+      for (var i = 0; i < j.length; i++) {
+        options += j[i];
+      }
+      var namespace = document.getElementById( 'NamespaceFilters' );
+      namespace.innerHTML = options;
+    })
+
+    var build_option = document.getElementById( 'pabst_build_id' );
+    if ( build_option[build_option.selectedIndex].value == 'specialaccess' ) {
+//      var confirmation = confirm( "The Complete Human SRMAtlas is being made available on a provisional basis. By selecting 'Yes', you are agreeing to the conditions on its use." ); 
+    var dialog_div = document.getElementById( 'access_agreement' );
+
+    // pre-fill email if they have already set it once
+    var cookie = document.cookie;
+    var regex = new RegExp( "SRMAuthEmail=([^;]+)" );
+    var match = regex.exec( cookie + ";" );
+    var previous_email = ''; 
+    if ( match ) {
+      previous_email = match[1]; 
+    }
+
+    dialog_div.innerHTML = "Access to the Complete Human SRMAtlas is provided as a preview for feedback and improvements.<br>\n";
+    dialog_div.innerHTML += "This is not a full public release of the Human SRMAtlas and is only provided as a pre-publication preview.<br>\n";
+    dialog_div.innerHTML += "If you agree with these terms, please enter your email address to preview the Complete Human SRMAtlas.<br> \n";
+    dialog_div.innerHTML += "<br><i>Results will be limited to 50 proteins per query. </i> <br> \n";
+    dialog_div.innerHTML += "<br><b><align=center>email:</align></b><input type=text value='" + previous_email + "' size=16 id=email_address></input>";
+      get_agreement( );
+    }
+
+  })
+
+})
+
+function agree_callback ( status ) {
+  var build_option = document.getElementById( 'pabst_build_id' );
+  var special_option = 0;
+  for (var i = 0; i < build_option.length; i++){
+    if( build_option.options[i].value == 'specialaccess' || build_option.options[i].value == 146  ) {
+      special_option = i;
+    }
+  }
+
+  if ( status ) {
+    // First check email format.
+    var email_ok = false;
+    var email = document.getElementById('email_address');
+    if ( email.value.length > 1 ) {
+      var email_regex = new RegExp( "(.*@.*\..*)" );
+      var email_match = email_regex.exec( email.value );
+      if ( email_match ) {
+        // nothing here yet
+        var cookie = document.cookie;
+        var regex = new RegExp( "SRMAuthEmail=([^;]+)" );
+        var match = regex.exec( cookie + ";" );
+        cookie = "SRMAuthEmail=" + email_match[0];
+        document.cookie = cookie;
+        var email_ok = true;
+      } else {
+        alert( "email address " + email.value + " appears invalid " );
+        get_agreement()
+      }
+    } else {
+      alert( 'Please enter a valid email address' );
+      get_agreement( );
+    }
+    // Set acceptance cookie
+    // Set value to build_id  
+    if ( email_ok ) {
+      build_option.options[special_option].value = 146;
+      var cookie = document.cookie;
+      var regex = new RegExp( "SRMAtlasAuthorized=([^;]+)" );
+      var match = regex.exec( cookie + ";" );
+    ~;
+    print "     var akey = '$akey'\n";
+    print q~
+      cookie = "SRMAtlasAuthorized=" + akey;
+      document.cookie = cookie;
+    }
+  } else {
+    // Delete special option
+    build_option.options[special_option].remove();
+  }
+
+}
+
+function get_agreement() {
+
+  $( "#access_agreement" ).dialog({
+                          position: "center top",
+                          resizable: false,
+                          autoOpen: false,
+                          height: 'auto',
+                          width: 'auto',
+                          modal: true,
+                          buttons: {
+                            "Agree to terms": function() {
+                              $( this ).dialog( "close" );
+                              return agree_callback( true );
+                            },
+                            "Disagree": function() {
+                               $( this ).dialog( "close" );
+                               return agree_callback( false );
+                             }
+                          }
+   })
+  var agreement = $( "#access_agreement" ).dialog( "open" );
+
+}
+
+</script>
+<div id=access_agreement>
+</div>
+
+<script type=text/javascript>
+function verify_build() {
+  var build_option = document.getElementById( 'pabst_build_id' );
+  var selected = build_option.selectedIndex;
+  var elution_time_option = document.getElementById( 'rt_type' );
+  // CHANGEME - remove the selected == 1 constraint along with HSRMA short-circuit
+  if ( typeof( selected ) == "undefined" || !build_option[selected].value  ) {
+    alert( "You must first select a valid build" );
+    elution_time_option.selectedIndex = 9999;
+    return false;
+  }
+  if ( elution_time_option.selectedIndex < 0 ) {
+    alert( "Elution time type not selected" );
+    return false;
+  }
+  return true;
+}
+</script>
+
+  ~;
+    print "$restricted_build_js\n";
+
+  }
+
+  #### Get the HTML to display the tabs
+  my $tabMenu = $atlas->getTabMenu(
+      parameters_ref => \%parameters,
+      program_name => $PROG_NAME,
+  );
+
+  $sbeams->time_stmt( "Added tabmenu" );
+
+  # SRM mode is if we want to show SRM Atlas skin, currently disabled.
+  unless ( 0 && $atlas->is_srm_mode() ) {
+    print $tabMenu->asHTML() if ($sbeams->output_mode() eq 'html');
+
+    if ( my $msg = $q->cookie( 'SubmitMessage' ) ) {
+      print qq~
+      <br>
+      <div class=info_box id=gt_info>$msg</div>
+      <script type="text/javascript">
+        setTimeout(function() {
+          var gt_info = document.getElementById( 'gt_info' );
+          gt_info.style.display = 'none';
+        }, 10000);
+      </script>
+      <br>
+      ~ if $is_html;
+    }
+    my $dhtml = $sbeams->getTabbedPanesDHTML();
+    print $dhtml if $is_html;
+  }
+
+  # Print form regardless.  A heavily-modified manage table form, 
+  my $err = '';
+  if ( !$pabst_build_id ) {
+    $err = $sbeams->makeErrorText( "<BR>No valid builds found for this user" );
+  } elsif( $bad_build_specified ) {
+    $err = $sbeams->makeErrorText( "<BR>Specified build is not accessible to this user" );
+  }
+  print $err if $err;
+
+  if ( $is_html ) {
+    print "<DIV id=query_info></DIV>\n";
+    print_form ( %parameters );  
+    $sbeams->time_stmt( "Printed form" );
+  }
+
+  if ( $parameters{action} && $parameters{action} eq 'QUERY' && !$err ) {
+    $log->debug( "  Going to fetch transitions"  . time());
+    fetch_transitions( %parameters, restricted_proteins => $restricted_protein_clause, restricted_peptides => $restricted_peptide_clause );  
+    $log->debug( "  Done fetching transitions"  . time());
+  }
+  $atlas->display_page_footer( close_tables => 0 ) if $guest;
+  $sbeams->setSessionAttribute( key => 'PA_resource', value => '' ) if $is_html;
+
+} # end main
+
+
+###############################################################################
+# Handle Request
+###############################################################################
+sub print_form {
+  my %args = @_;
+
+  # Historical, don't ask.
+  my %parameters = %args;
+
+
+  #### Define some generic variables
+  my ($i,$element,$key,$value,$line,$result,$sql);
+
+  #### Define some variables for a query and resultset
+  my %resultset = ();
+  my $resultset_ref = \%resultset;
+  my (%url_cols,%hidden_cols,%max_widths,$show_sql);
+
+  #### Read in the standard form values
+  my $apply_action    = $parameters{'action'} || $parameters{'apply_action'};
+  my $TABLE_NAME = $parameters{'QUERY_NAME'};
+  # Historical, don't ask.
+
+    #### Set some specific settings for this program
+    my $CATEGORY="Query Transitions";
+
+    $TABLE_NAME="AT_GetTransitions" unless ($TABLE_NAME);
+
+    ($PROGRAM_FILE_NAME) =
+        $atlas->returnTableInfo($TABLE_NAME,"PROGRAM_FILE_NAME");
+
+    my $base_url = "$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME";
+
+    #### Get the columns and input types for this table/query
+    my @columns = $atlas->returnTableInfo($TABLE_NAME,"ordered_columns");
+
+    my %input_types = 
+        $atlas->returnTableInfo($TABLE_NAME,"input_types");
+
+
+    #### Read the input parameters for each column
+    my $n_params_found = $sbeams->parse_input_parameters(
+        q=>$q,parameters_ref=>\%parameters,
+        columns_ref=>\@columns,input_types_ref=>\%input_types);
+     #$sbeams->printDebuggingInfo($q);
+
+
+    #### If the apply action was to recall a previous resultset, do it
+    my %rs_params = $sbeams->parseResultSetParams(q=>$q);
+
+    #### Set some reasonable defaults if no parameters supplied
+    unless ($n_params_found) 
+    {
+      $parameters{input_form_format} = "minimum_detail";
+    }
+    $parameters{n_peptides_per_protein} ||= 5;
+    $parameters{n_highest_intensity_fragment_ions} ||= 4;
+    if ( $parameters{peptides_only} ) {
+      $parameters{n_highest_intensity_fragment_ions} = 1;
+    }
+    $parameters{pabst_build_id} = $pabst_build_id;
+
+#    pabst_build_id=7
+#    protein_name_constraint=Foo
+#    upload_file=
+#    peptide_sequence_constraint=
+#    peptide_length=
+#    empirical_proteotypic_constraint=
+#    n_protein_mappings_constraint=
+#    n_genome_locations_constraint=
+#    n_highest_intensity_fragment_ions=3
+
+    ##Input form:  action is set by PROGRAM_FILE_NAME, so sub it w/ display page:
+    $sbeams->collectSTDOUT();
+
+    
+    my $noop = ( 1 ) ? $sbeams->makeInfoText( '(Weight adjustment temporarily unavailable)' ) : '';
+    my ( $tr, $link ) = $sbeams->make_table_toggle( name => 'pabst_penalty_form',
+                                                 visible => 0,
+                                                 tooltip => 'Show/Hide penalty form',
+                                                  sticky => 0,
+                                                 imglink => 0,
+                                                textlink => 1,
+                                               plaintext => 0,
+                                                hidetext => "Hide form $noop",
+                                                showtext => 'Show form' );
+
+
+    my @link = split "\n", $link;
+    my $script_css = join( "\n", @link[0..$#link-1] );
+
+    print $script_css;
+
+    $sbeams->display_input_form(
+        TABLE_NAME=>$TABLE_NAME,
+        CATEGORY=>$CATEGORY,
+        apply_action=>$apply_action,
+        parameters_ref=>\%parameters,
+        input_types_ref=>\%input_types,
+        mask_user_context=> '1',
+        mask_query_constraints => 1,
+        onSubmit => 'ONSUBMIT="return verify_build()"',
+        apply_uc_first => 1
+    );
+    my $form = $sbeams->fetchSTDOUT();
+    $form =~ s/PABST Build/SRMAtlas Build/gm;
+#      <TD><SELECT NAME="pabst_build_id" >
+    $form =~ s/QTrap/QTRAP/gm;
+
+    if ( $guest ) {
+     my $auth_path = get_auth_path();
+     clear_auth( $auth_path );
+     `touch $auth_path/$akey`;
+     close AUTH;
+
+#     $form =~ s/<SELECT NAME="pabst_build_id" >/<SELECT NAME="pabst_build_id" >\n<option class=bold_red_italic_text value=specialaccess><div class=bold_red_italic_text>Complete Human SRMAtlas<\/div><\/option>\n/gm;
+    }
+    $form =~ s/(NAME="pabst_build_id")/$1 ID="pabst_build_id"/gm;
+    $form =~ s/(NAME="source_instrument_type_id")/$1 ID="source_instrument_type_id"/gm;
+
+    my $id = 'ID="protein_name_constraint"';
+    $form =~ s/(NAME=\"protein_name_constraint\")/$1 $id/;
+
+    $parameters{rt_type} ||= 'SSRCalc';
+    my $rt_select = get_rt_select( $parameters{rt_type} );
+    my $ion_filters = get_ion_filters( %parameters );
+    my $mod_filters = get_mod_filters( %parameters );
+
+    # FINDME
+    my ( $sub_form ) = $best_peptide->get_change_form( form_only => 1, hide_buttons => 1, shade_defs => 1, set_params => \%parameters, noop => 0 );
+    $sub_form =~ s/tbl_visible/tbl_hidden/gm;
+
+   
+    my $peptide_chk = "<INPUT TYPE=checkbox NAME=peptides_only></INPUT>";
+    my $peptides_only_help = "<TD BGCOLOR=E0E0E0><IMG SRC='$HTML_BASE_DIR/images/greyqmark.gif' TITLE='Return peptide list only (no Q3 values)'</TD>";
+#    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Get Peptides Only:</B></TD>$peptides_only_help<TD>$peptide_chk</TD></TR> ~;
+#
+    my $namespace_filters = get_namespace_filters( %parameters );
+    if ( $namespace_filters ) {
+      $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Search Proteins From:</B></TD> $namespace_filters </TR> ~;
+    }
+
+	  my $multimap_filters = get_multimap_filters( %parameters );
+    if ( $multimap_filters ) {
+      $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Duplicate Peptides:</B></TD>$multimap_filters </TR> ~;
+    }
+
+
+#    $form =~ s/(\<INPUT TYPE="hidden" NAME="QUERY_NAME" VALUE="AT_GetPABSTList"\>)/$1<BR>$sub_form/gm;
+#    $form =~ s/\<\/TABLE\>/<TR><TD COLSPAN=3> $sub_form<\/TD><\/TR><\/TABLE>/i;
+#    $form .= "<TR><TD COLSPAN=3>$sub_form</TD></TR>\n";
+    my $change_help = mk_help_link( title => 'Pabst Parameters', text => 'Adjust PABST peptide parameters to refine peptide list (advanced)' );
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Adjust Weights:</B></TD>$change_help<TD>$link$sub_form $parameters{apply_action_hidden}</TD></TR> ~;
+
+
+    my $cmod_select = get_cmod_select( $parameters{cmod_mass} );
+    my $cmod_help = mk_help_link( title => 'Heavy Label', text => 'Fetch heavy-labeled (or light, if source data is heavy) versions of selected peptides. Use ctrl-shift for multiple options.' );
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Heavy Label:</B></TD>$cmod_help<TD>$cmod_select</TD></TR> ~;
+
+    my $cmod_radio = get_cmod_radio( $parameters{cmod_opts} );
+    my $cmod_help = mk_help_link( title => 'Heavy/Light Peptides', text => 'Calculate heavy transitions, light and heavy (L & H), or only light.  Only relevant if one or more heavy label options are selected.' );
+
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Labeled Transitions:</B></TD>$cmod_help<TD NOWRAP><DIV class=nowrap_clear_info_box>$cmod_radio &nbsp;</DIV></TD></TR> ~;
+
+    # Min/Max mz values
+    my $min_help = mk_help_link( title => 'Minimum m/z', text => 'Set minimum m/z threshold for transitions, applies to both precursor (Q1) and fragment ion (Q3) m/z' );
+    my $max_help = mk_help_link( title => 'Maximum m/z', text => 'Set maximum m/z threshold for transitions, applies to both precursor (Q1) and fragment ion (Q3) m/z' );
+    my $exclude_help = mk_help_link( title => 'Exclude Ions', text =>  'Semicolon-separated list of ions to exclude, generally the smallest, e.g. y2;y3;b2;b3' );
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Minimum m/z:</B></TD>$min_help<TD><INPUT TYPE=TEXT NAME=min_mz SIZE=10 VALUE=$parameters{min_mz}></INPUT></TD></TR> ~;
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Maximum m/z:</B></TD>$max_help<TD><INPUT TYPE=TEXT NAME=max_mz SIZE=10 VALUE=$parameters{max_mz}></INPUT></TD></TR> ~;
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Exclude Ions:</B></TD>$exclude_help<TD><INPUT TYPE=TEXT NAME=exclude_ions SIZE=10 VALUE=$parameters{exclude_ions}></INPUT></TD></TR> ~;
+#    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Allowable Modifications:</B></TD><TD BGCOLOR=E0E0E0></TD><TD>$select_lists->[1]</TD></TR> ~;
+#
+    
+    # Add SNP checkbox
+    my $snp_chk = ( $parameters{include_snps} ) ? 'checked' : 'unchecked';
+    my $snp_help = mk_help_link( title => 'Include SNPs', text =>  'Include SNPs for any selected peptides' );
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Include SNPs:</B></TD>$snp_help<TD><INPUT TYPE=CHECKBOX NAME=include_snps SIZE=10 $snp_chk></INPUT></TD></TR> ~;
+
+    # Add spectral links
+    my $splinks_chk = ( $parameters{speclinks} ) ? 'checked' : 'checked';
+    my $spec_help = mk_help_link( title => 'Spectra Link Display', text => 'Show links to various spectra in results' );
+    $form .= qq~ <TR><TD VALIGN=TOP NOBR><B>Show Spectral Links:</B></TD>$spec_help<TD><INPUT TYPE=CHECKBOX NAME=speclinks SIZE=10 $splinks_chk></INPUT></TD></TR> ~;
+    
+
+    my $rt_help =  "<TD BGCOLOR=E0E0E0><IMG SRC='$HTML_BASE_DIR/images/greyqmark.gif' TITLE='Select type of RT value to show in results'</TD>";
+
+    my $rt_help = mk_help_link( title => 'Elution Time', text => 'Select retention time values to show in results' );
+    $form .= qq~ <TR><TD VALIGN=TOP style="white-space:nowrap"><div id='gradient_doc'></div> </TD>$rt_help<TD>$rt_select </TD></TR> ~;
+    $form .= $ion_filters;
+    $form .= $mod_filters;
+
+  print $sbeams->addTabbedPane( label => 'Form' );
+  print "$form\n";
+    #### Display the form action buttons
+    $sbeams->display_form_buttons(TABLE_NAME=>$TABLE_NAME);
+    print $sbeams->closeTabbedPane( selected => 'Form' );
+
+
+} # end print_form
+
+sub clear_auth {
+  my $auth_dir = shift || return '';
+  my $clear = `find $auth_dir -mmin +5 -type f`;
+  for my $old_file ( split( /\n/, $clear ) ) {
+    unlink( $old_file );
+  }
+}
+
+sub mk_help_link {
+  my %args = @_;
+  my $title = $q->escape( $args{title} );
+  my $text = $q->escape( $args{text} );
+  return qq~<TD BGCOLOR=E0E0E0><span title='$args{text}' class=popup><IMG SRC='$HTML_BASE_DIR/images/greyqmark.gif' BORDER=0 ONCLICK="popitup('$CGI_BASE_DIR/help_popup.cgi?title=$title;text=$text;email_link=no');"></SPAN></TD>~;
+}
+
+sub get_auth_path {
+  my $srmauth_dir = $CONFIG_SETTING{SRMATLAS_AUTH} || 'SRMAuth';
+  my $authdir = $PHYSICAL_BASE_DIR . '/tmp/' . $srmauth_dir;
+  return $authdir;
+}
+
+sub get_src_weights {
+  my $params = shift;
+
+  my $sql = qq~
+  SELECT source_instrument_type_id
+  FROM $TBAT_PABST_SOURCE_PRIORITY
+  WHERE target_instrument_type_id = $params->{target_instrument}
+  ORDER BY priority ASC
+  ~;
+
+  my $sth = $sbeams->get_statement_handle( $sql );
+
+  my $cnt;
+  my $weight_clause = 'CASE ';
+
+  # Added source weighting to promote peptides with measurements 
+  # taken on a particular source machine.  
+  while ( my @row = $sth->fetchrow_array() ) {
+#    $weights{$row[0]} = $cnt++;
+     $cnt++;
+		 # Why not for is_predicted?
+     $weight_clause .= "WHEN PTI.source_instrument_type_id = $row[0] AND PTI.is_predicted = 'N' THEN synthesis_adjusted_score/$cnt\n";
+  }
+  $weight_clause .= "ELSE synthesis_adjusted_score END AS SRC_WEIGHT\n";
+  return $weight_clause;
+}
+
+sub get_rt_select {
+  my $rt_type = shift || '';
+  my $rt_select = "<SELECT NAME=rt_type ID=rt_type>\n";
+
+  my $sql = qq~
+  SELECT DISTINCT elution_time_type, elution_time_type_id 
+  FROM $TBAT_ELUTION_TIME_TYPE 
+  WHERE record_status != 'D' 
+  AND elution_time_type != 'SSRCalc'
+  ~;
+
+  my $sth = $sbeams->get_statement_handle( $sql );
+
+#  for my $type ( 'SSRCalc', 'RT_catalog Chipcube', 'RT_catalog QTrap5500' ) {
+  while ( my @row = $sth->fetchrow_array() ) {
+    my $type = $row[0];
+    my $id = $row[1];
+    my $selected = ( $rt_type eq $id ) ? 'selected' : '';
+    $rt_select .= "<OPTION VALUE='$id' $selected>$type</OPTION>\n";
+  }
+  $rt_select .= "</SELECT>\n";
+  return $rt_select;
+}
+
+
+sub get_mod_filters {
+  my %opts = @_;
+
+  my %mods = ( 'C[143]' => '',
+               'C[160]' => '',
+               'E[111]' => '',
+               'M[147]' => '',
+               'N[115]' => '',
+               'K[136]' => '',
+               'R[166]' => '',
+               'Q[111]' => '' );
+
+  # If we already ran a query, update values
+  my $mods_set = 0;
+  for my $mod ( sort( keys( %mods ) ) ) {
+    if ( $opts{$mod} ) {
+      $mods{$mod} = 'checked';
+      $mods_set++;
+    }
+  }
+  # Set default values
+  if ( !$mods_set ) {
+    for my $mod ( sort( keys( %mods ) ) ) {
+      next unless ( $mod eq 'C[160]' ||
+                    $mod eq 'K[136]' ||
+                    $mod eq 'N[115]' ||
+                    $mod eq 'R[166]' );
+      $mods{$mod} = 'checked';
+    }
+  }
+
+  my $mods_help = mk_help_link( title => 'Allowed Modifications', text => 'Checking options will allow peptides containing specified modification(s) in SRM transition list' );
+
+  my $checks = qq~
+    <DIV class=clear_info_box>
+    <TABLE><TR>
+    <TD>
+      <INPUT TYPE=checkbox NAME='C[160]' $mods{'C[160]'}> C[160] </INPUT>
+    </TD>
+    <TD>
+      <INPUT TYPE=checkbox NAME='K[136]' $mods{'K[136]'}> K[136] </INPUT>
+    </TD>
+    <TD>
+      <INPUT TYPE=checkbox NAME='R[166]' $mods{'R[166]'}> R[166] </INPUT>
+    </TD>
+    <TD>
+      <INPUT TYPE=checkbox NAME='N[115]' $mods{'N[115]'}> N[115] </INPUT>
+    </TD>
+
+    </TR><TR>
+    <TD>
+      <INPUT TYPE=checkbox NAME='M[147]' $mods{'M[147]'}> M[147] </INPUT>
+    </TD>
+    <TD>
+      <INPUT TYPE=checkbox NAME='C[143]' $mods{'C[143]'}> C[143] </INPUT>
+    </TD>
+    <TD>
+      <INPUT TYPE=checkbox NAME='Q[111]' $mods{'Q[111]'}> Q[111] </INPUT>
+    </TD>
+    <TD>
+      <INPUT TYPE=checkbox NAME='E[111]' $mods{'E[111]'}> E[111] </INPUT>
+    </TD>
+
+    </TR></TABLE>
+    </DIV>
+  ~;
+
+  my $filter_element = qq~
+  <TR><TD VALIGN=TOP NOBR><B>Allowed Peptide Modifications:</B></TD>$mods_help<TD>$checks</TD></TR> 
+  ~;
+  return $filter_element;
+}
+
+sub get_multimap_filters {
+  my %opts = @_;
+
+  my %names = ( all => '', results => '', global => '' );
+
+  # If we already ran a query, update values
+  my $multimap_set = 0;
+  for my $name ( sort( keys( %names ) ) ) {
+    if ( $opts{multimap} && $opts{multimap} eq $name ) {
+      $names{$name} = 'checked';
+      $multimap_set++;
+    }
+  }
+
+  $names{results} = 'checked' unless $multimap_set;
+
+
+  my $help = mk_help_link( title => 'Peptide Mapping Filter', text => 'Limit peptides that map to multiple proteins - Allow all does not limit the list, Unique in results ensures that a particular peptide is shown only once in a given set of results, and No multi-mapping keeps out any peptides that map to more than one peptide in the targeted namespace' );
+      
+  my $checks = "$help<TD><DIV class=nowrap_clear_info_box >";
+	my %name2param = ('Allow all' => 'all', 'Unique in results' => 'results', 'No multi-mapping' => 'global' );
+  for my $name ( 'Allow all', 'Unique in results', 'No multi-mapping' ) {
+    $checks .= "<INPUT TYPE=radio NAME=multimap value=$name2param{$name} $names{$name2param{$name}}> $name </INPUT>";
+  }
+  $checks .= "</DIV></TD>";
+  return $checks;
+}
+
+sub get_namespace_filters {
+  my %opts = @_;
+
+
+  # Only Mouse/Human currently have hybrid reference databases
+  return '' unless ( $opts{organism} );
+
+  my $help = mk_help_link( title => "Accession Namespace", text => "Select protein accession namespace(s) in which to search. Can help to limit redundancies." );
+
+  my $js = qq~
+    <script type=text/javascript>
+    function chk_namespace(species_cb) {
+      if ( species_cb.id == 'neXtProt' ) {
+        if ( species_cb.checked ) {
+          document.getElementById( 'IPI' ).checked = false;
+          document.getElementById( 'SwissProt' ).checked = false;
+          document.getElementById( 'Ensembl' ).checked = false;
+        } else {
+          document.getElementById( 'SwissProt' ).checked = true;
+        }
+      } else {
+        document.getElementById( 'neXtProt' ).checked = false;
+      }
+    }
+    </script>
+  ~;
+  my $checks = "$help $js <TD><DIV class=clear_info_box ID=NamespaceFilters>";
+
+  if ( $opts{organism} == 2 || $opts{organism} == 6 ) {
+
+    my %names = ( SwissProt => '', Ensembl => '', IPI => '' );
+
+    # If we already ran a query, update values
+    my $namespace_set = 0;
+    for my $name ( sort( keys( %names ) ) ) {
+      if ( $opts{$name} ) {
+        $names{$name} = 'checked';
+        $namespace_set++;
+      }
+    }
+    $names{SwissProt} = 'checked' unless $namespace_set;
+    for my $name ( qw( SwissProt Ensembl IPI ) ) {
+      $checks .= "<INPUT TYPE=checkbox NAME=$name $names{$name} id=$name onclick='chk_namespace(this)'> $name </INPUT>";
+    }
+    if ( $opts{organism} == 2 ) {
+      my $name = 'neXtProt';
+      $checks .= "<INPUT TYPE=checkbox NAME=$name id=$name onclick='chk_namespace(this)'> $name </INPUT>";
+    }
+
+  } elsif ( $opts{organism} == 3 ) {
+    $checks .= '<INPUT TYPE=checkbox NAME=SGD checked disabled> SGD </INPUT>';
+  } elsif ( $opts{organism} == 40 ) {
+    $checks .= '<INPUT TYPE=checkbox NAME=Tuberculist checked disabled> TubercuList </INPUT>';
+  } elsif ( $opts{organism} == 43 ) {
+    $checks .= '<INPUT TYPE=checkbox NAME=Dengue checked disabled> Dengue </INPUT>';
+  } else {
+    $checks .= '&nbsp;' x 4 . $sbeams->makeInactiveText( 'N/A' );
+  }
+
+  $checks .= "</DIV></TD>";
+  return $checks;
+}
+
+
+sub get_ion_filters {
+  my %opts = @_;
+
+  my $b_ions = 'checked';
+  my $y_ions = 'checked';
+  my $n_loss_ions = '';
+
+  # If we already ran a query, update values
+  if ( $opts{b_ions} || $opts{y_ions} || $opts{n_loss_ions} ) {
+    $b_ions = ( $opts{b_ions} ) ? 'checked' : '';
+    $y_ions = ( $opts{y_ions} ) ? 'checked' : '';
+    $n_loss_ions = ( $opts{n_loss_ions} ) ? 'checked' : '';
+  }
+
+  my $ions_help = mk_help_link( title => 'Ion Types', text => 'Checking options will allow that ion type in the SRM transition list' );
+  my $b_ions_chk = "<INPUT TYPE=checkbox NAME=b_ions $b_ions></INPUT>";
+  my $y_ions_chk = "<INPUT TYPE=checkbox NAME=y_ions $y_ions></INPUT>";
+  my $n_loss_chk = "<INPUT TYPE=checkbox NAME=n_loss_ions $n_loss_ions></INPUT>";
+  my $space = '&nbsp;' x 3;
+
+  my $checks = "<DIV class=clear_info_box>$y_ions_chk y ions $space $b_ions_chk b ions $space $n_loss_chk Neutral-loss ions</DIV>\n";
+
+  my $filter_element = qq~
+  <TR><TD VALIGN=TOP NOBR><B>Allowed Ion Types:</B></TD>$ions_help<TD>$checks</TD></TR> 
+  ~;
+#  <TR><TD VALIGN=TOP NOBR></TD><TD></TD><TD>b ions $b_ions_chk</TD></TR>
+#  <TR><TD VALIGN=TOP NOBR></TD><TD></TD><TD>Neutral-loss ions $n_loss_chk</TD></TR>
+  return $filter_element;
+}
+
+
+sub get_cmod_select {
+  my $curr_val = shift || '';
+
+  my %sel = ( K8 => '', R10 => '', K6 => '', R6 => '', K8A => '', R10A => '' );
+  my %seen;
+#  die $curr_val if $curr_val;
+  for my $curr ( split( ',', $curr_val ) ) {
+#    $curr =~ /(\w\d+\w*)/;
+#    next if $seen{$1}++;
+    $sel{$curr} = 'SELECTED';
+  }
+
+  my $cmod_sel = qq~
+    <SELECT SIZE=4 MULTIPLE NAME=cmod_mass>
+      <OPTION VALUE='' ></OPTION>
+      <OPTION VALUE=K8 $sel{K8}>Lysine + 8</OPTION>
+      <OPTION VALUE=R10 $sel{R10}>Arginine + 10</OPTION>
+      <OPTION VALUE=K6 $sel{K6}>Lysine + 6</OPTION>
+      <OPTION VALUE=R6 $sel{R6}>Arginine + 6</OPTION>
+    </SELECT>
+  ~;
+#      <OPTION VALUE=K8A $sel{K8A}>Aqua Lysine + 8</OPTION>
+#      <OPTION VALUE=R10A $sel{R10A}>Aqua Arginine + 10</OPTION>
+#  die $cmod_sel;
+  return $cmod_sel;
+}
+
+sub get_cmod_radio {
+  my $curr_val = shift || 'default';
+  my %sel = ( default => '', heavy_only => '', 'both' => '', 'light_only' => '' );
+  $sel{$curr_val} = 'checked';
+
+  my $cmod_radio = qq~
+  <INPUT TYPE=radio name=cmod_opts $sel{default} value=light> Default </INPUT>
+  <INPUT TYPE=radio name=cmod_opts $sel{light_only} value=light_only> Light only </INPUT>
+  <INPUT TYPE=radio name=cmod_opts $sel{both} value=both> L & H </INPUT>
+  <INPUT TYPE=radio name=cmod_opts $sel{heavy_only} value=heavy_only> Heavy only </INPUT>
+  ~;
+  return $cmod_radio;
+}
+
+sub get_download_form {
+  my $form = '<FORM NAME=DWNLD ID=DWNLD ACTION=GetResultSet.cgi/SRMAtlasAssays.tsv onSubmit="setMethodName()">';
+
+  my $select = qq~
+    <SCRIPT TYPE=text/javascript>
+    function setMethodName() {
+      var selval = document.getElementById('download').value;
+      var selreg = /SCIEX/;
+
+      if ( selreg.exec( selval ) ) {
+        var action = document.getElementById('DWNLD').action;
+        action = action.replace( '.tsv', '.csv' );
+        document.getElementById('DWNLD').action = action;
+      } else {
+        var action = document.getElementById('DWNLD').action;
+        action = action.replace( '.csv', '.tsv' );
+        document.getElementById('DWNLD').action = action;
+      }
+    }
+
+    </SCRIPT>
+    <SELECT NAME=download ID=download>
+      <OPTION VALUE='TSV_MRM' >TSV</OPTION>
+      <OPTION VALUE='TSV_SureQuant' >TSV-4digits</OPTION>
+      <OPTION VALUE='AgilentQQQ' >Agilent QQQ SRM</OPTION>
+      <OPTION VALUE='AgilentQQQ_dynamic' >Agilent QQQ dynamic SRM</OPTION>
+      <OPTION VALUE='ABSCIEX_QTRAP_SRM' >SCIEX QTRAP Scheduled SRM</OPTION>
+      <OPTION VALUE='ABSCIEX_QTRAP_SRMMSMS' >SCIEX QTRAP SRM</OPTION>
+      <OPTION VALUE='ThermoTSQ' >Thermo TSQ</OPTION>
+      <OPTION VALUE='Skyline' >Skyline TSV</OPTION>
+    </SELECT>
+    HIDDEN_PLACEHOLDER
+  ~;
+  my $nowrap_style = "<style> .nowrap { white-space: nowrap }; </style>";
+  my $calc_check_help = "<IMG SRC='$HTML_BASE_DIR/images/greyqmark.gif' TITLE='Add column with estimated RT for peptides without a RT Catalog value'/>";
+  my $ce_check_help = "<IMG SRC='$HTML_BASE_DIR/images/greyqmark.gif' TITLE='Add column with empirically determined best collision entergy for SRMs for which this was determined (Agilent only)'/>";
+
+  my $calc_check = '';
+  my $ce_check = '';
+  my $thtml = '';
+  my $tlink = '';
+
+#                                                    content => "<DIV style=clear_info_box><TABLE><TR><TD>$calc_check</TD></TR><TR><TD>$ce_check</TD></TR></TABLE></DIV>",
+	if ( ( !$guest || $super_guest ) && ( $pabst_build_id == 146 || $pabst_build_id == 160 ) ) {
+    $calc_check = "Include calculated RT $calc_check_help <INPUT TYPE=checkbox NAME=calc_rt></INPUT>";
+    $ce_check = "Include empirical optimized CE $ce_check_help <INPUT TYPE=checkbox NAME=empirical_ce></INPUT>";
+    $thtml = $sbeams->make_toggle_section( name => 'download_options',
+                                                    visible => 0,
+                                                    tooltip => 'Show/Hide advanced download options',
+                                                     sticky => 1,
+                                                    imglink => 1,
+                                                    content => "<DIV class=clear_info_box display: inline-block>$calc_check<BR>$ce_check</DIV>",
+                                                   textlink => 1,
+                                                   hidetext => 'Hide advanced download options',
+                                                   showtext => 'Show advanced download options',
+                                               );
+  }
+
+
+  my $button = "<INPUT TYPE=SUBMIT NAME=submit VALUE=Download>";
+  my $space = '&nbsp;' x 3;
+#  $form .= $nowrap_style . '<DIV style=nowrap>' . $ce_check . '&nbsp;' . $calc_check . $space . $select  . $button . '</DIV></FORM>';
+  $form .= $nowrap_style . '<DIV style=nowrap>' . $select . $button . "<BR> $thtml" . '</DIV></FORM>';
+  return $form;
+}
+
+sub get_multi_selects {
+  my $instr2code = $best_peptide->getInstrumentMap();
+  my $src_select = "<SELECT MULTIPLE SIZE=4 NAME=transition_source>\n";
+  for my $instr ( sort( keys( %{$instr2code} ) ) ) {
+    $src_select .= qq~<OPTION VALUE="$instr2code->{$instr}">$instr</OPTION>\n~;
+  }
+  $src_select .= "</SELECT>\n";
+
+# FIXME
+  my $sql = qq~
+  SELECT option_key,option_value FROM $TBAT_QUERY_OPTION 
+  WHERE option_type = 'GetTransitions_Modifications' 
+  AND record_status != 'D' 
+  ORDER BY sort_order,option_value;
+  ~;
+  my $sth = $sbeams->get_statement_handle( $sql );
+  my $mod_select = "<SELECT MULTIPLE SIZE=3 NAME=transition_mods>\n";
+  $mod_select .= "<OPTION VALUE='none' SELECTED>none</OPTION>\n";
+  while ( my @row = $sth->fetchrow_array() ) {
+    $mod_select .= "<OPTION VALUE=$row[0]>$row[1]</OPTION>\n";
+  }
+  $mod_select .= "</SELECT>\n";
+  return [$src_select, $mod_select];
+}
+
+sub fetch_transitions {
+  my %args = @_;
+
+  # Historical, don't ask.
+  my %parameters = %args;
+
+  my $restricted_proteins = $args{restricted_proteins} || '';
+  my $restricted_peptides = $args{restricted_peptides} || '';
+
+  my $content = '';
+
+  #$sbeams->printUserContext();
+
+  #### Define some generic variables
+  my ($i,$element,$key,$value,$line,$result,$sql);
+
+
+  $log->debug( "    Build constraints "  . time());
+  #### Define some variables for a query and resultset
+  my %resultset = ();
+  my $resultset_ref = \%resultset;
+  my (%url_cols,%hidden_cols,%max_widths,$show_sql);
+
+  #### Read in the standard form values
+  my $apply_action    = $parameters{'action'} || $parameters{'apply_action'};
+  my $TABLE_NAME = $parameters{'QUERY_NAME'};
+
+  #### If the apply action was to recall a previous resultset, do it
+
+
+  #########################################################################
+  #### Process all the constraints
+
+  my $clibs;
+
+  if ( $parameters{defaults} ) {
+    $parameters{b_ions}++;
+    $parameters{y_ions}++;
+    $parameters{'C[160]'}++;
+    $parameters{'M[147]'}++;
+  }
+  
+  if ( $args{speclinks} && $args{prefetch} ) {
+#    print "Getting libs<BR>\n";
+#    print time() . "\n";
+    $log->debug( "Prefetching consensus links " . time() );
+    $clibs = $consensus->getConsensusLinks( super_guest => $super_guest );
+    $log->debug( "Done " . time() );
+#    print "<BR>Done<BR>\n";
+#    print time() . "\n";
+  }
+  $sbeams->time_stmt( "Got Consensus links" );
+
+  # Try to limit size of returned resultset.
+  my %ok_param = ( overall => 0 );
+	{ # Check params block
+
+	  # Safe if protein_name is set and has no fully wildcarded terms
+	  if ( $parameters{protein_name_constraint} ) {
+	    if ( $parameters{protein_name_constraint} !~ /;%;|;%$|^%;|^%$/ ) {
+				$ok_param{protein_name_constraint}++;
+				$ok_param{overall}++;
+			}
+		}
+	  if ( $parameters{peptide_sequence_constraint} ) {
+	    if ( $parameters{peptide_sequence_constraint} !~ /^%$/ ) {
+				$ok_param{peptide_sequence_constraint}++;
+
+        if ( $parameters{peptide_sequence_constraint} !~ /\%/ ) {
+  				$ok_param{overall}++;
+        }
+			}
+		}
+	}
+
+  #### Build atlas_build_id constraint
+  my $atlas_build_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"PI.atlas_build_id",
+      constraint_type=>"int_list",
+      constraint_name=>"Atlas Build",
+      constraint_value=>$parameters{atlas_build_id} );
+  return if ($atlas_build_clause eq '-1');
+  ##  replace AND with WHERE
+  $atlas_build_clause =~ s/(.*)AND(.*)/$1WHERE$2/;
+
+  my $pabst_build_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"PP.pabst_build_id",
+      constraint_type=>"int_list",
+      constraint_name=>"PABST Build",
+      constraint_value=>$parameters{pabst_build_id} );
+  return if ($pabst_build_clause eq '-1');
+	$pabst_build_clause ||= "AND PP.pabst_build_id = $pabst_build_id";
+
+  #### Build consensus_library_id constraint
+  my $consensus_library_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"NL.consensus_library_id",
+      constraint_type=>"int_list",
+      constraint_name=>"Consensus Library",
+      constraint_value=>$parameters{consensus_library_id} );
+  return if ($consensus_library_clause eq '-1');
+
+  #### Build BEST_PROBABILITY constraint
+  my $best_probability_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"PI.best_probability",
+      constraint_type=>"flexible_float",
+      constraint_name=>"Best Probability",
+      constraint_value=>$parameters{best_probability_constraint} );
+  return if ($best_probability_clause eq '-1');
+
+  #### Build N_OBSERVATIONS constraint
+  my $n_observations_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"PI.n_observations",
+      constraint_type=>"flexible_int",
+      constraint_name=>"Number of Observations",
+      constraint_value=>$parameters{n_observations_constraint} );
+  return if ($n_observations_clause eq '-1');
+
+  #### Build N_SAMPLES constraint
+  my $n_samples_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"PI.n_samples",
+      constraint_type=>"flexible_int",
+      constraint_name=>"Number of Samples",
+      constraint_value=>$parameters{n_samples_constraint} );
+  return if ($n_samples_clause eq '-1');
+
+
+    #### Build EMPIRICAL_PROTEOTYPIC_SCORE constraint
+    my $empirical_proteotypic_clause = $sbeams->parseConstraint2SQL(
+        constraint_column=>"PI.empirical_proteotypic_score",
+        constraint_type=>"flexible_float",
+        constraint_name=>"Empirical Proteotypic Score",
+        constraint_value=>$parameters{empirical_proteotypic_constraint} );
+  return if ($empirical_proteotypic_clause eq '-1');
+
+
+    #### Build n_protein_mappings constraint
+    my $n_protein_mappings_clause = $sbeams->parseConstraint2SQL(
+        constraint_column=>"PI.n_protein_mappings",
+        constraint_type=>"flexible_int",
+        constraint_name=>"n_protein_mappings",
+        constraint_value=>$parameters{n_protein_mappings_constraint} );
+  return if ($n_protein_mappings_clause eq '-1');
+
+    #### Build n_genome_locations constraint
+    my $n_genome_locations_clause = $sbeams->parseConstraint2SQL(
+        constraint_column=>"PI.n_genome_locations",
+        constraint_type=>"flexible_int",
+        constraint_name=>"n_genome_locations",
+        constraint_value=>$parameters{n_genome_locations_constraint} );
+  return if ($n_genome_locations_clause eq '-1');
+
+    #### Build peptide_length constraint
+    my $peptide_length_clause = $sbeams->parseConstraint2SQL(
+        constraint_column=>"peptide_length",
+        constraint_type=>"flexible_int",
+        constraint_name=>"peptide_length",
+        constraint_value=>$parameters{peptide_length} );
+  return if ($peptide_length_clause eq '-1');
+  $peptide_length_clause =~ s/peptide_length/LEN\(peptide_sequence\)/;
+
+    #### Build transition_source constraint
+    my $transition_source_clause = $sbeams->parseConstraint2SQL(
+        constraint_column=>"PTI.source_instrument_type_id",
+        constraint_type=>"text_list",
+        constraint_name=>"source_instrument_type_id",
+        constraint_value=>$parameters{source_instrument_type_id} );
+  return if ($transition_source_clause eq '-1');
+
+  if ( $parameters{omit_predicted} ) {
+    if ( $transition_source_clause ) {
+      # AND PTI.source_instrument_type_id IN ( '1','6','7' )
+      $transition_source_clause =~ s/\'7\'//g;
+    } else {
+#      $transition_source_clause = "AND PTI.source_instrument_type_id NOT IN ( '7' )";
+#		  $transition_source_clause .= "\nAND PTI.is_predicted = 'N'";
+    }
+  }
+
+  # FIXME, we should handle this more robustly
+	if ( $transition_source_clause && $transition_source_clause !~ /7/  ) {
+		$transition_source_clause .= "\nAND PII.n_observations > 0";
+	}
+
+  my $target_instrument_clause = "AND PSP.target_instrument_type_id = $parameters{target_instrument}";
+
+  # provisional, try to handle newline delimited lists.
+  $parameters{protein_name_constraint} =~ s/\r\n/;/g;
+  $parameters{protein_name_constraint} =~ s/\n/;/g;
+  $parameters{protein_name_constraint} =~ s/\s+/;/g;
+
+
+  #### Build PEPTIDE_SEQUENCE constraint
+  my $peptide_sequence_clause = $sbeams->parseConstraint2SQL(
+      constraint_column=>"PP.peptide_sequence",
+      constraint_type=>"plain_text",
+      constraint_name=>"Peptide Sequence",
+      constraint_value=>$parameters{peptide_sequence_constraint} );
+  return if ($peptide_sequence_clause eq '-1');
+
+  # peptide_sequence field supercedes (obviates) file upload
+  if ( $parameters{peptide_file} && !$peptide_sequence_clause ) {
+
+    ## upload the file to a file handler
+    my $pepfile = $q->upload('peptide_file');
+
+    if (!$pepfile && $q->cgi_error && $is_html) {
+      print $q->header(-status=>$q->cgi_error);
+			exit;
+    }
+
+    my $max_peptide_cnt = 5000;
+    my %peptide_hash;
+    if ( (-T $pepfile) && (-s $pepfile < 1000000) ) {
+      my $pep;
+      while ($pep = <$pepfile>) {
+        chomp($pep);
+        $pep =~ s/\s//g;
+        next unless ( $pep =~ /^[A-Z]+$/ );
+        $peptide_hash{$pep}++;
+        # size constraint of 1 MB, restrict $count < $max_peptidnt
+        last if ( scalar(keys(%peptide_hash)) >= $max_peptide_cnt );
+      }
+
+      # secondary param check block
+  		# Make sure this isn't a null constraint if we are counting on it
+	    if ( scalar(keys(%peptide_hash)) ) {
+	      $ok_param{protein_file_constraint}++;
+	      $ok_param{overall}++;
+		  }
+    }
+
+    ## join with a commas:
+    my $peptide_list = "'" . join( "','", keys( %peptide_hash)) . "'";
+
+    $peptide_sequence_clause = "     AND PP.peptide_sequence IN ( $peptide_list )" if $peptide_list;
+  }
+
+
+  #### Build PROTEIN_NAME constraint
+  my $biosequence_name_clause = $sbeams->parseConstraint2SQL(
+        constraint_column=>"BS.biosequence_name",
+        constraint_type=>"plain_text",
+        constraint_name=>"Protein Name",
+        constraint_value=>$parameters{protein_name_constraint} );
+   return if ($biosequence_name_clause eq '-1');
+
+  if ( $parameters{neXtProt} ) {
+    $biosequence_name_clause =~ s/NX_//g;
+  }
+
+  my %protein_hash;
+
+  # protein name field supercedes (obviates) file upload
+  if ( $parameters{protein_file} && !$biosequence_name_clause ) {
+
+    ## upload the file to a file handler
+    my $prfile = $q->upload('protein_file');
+
+    if (!$prfile && $q->cgi_error && $is_html) {
+      print $q->header(-status=>$q->cgi_error);
+			exit;
+    }
+
+    my $max_cnt = 1000;
+    # size constraint of 1 MB, restrict $count < $max_cnt
+    if ( (-T $prfile) && (-s $prfile < 1000000) ) {
+      my $count = 0;
+      my $read_file=0;
+      ## protein list
+      my $prt;
+      while ($prt=<$prfile>) {
+        chomp($prt);
+        $prt =~ s/\s+$//;
+        if ($prt) {
+          $protein_hash{$prt}++;
+          $count = $count + 1;
+        }
+        last if ($count >= $max_cnt );
+      }
+      # secondary param check block
+  		# Make sure this isn't a null constraint if we are counting on it
+	    if ( $count ) {
+	      $ok_param{protein_file_constraint}++;
+	      $ok_param{overall}++;
+		  }
+    }
+
+    ## join with a commas:
+    my $protein_list = "'" . join( "','", keys( %protein_hash)) . "'";
+
+    $biosequence_name_clause = "     AND BS.biosequence_name IN ( $protein_list )" if $protein_list;
+  }
+
+  unless ( $ok_param{overall} ) {
+
+		print <<"    END";
+		<H4><BR>
+		Due to the size of the source dataset, you must provide either a protein list
+    <BR> (via protein_name form field or uploaded file) or
+		a peptide sequence constraint. <BR> A full wildcard search does not constitute a valid constraint. 
+		<BR>
+    </H4>
+    END
+
+    return;
+  }
+
+
+  # New filter, remove peptide ions with various mass mods.
+  my $modifications_constraint = '';
+  for my $mod ( 'C[143]', 'C[160]', 'E[111]', 'M[147]', 'N[115]', 'Q[111]', 'K[136]', 'R[166]' ) {
+    if ( !$parameters{$mod} ) {
+      my $stripped_mod = join( '', $mod =~ /\w\[(\d+)\]/ );
+      $modifications_constraint .= " AND PI.modified_peptide_sequence NOT LIKE '%" . $stripped_mod . "%'\n";
+    }
+  }
+
+
+  ## n_fragment_ions defaults to 4
+  my $n_fragment_ions = 4;
+  if ($parameters{'n_highest_intensity_fragment_ions'} =~ /^(\d+)$/) {
+    $n_fragment_ions = $1;
+  }
+  if ( $parameters{peptides_only} ) {
+    $n_fragment_ions = 1;
+  }
+
+  ## n_peptides_per_protein defaults to 5 
+  my $n_peps_per_prot = 5;
+  if ($parameters{'n_peptides_per_protein'} =~ /^([\d]+)$/) {
+    $n_peps_per_prot = $1;
+  }
+
+
+  my @column_array;
+
+  my $peptide_sql;
+  my %prot_peps;
+  my %pep_frags;
+  my %ce;
+#  my @display_rows = ( [qw( Protein Sequence Chg Q1_mz Q3_mz Intensity Ion CE SSRCalc RT n_obs Annot Source ) ] );
+
+  my %row2chg;
+
+
+  my $is_changed = 0;
+  my $default_params = $best_peptide->get_default_pabst_scoring();
+
+  for my $pparam ( keys ( %{$default_params} ) ) {
+    if ( defined $parameters{$pparam} ) {
+      if ( $parameters{$pparam} ne $default_params->{$pparam} ) {
+        $log->info( "$pparam is different, $parameters{$pparam} ne $default_params->{$pparam} " );
+        $is_changed++;
+      }
+    }
+  }
+  if ( $is_changed ) {
+    $best_peptide->set_pabst_penalty_values( %parameters );
+  }
+  $log->debug( "    done building constraints"  . time());
+
+  # Filter-based biosequence name clause
+  my $namespace_clause = '';
+  my $limit_ns = 0;
+  if ( $parameters{neXtProt} ) {
+    $parameters{SwissProt}++;
+  }
+  for my $ns ( qw ( SwissProt IPI Ensembl ) ) {
+    $limit_ns++ if $parameters{$ns};
+  }
+
+
+  if ( $limit_ns ) {
+    if ( !$parameters{SwissProt} ) {
+      $namespace_clause .= " AND biosequence_name NOT LIKE '______' \n"; 
+      $namespace_clause .= " AND biosequence_name NOT LIKE '______-_' \n"; 
+    }
+    if ( !$parameters{IPI} ) {
+      $namespace_clause .= " AND biosequence_name NOT LIKE 'IPI%' \n"; 
+    }
+    if ( !$parameters{Ensembl} ) {
+      $namespace_clause .= " AND biosequence_name NOT LIKE 'ENS%' \n"; 
+    }
+  }
+
+  # Added 2012-02 
+  my $peptide_sql = qq~
+  SELECT DISTINCT biosequence_name, BS.biosequence_id, PP.pabst_peptide_id, PP.peptide_sequence, biosequence_gene_name
+  FROM $TBAT_PABST_PEPTIDE PP 
+  JOIN $TBAT_PABST_PEPTIDE_MAPPING PM 
+    ON PM.pabst_peptide_id = PP.pabst_peptide_id
+  JOIN $TBAT_BIOSEQUENCE BS
+    ON BS.biosequence_id = PM.biosequence_id    
+  WHERE 1 = 1 
+  $pabst_build_clause
+  $peptide_sequence_clause
+  $best_probability_clause
+  $peptide_length_clause
+  $restricted_proteins
+  $restricted_peptides
+  $biosequence_name_clause
+  $namespace_clause
+  ~;
+
+  $sbeams->time_stmt( "Protein/peptide SQL" );
+  my $sth = $sbeams->get_statement_handle( $peptide_sql );
+  $sbeams->time_stmt( "done" );
+  my %acc2gene;
+  my %id2seq;
+  my %seq2id;
+  my %bioseq_ids;
+  my %bioseq2name;
+  my %bioseq2peptides;
+  my %pep2bioseq;
+
+  # We will limit the total number of proteins queried to 50 for 'superuser' 
+  my $max_query_proteins = 100;
+
+  my $rcount = 0;
+
+  while ( my @row = $sth->fetchrow_array() ) {
+    $rcount++;
+    if ( $super_guest && keys( %bioseq2name ) >= $max_query_proteins ) {
+      next unless $bioseq2name{$row[1]};
+    }
+
+    $acc2gene{$row[0]} ||= $row[4];
+    $id2seq{$row[2]} ||= $row[3];
+    $seq2id{$row[3]} = $row[2];
+    $bioseq_ids{$row[1]}++;
+    $bioseq2name{$row[1]} = $row[0];
+    $bioseq2peptides{$row[1]} ||= {};
+    $bioseq2peptides{$row[1]} ||= {$row[2]};
+  }
+
+  my %mature;
+  my $sql = qq~
+    SELECT sequence, biosequence_accession
+    FROM $TBAT_MATURE_FORM_PEPTIDES
+  ~;
+  my $sth = $sbeams->get_statement_handle( $sql );
+  while ( my @row = $sth->fetchrow_array() ) {
+    $mature{$row[0]} = $row[1];
+  }
+
+  my %snps;
+  my %has_snp;
+  if ( $parameters{include_snps} && scalar(keys(%seq2id)) ) {
+
+    my $seq_clause = "'" . join( "','", keys( %seq2id ) ) . "'";
+    my $sql = qq~
+    SELECT DISTINCT snp_sequence, matching_sequence, P.pabst_peptide_id,
+           dbsnp_acc, snp_pos, PM.biosequence_id
+    FROM $TBAT_SRMSNPS S
+    JOIN $TBAT_PABST_PEPTIDE P
+    ON P.peptide_sequence = S.snp_sequence
+    JOIN $TBAT_PABST_PEPTIDE_MAPPING PM
+    ON P.pabst_peptide_id = PM.pabst_peptide_id
+    WHERE S.matching_sequence IN ( $seq_clause )
+    ~;
+    my $sth = $sbeams->get_statement_handle( $sql );
+    my $snpacc = 'A';
+    while ( my @row = $sth->fetchrow_array() ) {
+      $has_snp{$row[1]} = { match => $row[0], snpacc => $snpacc };
+      $snps{$row[0]} = { match => $row[1], trans => [], snpacc => $snpacc,
+                         dbsnp => $row[3], snppos => $row[4] };
+      $id2seq{$row[2]} = $row[0];
+      $seq2id{$row[0]} = $row[2];
+      $bioseq2peptides{$row[3]}->{$row[2]}++;
+      $snpacc++;
+    }
+  }
+
+  fill_in_genes( \%acc2gene );
+  $sbeams->time_stmt( "Filled in genes" );
+  my $acc2symbol = get_gene_symbols( [keys( %acc2gene )] );
+  $sbeams->time_stmt( "got symbols" );
+
+  my $pep_id_string = join( ',', keys( %id2seq ) ) || 1;
+  my $pep_seq_string = "'" . join( "','", keys( %seq2id ) ) . "'" || '';
+  my $bioseq_id_string = join( ',', keys( %bioseq_ids ) ) || 1;
+
+#  if ( $isAuthorized ) {
+#    $SRMAuth;
+#    my $SRMAuthEmail = $q->cookie( 'SRMAuthEmail' );
+#    my $time = time();
+#    my $bioseq_str = join( ':', keys( %acc2gene ) );
+#    $log->info( "Allowed provisional access: $SRMAuth, $SRMAuthEmail, $ENV{REMOTE_HOST}, $bioseq_str" );
+#  }
+
+  my $nprots = scalar( keys( %bioseq_ids ) );
+  my $npeps = scalar( keys( %id2seq ) );
+
+  my $status_txt = "Running query with $nprots proteins and $npeps peptides ";
+
+  if ( $nprots > 7 && $nprots < 16 ) {
+    $status_txt = "Querying with $nprots proteins and $npeps peptides, could take up to a minute ";
+  } elsif ( $nprots > 20 ) { 
+    $status_txt = "Querying with $nprots proteins and $npeps peptides, could take over a minute ";
+  }
+  my $t0 = time();
+  print qq~
+  <script type="text/javascript">
+  var info_txt=document.getElementById("query_info");
+  info_txt.innerHTML=" ";
+  info_txt.innerHTML="<BR><DIV class=clear_warning_box><IMG SRC=$HTML_BASE_DIR/images/wait_sm.gif>&nbsp;$status_txt</DIV>";
+  </script>
+  ~ if $is_html;
+  
+  my $organism = $parameters{organism} || $best_peptide->getBuildOrganism( pabst_build_id => $parameters{pabst_build_id} );
+  my $scan_clause = $pep_id_string;
+
+  my $pepion2scanpath = {};
+  my $seq2badlinks = {};
+  if ( $args{speclinks} ) {
+     $log->debug( "get_scan_path " . time() );
+     $pepion2scanpath = get_scan_path( scan_clause => $scan_clause);
+     $log->debug( "done " . time() );
+  }
+
+  my $build_resources = $atlas->fetchBuildResources( pabst_build_id => $parameters{pabst_build_id} );
+  $sbeams->time_stmt( "got resources" );
+
+  #########################################################################
+  #### If QUERY or VIEWRESULTSET was selected, display the data
+  if ($apply_action =~ /QUERY/i ) {
+    my $ed = "<td>&nbsp;</td>";
+
+#    my $note = $sbeams->makeInfoText( "Note: masses are mono-isotopic" );
+#    $content .= "<BR>$note\n"  if $is_html;
+
+  my $ssr_field = 'SSRCalc_relative_hydrophobicity';
+  my $ssr_clause = '';
+  my $ssr_join = '';
+  $parameters{rt_type} ||= '4';
+
+  my $irt = 0;
+  if ( $parameters{rt_type} || $parameters{rt_type} ne 'SSRCalc' ) {
+    my $et_and = '';
+    if ( $build_resources->{elution_time_set} ) {
+      $irt = isIRT( $build_resources ); 
+      $et_and = " AND elution_time_set IN ( " . join( ',', keys( %{$build_resources->{elution_time_set}} ) ) . " ) ";
+    }
+    $ssr_field = 'elution_time';
+    $ssr_join = qq~
+     LEFT JOIN $TBAT_ELUTION_TIME ET ON ( ET.modified_peptide_sequence = PI.modified_peptide_sequence AND elution_time_type_id = '$parameters{rt_type}' $et_and )
+    ~;
+  }
+
+  my $peptide_mappings = {};
+#  if ( $parameters{SwissProt} && $organism == '2' ) {
+    $peptide_mappings = get_peptide_mappings( $pep_seq_string, $organism );
+#  }
+  my $has_mappings = ( scalar( keys( %{$peptide_mappings} ) ) ) ? 1 : 0;
+
+  my $quant_info;
+  my $has_quant;
+  unless ( $guest ) {
+	  $quant_info = get_quant_info( $pep_seq_string );
+    $has_quant = ( scalar( keys( %{$quant_info} ) ) ) ? 1 : 0;
+  }
+
+  my $has_snps = scalar( keys( %snps) );
+  $has_snps = 0 if !scalar(keys(%has_snp));
+  my $snp_clause = ( $has_snps ) ? "" : "AND is_snp <> 'Y'";
+
+  my $limit_clause = $sbeams->buildLimitClause( row_limit => 100000 );
+  my $weight_clause = get_src_weights( \%parameters );
+  my $lib_sql = qq~
+    SELECT DISTINCT preceding_residue, PI.modified_peptide_sequence, 
+    following_residue, synthesis_adjusted_score, instrument_type_name,
+    precursor_ion_mz, precursor_ion_charge, fragment_ion_mz,
+    fragment_ion_charge, fragment_ion_label, ion_rank, relative_intensity,
+    SSRCalc_relative_hydrophobicity, $ssr_field, biosequence_id,
+    merged_score, PII.n_observations, source_build, PSP.priority,
+    PTI.is_predicted, $weight_clause, PII.max_precursor_intensity,
+    is_snp, PP.pabst_peptide_id, PP.peptide_sequence
+    FROM $TBAT_PABST_PEPTIDE PP 
+    JOIN $TBAT_PABST_PEPTIDE_ION PI 
+    ON PP.pabst_peptide_id = PI.pabst_peptide_id
+    JOIN $TBAT_PABST_PEPTIDE_ION_INSTANCE PII 
+    ON PI.pabst_peptide_ion_id = PII.pabst_peptide_ion_id
+    JOIN $TBAT_PABST_TRANSITION PT 
+    ON PT.pabst_peptide_ion_id = PI.pabst_peptide_ion_id 
+    JOIN $TBAT_PABST_TRANSITION_INSTANCE PTI 
+    ON PT.pabst_transition_id = PTI.pabst_transition_id 
+    JOIN $TBAT_INSTRUMENT_TYPE IT 
+    ON ( IT.instrument_type_id = PTI.source_instrument_type_id  AND
+         IT.instrument_type_id = PII.source_instrument_type_id ) 
+    JOIN $TBAT_PABST_SOURCE_PRIORITY PSP 
+    ON ( PSP.source_instrument_type_id = PTI.source_instrument_type_id )
+
+    JOIN $TBAT_PABST_PEPTIDE_MAPPING PM
+    ON PM.pabst_peptide_id = PP.pabst_peptide_id
+
+    $ssr_join
+    WHERE PP.pabst_peptide_id IN ( $pep_id_string ) 
+    AND PM.biosequence_id IN ( $bioseq_id_string ) 
+      $pabst_build_clause
+      $atlas_build_clause
+      $transition_source_clause
+      $target_instrument_clause
+      $ssr_clause
+      $modifications_constraint
+      $snp_clause
+    ORDER BY 
+    is_snp DESC,
+    biosequence_id,
+    PTI.is_predicted ASC,
+    SRC_WEIGHT DESC,
+    synthesis_adjusted_score DESC,
+    PI.modified_peptide_sequence,
+    PSP.priority ASC,
+    PII.max_precursor_intensity DESC,
+    PII.n_observations DESC,
+    relative_intensity DESC,
+    ion_rank ASC
+    ~;
+
+#   die Dumper( %CONFIG_SETTINGS )
+#   print "<PRE>$lib_sql</PRE>\n";  
+#  $log->info( $lib_sql );
+#  print "<PRE>$lib_sql</PRE>\n";
+
+  my ( $ssr_type ) = $sbeams->selectOneColumn( "SELECT elution_time_type_id FROM $TBAT_ELUTION_TIME_TYPE WHERE elution_time_type = 'SSRCalc'" );
+  $parameters{rt_type} ||= $ssr_type;
+
+  my @headings = ( 'Protein', 'External Links', 'Pre AA', 'Sequence', 'Fol AA', 'Adj SS', 'Source', 'Q1_mz', 'Q1_chg', 'Q3_mz', 'Q3_chg', 'Ion', 'Rank', 'RI', 'SSRT'  );
+
+
+  # Code to get only pertinent headings here...
+  if ( $parameters{rt_type} ) {
+    my $rt_heading = ( $irt ) ? 'iRT' : 'RT_Cat';
+    if ( $rt_heading eq 'RT_Cat' ) {
+      push @headings, $rt_heading unless $parameters{rt_type} == $ssr_type;
+    } elsif ( $rt_heading eq 'iRT' ) {
+      push @headings, $rt_heading unless $parameters{rt_type} == $ssr_type;
+    }
+  }
+
+  if ( $has_mappings ) {
+    push @headings, 'N_map';
+  }
+  if ( $has_snps ) {
+    push @headings, 'SNP';
+  }
+  if ( $has_quant ) {
+    push @headings, 'Quant';
+  }
+
+
+  my $consensus_srcs = $consensus->getConsensusSources( pabst_build_id => $pabst_build_id );
+  my $has_ce = $consensus->hasCESet( pabst_build_id => $pabst_build_id );
+  my $has_chromats = $consensus->hasChromatograms( pabst_build_id => $pabst_build_id );
+	
+  if ( $parameters{speclinks} ) {
+    if ( 0 && $guest && !$super_guest ) {
+      push @headings, 'IonTrap';
+    } else {
+      if ( $consensus_srcs->{QTOF} ) {
+        push @headings, 'QTOF';
+        push @headings, 'QTOF_CE' if $has_ce;
+      }
+      for my $instr ( 'QTrap4000', 'QTrap5500', 'QQQ', 'IonTrap' ) {
+        push @headings, $instr if $consensus_srcs->{$instr};
+      }
+    }
+  }
+
+  if ( $has_chromats || $has_ce ) {
+    push @headings, 'QQQ ', ' QTRAP ';
+  }
+
+  #  peptides_only
+  if ( $parameters{peptides_only} ) {
+    splice( @headings, 5, 8 );
+  }
+
+  my $num_headings = scalar( @headings );
+
+  my $headings = $atlas->get_column_defs( labels => \@headings, plain_hash => 1 );
+
+  my $headings_ref = ( $sbeams->output_mode() =~ /html/i ) ? 
+           $best_peptide->make_sort_headings( headings => $headings, default => 'adj_SS' ) :
+           \@headings;
+
+  my @peptides = ( $headings_ref );
+
+  my $naa = $sbeams->makeInactiveText( 'n/a' );
+
+  my $instr2code = $best_peptide->getInstrumentMap();
+  my %src_name;
+  for my $src ( keys( %{$instr2code} ) ) {
+    my $code = $instr2code->{$src};
+    if ( $src =~ /PATR/ ) {
+      $src_name{$code} = $src . '-validated';
+    } elsif ( $src =~ /Predicted/ ) {
+      $src_name{$code} = $src;
+    } else {
+      $src_name{$code} = $src . '-observed';
+    }
+  }
+  my $start = time;
+  $sbeams->time_stmt( "Lib SQL" );
+  my $sth = $sbeams->get_statement_handle( $lib_sql );
+  $sbeams->time_stmt( "Done" );
+  my $end = time;
+	my $delta = $end - $start;
+
+  my %prots;
+
+  my @namelist = ( join( '::', qw(protein  sequence Q1_mz Q3_mz RT rank Q1_chg Q3_chg peak_intensity ion_label collision SSR) ) );
+
+  # placeholder, we don't have a source for retention time.
+  my $rt = '';
+  my %peps;
+  my %patr_peps;
+
+  my %counts;
+
+  my @transitions;
+  my $tcnt = 1;
+
+  my $id2name = $sbeams->get_organism_hash( key => 'organism_id' );
+
+# 0 preceding_residue
+# 1 PI.modified_peptide_sequence
+# 2 following_residue
+# 3 synthesis_adjusted_score
+# 4 instrument_type_name
+# 5 precursor_ion_mz
+# 6 precursor_ion_charge
+# 7 fragment_ion_mz
+# 8 fragment_ion_charge,
+# 9 fragment_ion_label
+# 10 ion_rank
+# 11 relative_intensity
+# 12 SSRCalc_relative_hydrophobicity
+# 13 $ssr_field
+# 14 biosequence_id
+# 15 merged_score
+# 16 PII.n_observations
+# 17 source_build
+# 18 PSP.priority
+# 19 PTI.is_predicted,
+# 20 $weight_clause
+# 21 PII.max_precursor_intensity
+# 22 is_snp
+# 23 P.pabst_peptide_id
+# 24 P.peptide_sequence
+
+  my $previous;
+  my $previous_snp;
+  my $previous_score;
+  while( my @row = $sth->fetchrow_array() ) {
+    push @row, $tcnt++;
+    $row[14] = $bioseq2name{$row[14]};
+    if ( $row[22] && $row[22] eq 'Y' ) {
+#      print "pushing SNP $row[1]<br>\n";
+      push @{$snps{$row[24]}->{trans}}, \@row;
+    } else {
+      $previous ||= $row[24];
+      my $print = ( $previous eq $row[24] ) ? 0 : 0;
+      print "not a SNP\n" if $print;
+      $previous_score ||= $row[3];
+      my $ref = ref( $has_snp{$previous} );
+      print "has_snps is $has_snps, previous is $previous, row 24 is $row[24], HSP is $has_snp{$previous} ref is $ref<br>\n" if $print;
+      if ( $has_snps && $ref && $previous ne $row[24] ) {
+        for my $row ( @{$snps{$has_snp{$previous}->{match}}->{trans}} ) {
+          $row->[3] = $previous_score;
+          push @transitions, $row;
+        }
+      }
+      push @transitions, \@row;
+      print "pushing regular $row[1]<br>\n" if $print;
+      $previous = $row[24];
+      $previous_score = $row[3];
+    }
+  }
+  if ( $has_snps && $has_snp{$previous} ) {
+    my $snpseq = $has_snp{$previous}->{match};
+    for my $row ( @{$snps{$snpseq}->{trans}} ) {
+      $row->[3] = $previous_score;
+      push @transitions, $row;
+    }
+  }
+  $sbeams->time_stmt( "Initial row cache" );
+
+  # If the user has modified any of the weights we have to do this from scratch...
+  if ( $is_changed  ) {
+    update_status( "PABST parameters have changed, rescoring peptides..." );
+    $best_peptide->set_pabst_penalty_values( %parameters );
+#    print Dumper( @transitions );
+#    my $param = $best_peptide->get_pabst_penalty_values();
+    # Do pabst eval on peptide list here.  Use these to modify src-weighted values
+    my $evaluated = $best_peptide->pabst_evaluate_peptides( peptides => \@transitions,
+                                                   previous_idx => 0, 
+                                                        seq_idx => 1, 
+                                                     follow_idx => 2, 
+                                                      score_idx => 20,
+                                                  hydrophob_idx => 12,
+                                                      trim_mods => 1 );
+
+    @transitions = sort { $b->[14] cmp $a->[14] ||
+                          $a->[19] cmp $b->[19] ||  
+                          $b->[25] <=> $a->[25] ||  
+                          $a->[1] cmp $b->[1] ||  
+                          $a->[22] <=> $b->[22] } @{$evaluated};
+
+
+#    print Dumper( $rows );
+#    die;
+
+# 0 preceding_residue,
+# 1 PI.modified_peptide_sequence,
+# 2 following_residue,
+# 3 synthesis_adjusted_score,
+# 4 instrument_type_name,
+# 5 precursor_ion_mz,
+# 6 precursor_ion_charge,
+# 7 fragment_ion_mz,
+# 8 fragment_ion_charge,
+# 9 fragment_ion_label,
+# 10 ion_rank,
+# 11 relative_intensity,
+# 12 SSRCalc_relative_hydrophobicity,
+# 13 $ssr_field,
+# 14 biosequence_id,
+# 15 merged_score,
+# 16 PII.n_observations,
+# 17 source_build,
+# 18 PSP.priority,
+# 19 PTI.is_predicted,
+# 20 $weight_clause,
+# 21 PII.max_precursor_intensity
+# 22 tcnt
+# 23 annot
+# 24 score
+# 25 adj_score
+
+#    die Dumper( $rows );
+
+  } else {
+    @transitions = sort { $b->[14] cmp $a->[14] ||
+                          $a->[19] cmp $b->[19] ||  
+                          $b->[20] <=> $a->[20] ||  
+                          $a->[1] cmp $b->[1] ||  
+                          $a->[22] <=> $b->[22] } @transitions;
+
+  }
+
+
+  # If no params were changed, use static values
+  $log->debug( "Iterating over results " . time() );
+  print STDERR "iterating " . time()  . "\n";
+  update_status( "Selecting optimum transitions" );
+
+  my %frag_seen;
+  my %pepion_used;
+  my %peptide_used;
+	my %skipped_multimap;
+
+  my $row_cnt = 0;
+  my %links;
+#  my %kseen;
+
+  $parameters{multimap} ||= 'results';
+
+  my %ex;
+  if ( $parameters{exclude_ions} ) {
+    for my $ion ( split( /;/, $parameters{exclude_ions} ) ) {
+      $ex{lc($ion)}++;
+    }
+  }
+
+
+  my %cc;
+  my $pfrag;
+  my %snpacc2key = ( keybase => 'A' );
+  for my $row ( @transitions ) {
+    if ( $is_changed ) {
+      $row->[20] = $row->[25];
+      $row->[3] *= $row->[24];
+    }
+#    my $key = join( '__', $row->[14], $row->[1], $row->[19], sprintf( "%0.3f", $row->[20]) );
+#    print "$key  <BR>\n" unless $kseen{$key};
+#    $kseen{$key}++;
+
+    my @row = @{$row};
+
+# 1 PI.modified_peptide_sequence,
+# 2 following_residue,
+# 3 synthesis_adjusted_score,
+# 4 instrument_type_name,
+# 5 precursor_ion_mz,
+# 6 precursor_ion_charge,
+# 7 fragment_ion_mz,
+# 8 fragment_ion_charge,
+# 9 fragment_ion_label,
+# 10 ion_rank,
+    if ( 1 && $row[1] =~ /C\[160\]C\w/ ) {
+      use  SBEAMS::PeptideAtlas::PeptideFragmenter;
+      $pfrag ||= new SBEAMS::PeptideAtlas::PeptideFragmenter( MzMaximum => 3000, MzMinimum => 200 );
+
+      my $alt_seq = $row[1];
+      $alt_seq =~ s/C(\w)/C[160]$1/g;
+
+      if ( ! $cc{$alt_seq} ) {
+        $log->info( "CC bug - calculating fragments for $alt_seq" );
+        for my $charge ( 1, 2, 3 ) {
+          $cc{$alt_seq} ||= {};
+          my $frags = $pfrag->getExpectedFragments( modifiedSequence => $alt_seq,
+                                                              charge => $charge,
+                                                      omit_precursor => 0,
+                                                      precursor_excl => 1,
+                                                     fragment_charge => $charge,
+                                                );
+          for my $frag ( @{$frags} ) {
+            my $s = $frag->{series};
+            my $o = $frag->{ordinal};
+            my $mz = $frag->{mz};
+            my $ch = $frag->{charge};
+            my $fkey = $s . $o . $ch;
+            if ( $frag->{label} eq 'precursor' ) {
+              $fkey = 'precursor' . $ch;
+            }
+            $cc{$alt_seq}->{$row[6]}->{$fkey} = $mz;
+          }
+        }
+      }
+      $row[1] = $alt_seq;
+      $row[5] = $cc{$alt_seq}->{$row[6]}->{'precursor' . $row[6]};
+      $row[7] = $cc{$alt_seq}->{$row[6]}->{$row[9] . $row[8]};
+    }
+
+      my $prot = $row[14];
+      
+      $counts{row}++;
+
+      $counts{prot}++ unless $prots{$prot};
+      $prots{$prot} ||= {};
+
+      $counts{pepions}++ unless $prots{$prot}->{$row[1]};
+#      if ( !$prots{$prot}->{$row[1]} ) {
+#        print "Checking on $row[1]\n";
+#      }
+      $prots{$prot}->{$row[1]}++;
+
+      # Do we have enough peptides already?
+      if ( scalar( keys( %{$prots{$prot}} ) ) > $n_peps_per_prot ) {
+#        print "Skipping for max peps per prot ($n_peps_per_prot)<BR>\n";
+        next; 
+      }
+
+      my $pep_key = $prot . $row[1];
+      my $pep_seq = $row[1];
+      $peps{$pep_key} ||= 0; 
+
+      # Do we have enough fragments already?
+      if ( $peps{$pep_key} >= $n_fragment_ions ) {
+#        print "Skipping for max peps per prot<BR>\n";
+        next;
+      }
+
+# 0 preceding_residue
+# 1 peptide_sequence
+# 2 following_residue
+# 3 synthesis_adjusted_score
+# 4 transition_source
+# 5 precursor_ion_mass
+# 6 precursor_ion_charge
+# 7 fragment_ion_mass
+# 8 fragment_ion_charge
+# 9 fragment_ion_label
+# 10 ion_rank
+# 11 relative_intensity
+# 12 SSRCalc_relative_hydrophobicity
+# 13 biosequence_name
+# 14 merged_score
+# 15 n_observations
+      # Problem cases 
+      # 1) duplicate ions
+
+      # Added biosequence name into seen_key, DSC 2012-01-05
+      my $frag_key = join( ':', @row[1,6,8,9,14] );
+      if ( $frag_seen{$frag_key}++ ) {
+        next;
+      }
+
+      # 2) fragment ion too big
+      if ( abs( $row[5] * $row[6] - $row[7] * $row[8] ) < 5 ) {
+#        print "rejected $row[1] frag $row[9] for toobigosity<BR>\n";
+        next;
+      }
+
+      if ( !$parameters{b_ions} ) {
+        next if $row[9] =~ /^b/;
+      }
+      if ( !$parameters{y_ions} ) {
+        next if $row[9] =~ /^y/;
+      }
+      if ( !$parameters{n_loss_ions} ) {
+        next if $row[9] =~ /\-\d+/;
+      }
+
+      if ( keys(%ex) ) {
+        next if $ex{$row[9]};
+      }
+
+
+      if ( $parameters{min_mz} ) {
+        if ( $parameters{min_mz} > $row[5] ||  $parameters{min_mz} > $row[7] ) {
+					next;
+				}
+      }
+      if ( $parameters{max_mz} ) {
+        if ( $parameters{max_mz} < $row[5] ||  $parameters{max_mz} < $row[7] ) {
+					next;
+				}
+      }
+
+      # clean
+      my $cleanseq = $row[1];
+      $cleanseq =~ s/\[\d+\]//g;
+
+      if ( $parameters{multimap} eq 'results' ) {
+	my $pepion = $row[1] . '__' . $row[6];
+	$pepion_used{$pepion} ||= {};
+	$peptide_used{$cleanseq} ||= {};
+	my $skip_protein = 0;
+	for my $used_prot ( keys( %{$peptide_used{$cleanseq}} ) ) {
+#		  	for my $used_prot ( keys( %{$pepion_used{$pepion}} ) ) {
+	  if ( $used_prot !~ /$prot/ ) {
+	    $skip_protein++;
+	    last;
+	  }
+	}
+	if ( $skip_protein ) {
+	  $skipped_multimap{$prot} ||= {};
+	  $skipped_multimap{$prot}->{$cleanseq}++;
+	  next;
+	}
+	$pepion_used{$pepion}->{$prot}++;
+	$peptide_used{$cleanseq}->{$prot}++;
+      } elsif ( $parameters{multimap} eq 'global' ) {
+	if ( $peptide_mappings->{$cleanseq} && $peptide_mappings->{$cleanseq} !~ />1</ ) {
+	  $log->info( "Skipping $cleanseq for global doppletude" );
+	  $skipped_multimap{$prot}->{$cleanseq}++;
+	  next;
+	}
+      }
+
+      $peps{$pep_key}++;
+
+      $row[10] = $peps{$pep_key};
+      $row[9] = lcfirst($row[9]);
+  
+      $row[5] = sprintf( "%0.4f", $row[5] );
+      $row[4] = $src_name{$row[4]} if $src_name{$row[4]};
+      $row[4] .= '-pred' if $row[19] eq 'Y';
+
+      if ( $row[4] eq 'QTOF' ) {
+        $row[7] = sprintf( "%0.4f", $row[7] );
+      } else {
+        $row[7] = sprintf( "%0.4f", $row[7] );
+      }
+      $row[3] = sprintf( "%0.2f", $row[3] );
+      $row[20] = sprintf( "%0.2f", $row[20] );
+      $row[12] = ( $row[12] ) ? sprintf( "%0.1f", $row[12] ) : '';
+      $row[13] = ( $row[13] ) ? sprintf( "%0.1f", $row[13] ) : '';
+      if ( $row[11] ) {
+        $row[11] = int( $row[11] );
+      } elsif ( $is_html ) {
+        $row[11] = $naa; 
+      } else {
+        $row[11] = ''; 
+      }
+  
+      my $ce = calculateCE( mz => $row[5], chg => $row[6] );
+
+
+      $patr_peps{$row[1]}++;
+
+      # Cache for xfer to ATAQs
+      # protein  sequence Q1_mz Q3_mz RT rank Q1_chg Q3_chg peak_intensity ion_label collision SSR
+      push @namelist, join( '::', $prot, @row[1,5,7],'',@row[10,6,8,11,9],$ce, $row[12] );
+
+      if ( $row[16] && $is_html ) {
+        $row[16] = "<A HREF='Summarize_Peptide?searchWithinThis=Peptide+Sequence&searchForThis=$cleanseq;action=QUERY'>$row[15]</A>";
+      }
+
+      if ( $is_html ) {
+        $row[11] ||= $naa; 
+      }
+    
+# 0 prot
+# 2 peptide_sequence
+# 6 precursor_ion_mass
+# 7 precursor_ion_charge
+# 8 fragment_ion_mass
+# 9 fragment_ion_charge
+# 10 fragment_ion_label
+#      my  @rowdata = ( $prot, @row[0..12,15,19] );
+
+
+      my  @rowdata;
+      my $pa_link = '';
+      my $srm_link = '';
+      my $organism_name = $id2name->{$organism} || 'unknown';
+
+      my $links = '';
+#      if ( !$guest || $super_guest ) {
+      if ( 1 ) {
+        my @bids = keys( %{$build_resources->{atlas_build}} );
+        my $pa_img = "<img src='$HTML_BASE_DIR/images/pa_tiny_clear.png' border=0 />";
+        my $srm_img = "<img src='$HTML_BASE_DIR/images/srm_icon_clear.gif' border=0 />";
+        my $np_img = "<img src='$HTML_BASE_DIR/images/neXtprot_small.png' border=0 />";
+        my $pratlas_img = "<img src='$HTML_BASE_DIR/images/ProteinAtlasTiny.gif' border=0 />";
+        my $pcommons_img = "<img src='$HTML_BASE_DIR/images/pc2_tiny.png' border=0 />";
+        my $srmc_img = "<img src='$HTML_BASE_DIR/images/SRMC.png' border=0 />";
+
+        $q->delete( 'protein_name_constraint', 'n_peptides_per_protein', 'n_highest_intensity_fragment_ions' );
+        my $recall_url = $q->self_url();
+        $recall_url =~ s/peptide_sequence_constraint=[^;&]+[;&]*//;
+        $recall_url .= ";protein_name_constraint=$prot;n_peptides_per_protein=100;n_highest_intensity_fragment_ions=1;omit_predicted=1;protein_context=1";
+        $pa_link = qq~
+        <A HREF='GetProtein?organism_name=$organism_name;protein_name=$prot;apply_action=GO&action=GO#Sequence%20Motifs' TARGET='_peptideatlas' title='Look up protein in the Peptide Atlas' class='popup'>$pa_img</A>
+        ~;
+        $srm_link = qq~
+        <A HREF='$recall_url' TARGET='_srmatlas' title='Find all peptides for this protein in SRMAtlas' class='popup'>$srm_img</A>
+        ~;
+
+        my $gene = $prot;
+        if ( $gene =~ /^IPI/ || $gene =~ /^ENSP/ ) {
+          $gene = $acc2gene{$gene} if $acc2gene{$gene};
+        }
+        my $pc_protein = $prot;
+        if ( $acc2symbol->{$prot} && $acc2symbol->{$prot}->{symbol} ) {
+          $pc_protein = $acc2symbol->{$prot}->{symbol};
+        }
+
+        my $pc_link = qq~
+        <A HREF="http://www.pathwaycommons.org/pcviz/#neighborhood/$pc_protein" TARGET='_external' title='Look up protein interactions for $pc_protein at Pathway Commons' class='popup'>$pcommons_img</A>&nbsp;
+        ~;
+
+        my $srmc_link = '';
+        if ( $parameters{organism} == 2 || $pabst_build_id == 146 ) {
+          $srmc_link = qq~
+          <A HREF="http://www.srmcollider.org/srmcollider/srmcollider.py?peptides=$pep_seq&ssr_window=6&q1_window=1&q3_window=1&low_mass=400&high_mass=1500&genome=human&isotope=1&missed=0&uis=2&bions=true" TARGET='_external' title='Look up peptide UIS at srmcollider.org' class='popup'>$srmc_img</A>&nbsp;
+          ~;
+        }
+
+        my $pratlas_link = qq~
+        <A HREF="http://www.proteinatlas.org/search/$gene" TARGET='_external' title='Look up protein in the Human Protein Atlas' class='popup'>$pratlas_img</A>&nbsp;
+        ~;
+
+        my $np_link = '';
+        if ( $parameters{organism} == 2 || $pabst_build_id == 146 ) {
+          if ( $acc2symbol->{$gene} && $acc2symbol->{$gene}->{nextprot} ) {
+            $gene = 'NX_' . $gene if length( $gene ) == 6;
+            $np_link = qq~
+            <A HREF='http://www.nextprot.org/entry/$gene' TARGET='_external' title='Look up protein in neXtProt knowledgebase' class='popup'>$np_img</A>&nbsp;
+            ~;
+          }
+        }
+
+
+        $links = "$srm_link$pa_link$pratlas_link$np_link$pc_link$srmc_link";
+        $links =~ s/\n//g;
+        $links = "<span class=nowrap_text>$links</span>";
+      } else {
+        $prot = "<A HREF='GetProtein?organism_name=$organism_name;protein_name=$prot;apply_action=GO&action=GO#Sequence%20Motifs' TARGET='_peptideatlas' title='Look up protein in the Peptide Atlas'>$prot</A>" if $is_html;
+      }
+
+      my $display_prot = $prot;
+      if ( $parameters{neXtProt} ) {
+        $display_prot = 'NX_' . $prot;
+      }
+         
+      if ( $parameters{rt_type} eq 'iRT'  || $parameters{rt_type} == $ssr_type ) {
+
+        @rowdata = ( $prot, $links, @row[0..12] );
+      } else {
+        @rowdata = ( $display_prot, $links, @row[0..13] );
+      }
+
+      if ( $mature{$row[24]} ) {
+        $rowdata[3] = "<span style='background-color:#33FF66' title='Denotes peptide unique to mature proteoform' >$rowdata[3]</span>";
+      }
+
+      if ( $has_mappings ) {
+        if ( $peptide_mappings->{$cleanseq} ) {
+          push @rowdata, $peptide_mappings->{$cleanseq};
+        } else {
+          push @rowdata, 'n/a';
+        }
+      }
+      if ( $has_snps ) {
+        if ( $snps{$row[24]} ) {
+          if ( !$snpacc2key{$snps{$row[24]}->{snpacc}} ) {
+            $snpacc2key{$snps{$row[24]}->{snpacc}} = $snpacc2key{keybase}++; 
+          }
+          my $snpref = 'SNP_' . $snpacc2key{$snps{$row[24]}->{snpacc}};
+          if ( $snps{$row[24]}->{dbsnp} ) {
+            $snpref = "<a target=_dbsnp href=https://www.ncbi.nlm.nih.gov/projects/SNP/snp_ref.cgi?rs=" . $snps{$row[24]}->{dbsnp} . ">$snpref</a>";
+          }
+#          push @rowdata, 'SNP_' . $snpacc2key{$snps{$row[24]}->{snpacc}};
+          push @rowdata, $snpref;
+
+          if ( $snps{$row[24]}->{snppos} ) {
+#            print "In loop with $rowdata[3], pos is $snps{$row[24]}->{snppos} <br>\n";
+            my @seq = split( '', $rowdata[3] );
+            my $idx = 0;
+            my @newseq;
+            for my $char ( @seq ) {
+              
+#              print "testing $char at position $idx, pos is $snps{$row[24]}->{snppos}<br>\n";
+              if ( $char =~ /\w/ && $char !~ /\d/ ) {
+                $idx++;
+# print "word char<br>\n";
+                if ( $idx == $snps{$row[24]}->{snppos} ) {
+#                  print "idx matches pos<br>\n";
+                  push @newseq, "<span style='background-color:#66CCFF'>$char</span>";
+                } else {
+                  push @newseq, $char;
+                }
+              } else {
+#                print "odd char<br>\n";
+                push @newseq, $char;
+              }
+            }
+            $rowdata[3] = join( '', @newseq );
+          }
+
+
+        } elsif ( $has_snp{$row[24]} ) {
+          if ( !$snpacc2key{$has_snp{$row[24]}->{snpacc}} ) {
+            $snpacc2key{$has_snp{$row[24]}->{snpacc}} = $snpacc2key{keybase}++; 
+          }
+          push @rowdata, 'Orig_' . $snpacc2key{$has_snp{$row[24]}->{snpacc}};
+        } else {
+          push @rowdata, '';
+        }
+      } else {
+      }
+      if ( $has_quant ) {
+        if ( $quant_info->{$cleanseq} ) {
+          my $precursor = int($row[5]);
+          push @rowdata, "<A HREF=quant_info?peptide_sequence=$cleanseq;precursor=$precursor TARGET='_quant'><IMG SRC=$HTML_BASE_DIR/images/quant.png BORDER=0></A>";
+        } else {
+          push @rowdata, '&nbsp;';
+        }
+      }
+
+      if ( $parameters{speclinks} ) {
+        my $link_key = $row[1] . $row[6];
+
+        # Fetch chromat/spectrum links for this peptide
+        my $links = $links{$link_key} || get_consensus_links( seq => $row[1], 
+                                                              chg => $row[6], 
+                                                              libs => $clibs, 
+                                                              pabst_build_id => $pabst_build_id, 
+                                                              badlinks => $seq2badlinks,
+                                                              consensrc => $consensus_srcs,
+                                                              has_ce => $has_ce,
+                                                              organism => $organism );
+
+
+        $links{$link_key} ||= $links;
+        my $mass = $massCalculator->getPeptideMass( sequence => $row[1], mass_type => 'monoisotopic' );
+
+        my @chromat_links;
+				my %image = ( QTrap5500 => "$HTML_BASE_DIR/images/chromatogram.gif",
+				              QQQ => "$HTML_BASE_DIR/images/chromatogram.gif" );
+
+        for my $ch_type ( qw( QQQ QTrap5500 ) ) {
+
+          # FIXME temporary hack, only builds with CE set will get chromat links.
+          next unless $has_ce || $has_chromats;
+
+          my $instr_name = ( $ch_type =~ /QQQ/ ) ? 'Agilent 6460 QQQ' : 
+                           ( $ch_type =~ /QTrap5500/i ) ? 'ABI SCIEX QTRAP 5500' : $ch_type;
+           
+          my $chromat_link = '';
+#          die "link key is $link_key, chtype is $ch_type";
+
+          if ( $pepion2scanpath->{$ch_type}->{$link_key} ) {
+            my $title = "View +$row[6] chromatogram for $row[1] on $instr_name"; 
+						my $precursor_param = '';
+						my $scan_param = '';
+						if ( $ch_type =~ /QQQ/ ) {
+							$precursor_param = ";precursor_charge=$row[6];expand_timeframe=20";
+							if ( $seq2badlinks->{$link_key}  ) {
+				        $image{QQQ} = "$HTML_BASE_DIR/images/smelly.png";
+							}
+						} else {
+						  $scan_param = 'q1_tolerance=' . MZ_TOLERANCE;
+              if ( $pepion2scanpath->{$ch_type}->{$link_key} ) {
+                $scan_param .= ";scan=$pepion2scanpath->{$ch_type}->{$link_key}->{scan};";
+              }
+            }
+            my $pepion = $q->escape( $row[1] . '+' . $row[6] );
+
+            $instr_name = $q->escape( $instr_name );
+
+            if ( $instr_name =~ /QQQ/i && !grep /qqq_spectrum/, @{$links{$link_key}} ) {
+              $chromat_link = '';
+            } elsif ( $instr_name =~ /5500/i && !grep /qtrap_spectrum/, @{$links{$link_key}} ) {
+              $chromat_link = '';
+            } else {
+              $chromat_link = "<A HREF=ShowChromatogram?sort_peaks=1;q1_tolerance=0.01;alternate_q1=0.07;${scan_param}precursor_neutral_mass=$mass;pepseq=$row[1]$precursor_param;precursor_mz=$row[5];limit_smoothing_options=1;default_smoothing_factor=5;spectrum_pathname=$pepion2scanpath->{$ch_type}->{$link_key}->{path};peptide=$row[1];no_specfile=1;no_mquest=1;instrument_name=$instr_name TARGET=$ch_type> <IMG BORDER=0 SRC='$image{$ch_type}' TITLE='$title'> </A>";
+            }
+          }
+          push @chromat_links, $chromat_link;
+        }
+#        push @rowdata, $links, $chromat_link;
+        push @rowdata, @{$links};
+        if ( $has_chromats || $organism == 2 ) {   # && ( !$guest || $super_guest ) ) {
+          push @rowdata, @chromat_links;
+        }
+      }
+
+
+      # Here we push the peptide, generally the 'light' version - unless the 
+      # it is an observed 'heavy', in which case we may push the 'heavy'
+			$parameters{cmod_opts} ||= 'default';
+      if ( $parameters{cmod_mass} && $parameters{cmod_opts} ne 'default' ) {
+        if ( $rowdata[2] =~ /[KR]$/ ) {  # Not modified (light)
+          push @peptides, \@rowdata unless $parameters{cmod_opts} eq 'heavy_only';
+        } elsif ( $rowdata[2] =~ /[KR]\[\d\d\d\]$/ ) {  # Modified (heavy)
+          push @peptides, \@rowdata unless $parameters{cmod_opts} eq 'light_only';
+        }
+      } else {
+        push @peptides, \@rowdata;
+      }
+
+
+
+      # Manually build Lys/Arg C-labeled code
+      if ( $parameters{cmod_mass} && !$parameters{peptides_only} && $parameters{cmod_opts} ne 'default'  ) {
+
+        my %seen;
+        for my $mod ( split( ',', $parameters{cmod_mass} ) ) {
+
+          my ( $aa, $mass ) = $mod =~ /^(\w)(\d+)$/;
+  
+          if ( $aa && $mass ) {
+
+            # Only consider the first instance of any AA (only one mod mass each for K/R)
+            next if $seen{$aa}++;
+  
+            my $annot = '';
+            if ( $aa =~ /R/i ) {
+              my $mod_aa = $mass + 156;
+              $annot = "R[$mod_aa]";
+            } else {
+              my $mod_aa = $mass + 128;
+              $annot = "K[$mod_aa]";
+            }
+
+            my @mod_row = ( $prot, @row[0..14] );
+
+
+            my $delta_mass = ( $mod eq 'R10' ) ? 10.008269 :
+                             ( $mod eq 'K8' ) ?  8.014199 : $mass;
+
+            # only allow modified K/R on the terminus 
+            # If original row was light (unmodified)
+            if ( $mod_row[2] =~ /$aa$/ ) {
+              $mod_row[2] =~ s/$aa$/$annot/;
+              $mod_row[6] = sprintf( "%0.4f", $mod_row[6] + $delta_mass/$mod_row[7] );
+              if ($mod_row[10] =~ /^y/i ) {
+                $mod_row[8] = sprintf( "%0.4f", $mod_row[8] + $delta_mass/$mod_row[9] );
+              }
+
+              # Setting the number of columns here, might get out of sync...
+              $#mod_row = 14;
+
+              if ( $parameters{cmod_opts} eq 'heavy_only' || $parameters{cmod_opts} eq 'both' ) {
+                # We are now pushing a links column into the row[1]
+                 push @peptides, [ $mod_row[0], $rowdata[1], @mod_row[1..14] ];
+              }
+            # if original row was heavy (modified)
+            } elsif ( $mod_row[2] =~ /$aa\[\d\d\d\]$/ ) {
+
+              # Strip annotation
+              $mod_row[2] =~ s/$aa\[\d\d\d\]$/$aa/;
+
+              # Adjust transition mz by delta/charge
+              $mod_row[6] = sprintf( "%0.4f", $mod_row[6] - $delta_mass/$mod_row[7] );
+              if ($mod_row[10] =~ /^y/i ) {
+                $mod_row[8] = sprintf( "%0.4f", $mod_row[8] - $delta_mass/$mod_row[9] );
+              }
+
+              # Setting the number of columns here, might get out of sync...
+              $#mod_row = 14;
+
+              # Store this only if light version was requested
+              if ( $parameters{cmod_opts} eq 'light_only' || $parameters{cmod_opts} eq 'both' ) {
+                # We are now pushing a links column into the row[1]
+                push @peptides, [ $mod_row[0], $rowdata[1], @mod_row[1..14] ];
+              }
+            }
+
+          } else {
+            $log->debug( "$parameters{cmod_mass} is nothing!" );
+          }
+        }
+      }
+
+      $row_cnt++;
+      if ( $row_cnt >= ROW_LIMIT ) {
+        print $sbeams->makeInfoText( "Maximum query size (" . ROW_LIMIT . ") exceeded, results are truncated" );
+        last;
+      }
+  } # End loop over resultset
+
+  $log->debug( "Done 1 " . time()  . "\n" );
+  
+  print STDERR "Done 2 " . time()  . "\n";
+  my $cnttxt = "Looped over $counts{row} total rows for $counts{prot} proteins and $counts{pepions} peptide ions";
+
+  $end = time;
+	my $delta = $end - $start;
+  print qq~
+  <script type="text/javascript">
+  var info_txt=document.getElementById("query_info");
+  info_txt.innerHTML="<BR><DIV class=clear_warning_box> Took $delta seconds to loop over $counts{row} rows </DIV>";
+	function clear_status() {
+    info_txt.innerHTML=" ";
+	}
+  setTimeout( "clear_status()", 5000 );
+  </script>
+  ~ if $is_html;
+
+  if ( scalar( keys( %skipped_multimap ) ) ) {
+		my $mesg = 'Some multiple-mapping peptides were skipped: ';
+		for my $prot ( sort( keys( %skipped_multimap ) ) ) {
+			$mesg .= "$prot (";
+			my $sep = '';
+		  for my $pep ( sort( keys( %{$skipped_multimap{$prot}} ) ) ) {
+				$mesg .= $sep . $pep;
+			  $sep = ',';	
+		  }
+			$mesg .= ") ";
+		}
+		update_status( $mesg ) if $is_html;
+	}
+
+
+  $log->debug( "CNT: $cnttxt\n" );
+
+  $log->debug( "Done! " . time() );
+  $log->debug( "processed " . scalar( @namelist )  . " transitions " );
+
+  $log->debug( "fetching from PATR ! " . time() );
+
+# 0 preceding_residue
+# 1 peptide_sequence
+# 2 following_residue
+# 3 synthesis_adjusted_score
+# 4 transition_source
+# 5 precursor_ion_mass
+# 6 precursor_ion_charge
+# 7 fragment_ion_mass
+# 8 fragment_ion_charge
+# 9 fragment_ion_label
+# 10 ion_rank
+# 11 relative_intensity
+# 12 SSRCalc_relative_hydrophobicity
+# 13 biosequence_name
+# 14 merged_score
+# 15 n_observations
+
+  my @peps = keys( %patr_peps );
+  my $patr = get_PATR_transitions( peptides => \@peps );
+
+#  SELECT DISTINCT P.peptide_sequence, modified_peptide_sequence, peptide_charge,
+#  Q1_mz ,Q3_mz, Q3_ion_label, collision_energy,
+#  SSRCalc_relative_hydrophobicity, retention_time, 'na', ''
+#  0 => protein
+#  1 => pre
+#  2 => seq
+#  3 => post
+
+  for ( my $i = 0; $i <= $#peptides; $i++ ) {
+    my $pep = $peptides[$i];
+    if ( $patr->{$pep->[2]} ) {
+      $peptides[$i] = $patr->{$pep->[2]};
+    }
+    if ( $parameters{peptides_only} ) {
+      splice( @{$pep}, 5, 8 ) if $i;
+    }
+  }
+  $log->debug( "Done ! " . time() );
+
+
+# prot Protein => 'Protein Name/Accession',
+# 0 Pre => 'Previous amino acid',
+# 1 Sequence => 'Amino acid sequence of peptide',
+# 2 Fol => 'Followin amino acid',
+# 3 'Score' => 'Adjusted proteotypic score',
+# 4 Src => 'Transition source, one of PATR, QQQ (triple quad), IT (ion trap), IS (In silico/theoretical)',
+# 5 Q1_mz => 'Precursor ion m/z',
+# 6 Q1_chg => 'Precursor ion charge',
+# 7 Q3_mz => 'Fragment ion m/z',
+# 8 Q3_chg => 'Fragment ion charge',
+# 9 Label => 'Fragment ion label (series/number)',
+# 10 Rank => 'PABST transition rank',
+# 11 RI => 'Fragment peak relative intensity (scaled to 10000 Units)',
+# 12 SSR => 'SSRCalc',
+# 13 Protein name => 
+# 13 Merged score =>  
+
+  my $align = [qw(center center center left center center right right right center right left right right)];
+
+  my $col_info = $atlas->get_column_defs( labels => \@headings );
+  my $help_text = $atlas->make_table_help( description => 'Q1/Q3 transition pairs for SRM experiments',
+                                                   entries => $col_info,
+                                                   ); 
+
+  my $change_on = 3;
+  if ( $args{cmod_mass} && !$args{peptides_only}  ) {
+    $change_on = 10;
+  }
+
+  my $download_select = get_download_form();
+#  $download_select =~ s/HIDDEN_PLACEHOLDER//gm;
+#  print $download_select;
+#  exit;
+
+  my ( $html, $rs_name ) = $atlas->encodeSectionTable( header => 1, 
+                                                        width => '600',
+                                                      tr_info => $args{tr},
+                                                       align  => $align,
+                                                  rs_headings => \@headings,
+                                                         rows => \@peptides,
+                                                 rows_to_show => 20,
+                                                      colspan => 3,
+                                                     max_rows => 2500,
+                                               manual_widgets => 1,
+                                                    help_text => $help_text,
+                                                  chg_bkg_idx => $change_on, 
+                                                 set_download => 'Download peptides', 
+                                                download_form => $download_select, 
+                                                    rs_params => \%rs_params,
+                                                  file_prefix => 'best_peptides_', 
+                                                     bg_color => '#EAEAEA',
+                                                     sortable => 1,
+                                                     table_id => 'pabst',
+        close_table => 1,
+                                                     );
+
+
+  # "Publish" data as indirect resource for firegoose.  
+  my $namelist = join( "\n", @namelist );
+  my $tempfile = $sbeams->writeSBEAMSTempFile( content => $namelist );
+  my @name = split "/", $tempfile;
+  my $base = $q->url( -base => 1 );
+  my $tmpfile_url = "$base/$HTML_BASE_DIR/tmp/$name[$#name]";
+
+  my $gXML =  $sbeams->getGaggleXML( data => $tmpfile_url,
+                                organism => $organism, 
+                                  object => 'namelist', 
+                                   start => 1, 
+                                   end => 1, 
+                                    name => 'SRM_transitions', 
+                                    type => 'indirect' );
+      
+
+				my $rs = $atlas->get_cached_resultset( rs_name => $rs_name );
+      if ( $is_html ) {
+        $content .= "<BR><BR><TABLE >$html $gXML";
+      } else {
+
+        if ( !$is_html && !$rs_params{set_name} ) {
+          $rs_params{set_name} = 'srm_atlas_build_' . $pabst_build_id; 
+        }
+        my $suppress_header = 1;
+        my $omode = $sbeams->output_mode();
+        if ( $omode =~ /tsv|json/i  ) {
+          $suppress_header = 0;
+        }
+        
+        $sbeams->displayResultSet( resultset_ref => $rs,
+				   query_parameters_ref=>\%parameters,
+				   rs_params_ref=> \%rs_params,
+				   url_cols_ref=> [],
+				   hidden_cols_ref=> {},
+				   max_widths=> {},
+				   column_titles_ref=> $rs->{column_list_ref},
+				   base_url=> '',
+				   suppress_header => $suppress_header,
+				   output_mode => $sbeams->output_mode()
+	    );
+
+      }
+
+
+    #### If QUERY was not selected, then tell the user to enter some parameters
+  } else {
+    if ($sbeams->invocation_mode() eq 'http' && $is_html ) {
+      $content .= "<H4>Select parameters above and press QUERY</H4>\n";
+    } else {
+      $content .= "You must supply some parameters to contrain the query\n";
+    }
+  }
+
+#    open FRM, ">/tmp/form";
+#    print FRM qq~
+#    $content
+#    ~;
+  if ( $is_html ) {
+    print $sbeams->addTabbedPane( label => 'Results' );
+    print "$content\n";
+    print $sbeams->closeTabbedPane( selected => 'Results' );
+  }
+
+  $sbeams->time_stmt( "Done.  Almost" );
+  return unless ( $parameters{protein_context} );
+  $sbeams->time_stmt( "Context? What is context?" );
+
+#  print $sbeams->addTabbedPane( label => 'Context' );
+#  print get_protein_context( %parameters );
+#  print $sbeams->closeTabbedPane( selected => 'Results' );
+
+} # end fetch_transitions
+
+sub fill_in_genes {
+  my $acc2gene = shift;
+  my %mia;
+  for my $prot ( keys( %{$acc2gene} ) ) {
+    $mia{$prot}++ unless $acc2gene->{$prot};
+  }
+  return unless scalar( keys( %mia ) );
+  my $pstr = "'" . join( "','", keys( %mia ) ) . "'";
+  my $sql = qq~
+    SELECT DISTINCT biosequence_name, biosequence_gene_name 
+    FROM $TBAT_BIOSEQUENCE
+    WHERE biosequence_name IN ( $pstr )
+    AND biosequence_gene_name IS NOT NULL
+    AND biosequence_gene_name <> ''
+  ~;
+  my $sth = $sbeams->get_statement_handle( $sql );
+  while ( my @row = $sth->fetchrow_array() ) {
+    $acc2gene->{$row[0]} ||= $row[1];
+  }
+  return;
+}
+
+sub get_gene_symbols {
+  my $acc = shift;
+  my $pstr = "'" . join( "','", @{$acc} ) . "'";
+  my %acc2symbol;
+  my $sql = qq~
+    SELECT DISTINCT entry_accession, gene_symbol, nextprot_id 
+    FROM $TBAT_UNIPROT_DB_ENTRY
+    WHERE entry_accession IN ( $pstr )
+  ~;
+  my $sth = $sbeams->get_statement_handle( $sql );
+  while ( my @row = $sth->fetchrow_array() ) {
+    my $symbol = $row[1];
+    $symbol =~ s/://g;
+    $symbol =~ s/;//g;
+    my $np = $row[2];
+    $acc2symbol{$row[0]} ||= {};
+    $acc2symbol{$row[0]}->{symbol} = $symbol;
+    $acc2symbol{$row[0]}->{nextprot} = $np;
+  }
+  return \%acc2symbol;
+}
+
+
+sub update_status {
+  my $msg = shift || return;
+  print qq~
+  <script type="text/javascript">
+  var info_txt=document.getElementById("query_info");
+  info_txt.innerHTML=" ";
+  info_txt.innerHTML="<BR><DIV class=clear_warning_box><IMG SRC=$HTML_BASE_DIR/images/wait_sm.gif>&nbsp;$msg</DIV>";
+  </script>
+  ~ if $is_html;
+}
+
+sub get_quant_info {
+  my %quant;
+  my $pep_string = shift || return \%quant;
+
+  my $sql = qq~
+  SELECT DISTINCT peptide_sequence, lod, loq 
+  FROM $TBAT_QUANT_INFO
+  WHERE product_mz IS NULL
+  AND fail_mode = 'PASSED'
+  AND peptide_sequence IN ( $pep_string )
+  ~;
+
+  my $sth = $sbeams->get_statement_handle($sql);
+  while ( my @row = $sth->fetchrow_array() ) {
+		$quant{$row[0]} = { lod => sprintf( "%0.2f", $row[1] ) || 'n/a',
+                        loq => sprintf( "%0.2f", $row[2] ) || 'n/a',
+		                  };
+	}
+	return \%quant;
+}
+
+sub get_protein_context {
+  my %args = @_;
+#  die Dumper( %args );
+
+  my $sql = qq~
+  SELECT DISTINCT peptide_sequence,
+  FROM $TBAT_PROTEOTYPIC_PEPTIDE PP 
+  JOIN $TBAT_PROTEOTYPIC_PEPTIDE_MAPPING PPM
+  ON PP.proteotypic_peptide_id = PPM.proteotypic_peptide_id
+  JOIN $TBAT_BIOSEQUENCE B
+  ON PPM.source_biosequence_id = B.biosequence_id
+  WHERE biosequence_set_id = $parameters{build_bss_id}   
+  ~;
+
+  my %bioseqs;
+#  my $sth = $sbeams->get_statement_handle($sql);
+#  while ( my @row = $sth->fetchrow_array() ) {
+#	}
+
+  return 'Content';
+  return '<table><tr><td>content</td></tr></table>';
+}
+
+
+##################
+sub get_peptide_mappings {
+  my %mappings;
+  my $pep_string = shift || return \%mappings;
+
+  my $sql = qq~
+  SELECT DISTINCT peptide_sequence,
+	CASE WHEN n_sp_mapping IS NULL THEN n_protein_mappings ELSE n_sp_mapping END AS mappings ,
+	source_biosequence_id
+  FROM $TBAT_PROTEOTYPIC_PEPTIDE PP 
+  JOIN $TBAT_PROTEOTYPIC_PEPTIDE_MAPPING PPM
+  ON PP.proteotypic_peptide_id = PPM.proteotypic_peptide_id
+  JOIN $TBAT_BIOSEQUENCE B
+  ON PPM.source_biosequence_id = B.biosequence_id
+  WHERE biosequence_set_id = $parameters{build_bss_id}   
+  AND peptide_sequence IN ( $pep_string )
+  ~;
+
+  my %bioseqs;
+  my $sth = $sbeams->get_statement_handle($sql);
+  while ( my @row = $sth->fetchrow_array() ) {
+		$mappings{$row[0]} ||= $row[1];
+		$bioseqs{$row[2]} ||= {};
+		$bioseqs{$row[2]}->{$row[0]}++;
+	}
+
+  my $bioseq_str = join( ',', keys( %bioseqs ) );
+  $parameters{show_mapping_acc} = 1;
+  if ( $parameters{show_mapping_acc} ) {
+
+    my %pep2accstr;
+
+    if ( $bioseq_str ) {
+
+      my $sql = qq~
+      SELECT DISTINCT biosequence_accession, biosequence_id
+      FROM $TBAT_BIOSEQUENCE 
+      WHERE biosequence_id IN ( $bioseq_str )
+      ~;
+
+      my $sth = $sbeams->get_statement_handle($sql);
+      while ( my @row = $sth->fetchrow_array() ) {
+	for my $pep ( keys( %{$bioseqs{$row[1]}} ) ) {
+	  my $sep = ( $pep2accstr{$pep} ) ? ',' : '';
+	  $pep2accstr{$pep} .= $sep . $row[0];
+	}
+      }
+    }
+
+    for my $pep ( keys( %mappings ) ) {
+      if ( $pep2accstr{$pep} ) {
+	my $cnt = $mappings{$pep};
+	$mappings{$pep} = "<SPAN TITLE='$pep2accstr{$pep}'>$cnt</SPAN>" if $is_html;
+      } else {
+      }
+    }
+  }
+
+  return \%mappings;
+}
+
+sub get_bad_qqq {
+  my %args = ( sequence_clause => '',
+	       probability => 0.5,
+	       @_ );
+
+  $args{sequence_clause} =~ s/PP\.peptide_//gm;
+
+  my $sql = qq~
+  SELECT DISTINCT modified_sequence, charge  
+    FROM $TBAT_CONSENSUS_LIBRARY_SPECTRUM
+		WHERE consensus_library_id = 293
+		AND probability < $args{probability}
+    $args{sequence_clause}
+  ~;
+
+  my $sth = $sbeams->get_statement_handle($sql);
+
+  my %spectra;
+
+  while ( my @row = $sth->fetchrow_array() ) {
+    my $spec_key = $row[0] . $row[1];
+    $spectra{$spec_key}++;
+  }
+
+  return \%spectra;
+}
+
+sub isIRT {
+  my $build_resources = shift || return 0;
+  my $rt_type_clause = '';
+  if ( $parameters{rt_type} && $parameters{rt_type} =~ /^\d+$/ ) {
+    $rt_type_clause = " AND ET.elution_time_type_id = $parameters{rt_type}";
+  }
+  my $et = join( ',', keys( %{$build_resources->{elution_time_set}} ) );
+  my $et_sql = qq~
+  SELECT elution_time_type
+  FROM $TBAT_ELUTION_TIME ET join $TBAT_ELUTION_TIME_TYPE ETT
+    ON ET.elution_time_type_id = ETT.elution_time_type_id
+  WHERE ET.elution_time_set IN ( $et )
+  $rt_type_clause
+  ~;
+  my $sth = $sbeams->get_statement_handle($et_sql);
+
+  my $is_irt = 0;
+  while ( my @row = $sth->fetchrow_array() ) {
+    if ( $row[0] =~ /irt/i ) {
+      $is_irt = 1;
+    } else { 
+      $is_irt = 0;
+      last;
+    }
+	}
+  return $is_irt;
+}
+
+sub get_scan_path {
+  my %args = @_;
+
+  my $subclause = '';
+  if ( $args{scan_clause} ) {
+
+    $subclause = qq~
+    AND modified_sequence IN (  
+    SELECT DISTINCT modified_peptide_sequence FROM 
+    $TBAT_PABST_PEPTIDE_ION 
+    WHERE pabst_peptide_id IN ( $args{scan_clause}  ) )
+    ~;
+  }
+
+
+  my $sql = qq~
+  SELECT DISTINCT peptide_ion, mzML_path, scan_number, instrument_type_name  
+    FROM $TBAT_CHROMATOGRAM_SOURCE_FILE CSF
+    JOIN $TBAT_INSTRUMENT_TYPE IT
+      ON IT.instrument_type_id = CSF.instrument_type_id
+    WHERE 1 = 1
+    $subclause
+
+  ~;
+#    AND source_file_set = 4
+  $log->debug( "Exec scan path SQL" . time() );
+
+  my $sth = $sbeams->get_statement_handle($sql);
+  $log->debug( "Done" . time() );
+
+  my %pepion2scan = { QTrap5500 => {}, QQQ => {} };
+  while ( my @row = $sth->fetchrow_array() ) {
+    $pepion2scan{$row[3]}->{$row[0]} = { scan => $row[2], path => $row[1] };
+    $pepion2scan{$row[3]}->{$row[0]} = { scan => $row[2], path => $row[1] };
+  }
+  return \%pepion2scan;
+}
+
+sub get_consensus_links {
+  my %args = @_;
+
+  my $seq = $args{seq};
+  my $chg = $args{chg};
+  my $libs = $args{libs};
+	my $seq2badlinks = {};
+	my $organism = $args{organism};
+  my $consensus_srcs = $args{consensrc} || {};
+  my $has_ce = $args{has_ce} || 0;
+
+  my $spectrum_key = $seq . $chg;
+
+  my $link = '';
+
+  my $glyco = ( $parameters{pabst_build_id} == 154 ) ? 1 : 0;
+
+  if ( !$parameters{prefetch} ) {
+    $libs = $consensus->getConsensusLinks( modified_sequence => $seq, 
+                                                    organism => $organism,
+                                                    pabst_build_id => $pabst_build_id,
+                                                    has_ce => $has_ce,
+                                                       glyco => $glyco,
+                                                    super_guest => $super_guest );
+  }
+
+  my %instr = ( QQQ => 'Agilent 6460 QQQ', 
+              QTrap5500 => 'ABI SCIEX QTRAP 5500',
+              QTrap => 'ABI SCIEX QTRAP',
+              QTrap4000 => 'ABI SCIEX QTRAP 4000',
+               QTOF => 'Agilent 6530 QTOF',
+               IonTrap => 'IonTrap' );
+
+  my @links;
+#  if ( !$guest || $super_guest ) {
+  if ( 1 ) {
+    my $link = '';
+    if ( $libs->{qtof}->{$spectrum_key} ) {
+      my $title = "View +$chg spectrum for $seq in $instr{QTOF} library"; 
+      $link = "<A HREF='ShowConsensusSpectrum?consensus_library_spectrum_id=$libs->{medium}->{$spectrum_key};peakDetect=true' TARGET=_qtof_spectrum> <IMG BORDER=0 SRC='$HTML_BASE_DIR/images/spectrum.gif' TITLE='$title'></A>";
+    }
+    push @links, $link if $consensus_srcs->{QTOF};
+
+    $link = '';
+    if ( $libs->{medium}->{$spectrum_key} ) {
+      my $title = "View +$chg spectra for $seq from $instr{QTOF} at various CE values";
+      my $param_str;
+      my $xmax = 1200;
+      my $xmin = 200;
+      for my $opt ( 'medium','high','low','mhigh', 'mlow' ) {
+        $libs->{$opt}->{$spectrum_key} ||= '';
+        $param_str .= ";$opt=$libs->{$opt}->{$spectrum_key}";
+      }
+      $link = "<A HREF='ShowCESpectralPlot?xmax=$xmax;xmin=$xmin$param_str' TARGET='_CE_spectrum'> <IMG BORDER=0 SRC='$HTML_BASE_DIR/images/spectrum.gif' TITLE='$title'> </A>";
+    }
+    push @links, $link if $has_ce;
+
+    $link = '';
+    if ( $libs->{qtrap}->{$spectrum_key} ) {
+      my $title = "View +$chg spectrum for $seq in $instr{QTrap} library";
+      $link = "<A HREF='ShowConsensusSpectrum?consensus_library_spectrum_id=$libs->{qtrap}->{$spectrum_key};peakDetect=true' TARGET=_qtrap_spectrum> <IMG BORDER=0 SRC='$HTML_BASE_DIR/images/spectrum.gif' TITLE='$title'> </A>";
+    }
+    push @links, $link if $consensus_srcs->{QTrap5500} || $consensus_srcs->{QTrap4000};
+
+    $link = '';
+    if ( $libs->{qqq}->{$spectrum_key} ) {
+			my $image = "$HTML_BASE_DIR/images/spectrum.gif";
+			$image = "$HTML_BASE_DIR/images/redqmark.gif" if $seq2badlinks->{$spectrum_key};
+      my $title = "View +$chg spectrum for $seq in $instr{QQQ} library";
+      $link = "<A HREF='ShowConsensusSpectrum?consensus_library_spectrum_id=$libs->{qqq}->{$spectrum_key};peakDetect=false' TARGET=_qqq_spectrum> <IMG BORDER=0 SRC='$image' TITLE='$title'> </A>";
+    }
+    push @links, $link if $consensus_srcs->{QQQ};
+  }
+
+  my $link = '';
+  if ( $libs->{it}->{$spectrum_key} ) {
+    my $title = "View +$chg spectrum for $seq in Ion Trap library";
+    $link = "<A HREF='ShowConsensusSpectrum?consensus_library_spectrum_id=$libs->{it}->{$spectrum_key};peakDetect=true' TARGET=_it_spectrum> <IMG BORDER=0 SRC='$HTML_BASE_DIR/images/spectrum.gif' TITLE='$title'> </A>";
+  }
+  push @links, $link if $consensus_srcs->{IonTrap};
+
+  return \@links;
+
+}
+
+
+sub get_PATR_transitions {
+  return {};
+  my %args = @_;
+
+  # Superfluous
+#  return unless $args{peptides};
+#  my $peptide_clause = " WHERE P.peptide_sequence IN ( ";
+#  my $sep = '';
+#  for my $pep ( @{$args{peptides}} ) {
+#    next if $pep =~ /amino acid/i;
+#    $peptide_clause .= $sep . "'" . $pep . "'";
+#    $sep = ',';
+#  }
+#  $peptide_clause .= ")\n";
+
+  my $sql = qq~
+  SELECT DISTINCT P.peptide_sequence, modified_peptide_sequence, peptide_charge,
+  Q1_mz ,Q3_mz, Q3_ion_label, collision_energy,
+  SSRCalc_relative_hydrophobicity, retention_time, 'na', ''
+  FROM $TBAT_SRM_TRANSITION SMT 
+  JOIN $TBAT_PEPTIDE P ON P.peptide_sequence = SMT.stripped_peptide_sequence
+  ORDER BY modified_peptide_sequence, peptide_charge, transition_suitablity_level,
+  Q1_mz, Q3_mz
+ 
+  ~;
+
+  my $sth = $sbeams->get_statement_handle($sql);
+
+  my %pep_rows;
+  while ( my @row = $sth->fetchrow_array() ) {
+    $pep_rows{$row[0]} = \@row;
+  }
+  return \%pep_rows;
+}
+
+sub calculateCE {
+  my %args = @_;
+  for my $attr ( qw( charge mz ) ) {
+    return '' unless $attr;
+  }
+  my $ce = '';
+  if ( $args{charge} == 2 ) {
+    $ce = ( 0.044 * $args{mz} ) + 5.5;
+  } elsif ( $args{charge} == 3 ) {
+    $ce = ( 0.051 * $args{mz} ) + 0.55
+  }
+  return sprintf( "%0.1f", $ce);
+}
+
+sub is_srma_preview_site {
+  my $referrer = shift || $q->referer();
+  my $is_allowed = 0;
+
+  if ( !$referrer ) {
+    $log->error( "No referrer sent to srmatlas_preview, aborting" );
+    return $is_allowed;
+  }
+
+  $CONFIG_SETTING{SRMATLAS_PREVIEW_SITES} ||= '';
+  my @sites = split( /\s+/, $CONFIG_SETTING{SRMATLAS_PREVIEW_SITES} );
+
+  for my $site ( @sites ) {
+    if ( $referrer =~ /$site/ ) {
+      $is_allowed++;
+      last;
+    }
+  }
+  return ( $is_allowed );
+}

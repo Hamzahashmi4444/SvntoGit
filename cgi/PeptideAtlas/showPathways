@@ -1,0 +1,632 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# Program showPathways    
+# $Id: $
+#
+# Description :  Show protein information overlayed on KEGG pathway maps.
+#
+# SBEAMS is Copyright (C) 2000-2021 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+#
+###############################################################################
+
+use strict;
+use lib qw (../../lib/perl);
+use File::Basename;
+use Benchmark;
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::TabMenu;
+use SBEAMS::Connection::DataTable;
+
+use SBEAMS::BioLink::KeggMaps;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::PeptideAtlas::BestPeptideSelector;
+
+use Data::Dumper;
+
+## Globals ##
+my $sbeams = new SBEAMS::Connection;
+$sbeams->setSBEAMS_SUBDIR( 'PeptideAtlas' );
+
+my $atlas = new SBEAMS::PeptideAtlas;
+$atlas->setSBEAMS($sbeams);
+
+my $best_peptide = new SBEAMS::PeptideAtlas::BestPeptideSelector;
+$best_peptide->setSBEAMS($sbeams);
+
+my $program = basename( $0 );
+
+my $keggmap = SBEAMS::BioLink::KeggMaps->new();
+
+my $atlas_build_id;
+my $kegg_organism;
+
+my $verbose = 1;
+my $script_name = basename( $0 );
+
+# Don't buffer output
+$|++;
+
+{ # Main 
+
+  # Authenticate user.
+  my $current_username = $sbeams->Authenticate( allow_anonymous_access => 1 ) || die "Authentication failed";
+
+  # Process cgi parameters
+  my $params = process_params();
+
+  # Print cgi headers.  The hideTimer function won't be in all pages,
+  # but this failure is not apparent to user.
+  $atlas->printPageHeader( onload => 'hideTimerInfo()' );
+  
+  #### Get the current atlas_build_id based on parameters or session
+  $atlas_build_id = $atlas->getCurrentAtlasBuildID( parameters_ref => $params );
+
+  my $paramstr = '';
+  my $organism = $atlas->getCurrentAtlasOrganism( atlas_build_id => $atlas_build_id,
+                                                    parameters_ref => $params, 
+                                                              type => 'organism_id',
+                                                  );
+  $kegg_organism = $keggmap->getOrganismCode( organism_id => $organism );
+
+  $params->{apply_action} ||= 'list_pathways';
+
+  my $content = '';
+
+  #### Get the HTML to display the tabs
+  my $tabMenu = $atlas->getTabMenu(
+    parameters_ref => $params,
+    program_name => $script_name,
+  );
+  if ( $sbeams->output_mode() eq 'html' ) {
+    $content .= "<script>document.title = 'PeptideAtlas: Show Pathways for ".$atlas->getCurrentAtlasOrganism( atlas_build_id => $atlas_build_id, parameters_ref => $params)."';</script>\n";
+    $content .= $tabMenu->asHTML(); 
+  }
+
+  # Decision block, what type of page are we going to display?
+  if ( $params->{apply_action} eq 'list_pathways' ) {
+    if ( $kegg_organism ) {
+      $content .= '<br>' . add_build_selector( $atlas_build_id );
+      $content .= list_pathways( $params );
+    } else {
+      my $txt = $sbeams->makeInfoText("No KEGG map information available for the current atlas build, please select another to continue.");
+      $content .= "<br>$txt<br><br>\n";
+      $content .= add_build_selector( $atlas_build_id );
+    }
+  } elsif ( $params->{apply_action} eq 'pathway_details' ) {
+
+    # Until caching is available, will print out as we go.
+    print $content;
+    $content = pathway_details( $params );
+    $atlas->printPageFooter( close_tables=>'NO');
+    exit;
+  } else {
+    $content .= list_pathways( $params );
+  }
+
+
+#  Don't think I really need this, but...
+#  $sbeams->printUserContext();
+
+  print $content;
+  $atlas->printPageFooter( close_tables=>'NO');
+
+} # end Main
+
+sub add_build_selector {
+  my $build_id = shift;
+
+  my $selector = '<br><b>Select Atlas Build:</b>';
+  $selector .= $atlas->getBuildSelector( atlas_build_id => $atlas_build_id, inline => 1 );
+  $selector .= '<script>function hideTimerInfo() {} </script>';
+  return $selector;
+}
+
+#+
+# Routine to list all available pathways for current organism
+#-
+sub list_pathways {
+  my $params = shift;
+  my $url = $q->url( -full=>1 );
+  my $page = ''; #$sbeams->getGifSpacer(900);
+
+  if ( !$atlas->has_search_key_data( parameters_ref => $params ) ) {
+    $sbeams->set_page_message( type => 'Error', msg => <<"    END" );
+    Current build does not have search index built, KEGG map will show no hits. 
+    Follow PeptideAtlas Home link and choose a default atlas to make this work.
+    END
+  }
+  my $t0 = new Benchmark;
+
+  my $pathways = $keggmap->getKeggPathways( organism => $kegg_organism );
+
+  my $table = SBEAMS::Connection::DataTable->new();
+  $table->addRow( ['Pathway ID', 'View Data','Pathway Definition' ] );
+  $table->setRowAttr( ROWS => [1], BGCOLOR => '#002664', ALIGN=>'CENTER', NOWRAP => 0, HEIGHT => 35 );
+  $table->setHeaderAttr(WHITE_TEXT=>1,BOLD=>1);   # this actually has effect via sub formatHeader
+
+  $page .= "<br><br>";
+
+  my $pa_img = "<IMG SRC=$HTML_BASE_DIR/images/pa_tiny.png BORDER=0 />";
+  my $srm_img = "<IMG SRC=$HTML_BASE_DIR/images/srmatlas-icon.gif BORDER=0 />";
+
+  for my $path ( @{$pathways} ) {
+    my $desc = $q->escape( $path->{definition} );
+    my $links = "<A HREF=$url?apply_action=pathway_details;path_id=$path->{entry_id};path_def=$desc;searchdb=pa TARGET=_pa_pathdetails TITLE='View data from pathway proteins in PeptideAtlas'>$pa_img</A> ";
+    $links .= " <A HREF=$url?apply_action=pathway_details;path_id=$path->{entry_id};path_def=$desc;searchdb=srm TARGET=_srm_pathdetails TITLE='View data from pathway proteins in SRMAtlas'>$srm_img</A> ";
+    $table->addRow( [$path->{entry_id},$links,$path->{definition} ] ); 
+  }
+  $table->alternateColors(PERIOD => 1, FIRSTROW=> 2, DEF_BGCOLOR => '#f3f1e4', BGCOLOR => '#d3d1c4');
+  my $nrows = $table->getRowNum();
+  $table->setColAttr(  COLS => [2], ROWS => [2..$nrows], ALIGN => 'CENTER' );
+
+  $page .= "$table<BR>\n";
+
+  my $t1 = new Benchmark;
+  $log->debug( parseTime( $t1, $t0, "seconds to fetch pathways for $kegg_organism" ) );
+
+  return $page;
+}
+
+
+#+
+# Routine to list all available pathways for current organism
+#-
+sub pathway_details {
+  my $params = shift;
+  my $url = $q->self_url();
+  my @url = split( /\?/, $url );
+  $url = $url[0];
+
+  #  Due to performance issues, we will print this out as we go along until
+  #  feature is better implemented.
+  print $sbeams->getGifSpacer(1200) . "<BR>\n";
+
+
+
+#  Turned off
+#  my $addpath = ( $params->{path_def} =~ /pathway/i ) ? '' : 'Pathway ';
+#  print "<DIV ID=1234321 CLASS=visible>\n";
+
+  my $src_atlas = ( $params->{searchdb} eq 'srm' ) ? 'SRMAtlas' : 'PeptideAtlas';
+  print qq~
+<script>document.title = 'PeptideAtlas: Show (KEGG) Pathway for $params->{path_def}';</script>
+    <PRE>
+  The image below shows the pathway for $params->{path_def} from KEGG, annotated with information from the
+  $src_atlas.  As shown in the legend, proteins for which there are peptides in the <B>$src_atlas</B> are colored green, while proteins for 
+  which there is no information are colored yellow.  Some nodes in the network may have no color, this is because there is no information 
+  on them from KEGG.  Each colored node is clickable, linking to a page showing more detailed information.  The link below will load a 
+  query with all known proteins in the pathway, you can modify options as desired and submit.
+    </PRE>
+  <DIV ID=path_link></DIV>
+  <BR><BR>
+  ~;
+
+
+  print <<"  END";
+  <a href="#" onclick="toggle_stats();return false;">
+   <img src="$HTML_BASE_DIR/images/small_gray_minus.gif" title='Show/Hide Stats' ID='1234321_gif'><div class="visilink" id="123454321"> Hide Stats</div></a>
+   <div id="1234321" class="visible">
+   <br>
+  END
+  print "Looking up genes in $params->{path_def} ($params->{path_id}) at KEGG - ";
+
+  my $t2 = new Benchmark;
+
+  $keggmap->setPathway( pathway => $params->{path_id} );
+
+
+#  my $relationships = $keggmap->getPathwayRelationships();
+
+  $params->{searchdb} ||= 'pa';
+  my $pabst_build_id = $best_peptide->get_pabst_build( $params );
+  $params->{pabst_build_id} = $pabst_build_id;
+
+  # Get info from pathway XML
+  my $processed = $keggmap->parsePathwayXML();
+  my $organism = keggOrg2Std( $kegg_organism );
+
+  my $protstr = '';
+  if ( $kegg_organism =~ /mmu|hsa/ ) {
+    $protstr = join "%3B", @{$processed->{uniprot}}; 
+  } else {
+    $protstr = join "%3B", @{$processed->{allgenes}}; 
+  }
+
+  my $path_link = '';
+  if ( $params->{searchdb} eq 'srm' ) {
+    $path_link = "<A HREF=GetTransitions?pabst_build_id=$pabst_build_id;organism_name=$organism;protein_name_constraint=$protstr;C160=on;y_ions=on;b_ions=on;SwissProt=checked;speclinks=on>Search for all pathway proteins</A>";
+  } else {
+     $path_link = "<A HREF=GetProteins?biosequence_name_constraint=$protstr;presence_level_constraint=1;presence_level_constraint=2;redundancy_constraint=4>Search for all pathway proteins</A>";
+  }
+
+
+  # Some page-specific javascript/css.  Allows loading info to get hidden, 
+  # draws box around legend
+  print <<"  END";
+  <SCRIPT LANGUAGE='javascript'>
+  function hideTimerInfo() {
+      toggle_stats();
+      var link = document.getElementById( 'path_link' );
+      link.innerHTML = '$path_link'
+  }
+  function toggle_stats() {
+    // Grab page elements by their IDs
+    var tgif = document.getElementById( '1234321_gif' );
+    var stats= document.getElementById( '1234321' );
+    var showhide= document.getElementById( '123454321' );
+    if (  stats.className == 'visible' ) {
+      stats.className = 'hidden';
+      showhide.innerHTML = 'Show Stats';
+      tgif.src =  '/sbeams/images/small_gray_plus.gif'
+    } else {
+      stats.className = 'visible';
+      showhide.innerHTML = 'Hide Stats';
+      tgif.src =  '/sbeams/images/small_gray_minus.gif'
+    }
+  }
+  </SCRIPT>
+  <STYLE TYPE="text/css" media="screen">
+    div.visible {
+    display: inline;
+    white-space: nowrap;         
+    }
+    div.hidden {
+    display: none;
+    }
+    span.legend { 
+     border: solid;
+     border-width: 1px;
+    }
+  </STYLE> 
+  END
+
+
+
+  my %proteins;
+  my @links;
+  my @text;
+  if ( $params->{searchdb} eq 'srm' ) {
+    my %entry2prots = ( $kegg_organism =~ /mmu|hsa/ ) ? %{$processed->{entry2uniprot}} : %{$processed->{entry2genes}};
+    for my $en ( @{$processed->{entries}} ) {
+      if ( $entry2prots{$en} ) {
+        my @egenes = @{$entry2prots{$en}};
+        my $protstr = join( '%3B', @egenes );
+        push @links, "GetTransitions?pabst_build_id=$pabst_build_id;organism_name=$organism;protein_name_constraint=$protstr;action=QUERY;C160=on;y_ions=on;b_ions=on;SwissProt=checked;speclinks=on";
+        push @text, "Gene ID(s) " . join( ", ", @egenes );
+        for my $prot ( @egenes ) {
+          $proteins{$prot}++;
+        }
+      } else {
+        log->warn( "No entry for $en" );
+      }
+    } 
+  } else {
+    my %entry2genes = %{$processed->{entry2genes}};
+    for my $en ( @{$processed->{entries}} ) {
+      if ( $entry2genes{$en} ) {
+        my @genes;
+        if ($kegg_organism !~ /bbu/){
+           @genes = map( /$kegg_organism:(.*)/, @{$entry2genes{$en}} );
+        }else{
+           @genes = @{$entry2genes{$en}};
+        }
+        my $gene = join( '%3B', @genes ); # @{$entry2genes{$en}} );
+        push @links, "Search?build_type_name=$organism;search_key=$gene;action=GO";
+        push @text, "Gene ID(s) " . join( ", ", @genes );
+        for my $prot ( @genes ) {
+          $proteins{$prot}++;
+        }
+      } else {
+        log->warn( "No entry for $en" );
+      }
+    } 
+  }
+  my $t3 = new Benchmark;
+  $log->debug( parseTime( $t3, $t2, "seconds to get KGML" ) );
+
+#  my $gene_list = $keggmap->getPathwayGenes( source => 'xml' );
+  my $gene_list = [ keys( %proteins ) ];
+
+  my $tot = scalar( @{$gene_list} );
+  my $t4 = new Benchmark;
+  $log->debug( parseTime( $t4, $t3, "seconds to fetch genes for $params->{path_def}" ) );
+	print parseTime( $t4, $t3, '' ) . " seconds <BR>\n";
+
+  print "Found $tot genes in pathway, looking up data in Atlas - ";
+
+  # Fetches expression info from db, returns arrays of bg/fg colors
+  my ( $seen, $atlas_hits, $cnt ) = getExpressionValues( gene_list => $gene_list, %{$params} );
+
+  my $t5 = new Benchmark;
+  $log->debug( parseTime( $t5, $t4, "seconds to get Atlas data for $params->{path_def}" ) );
+	print parseTime( $t5, $t4, '' ) . " seconds <BR>\n";
+
+  print "Found Atlas data for $cnt of $tot ";
+
+  my $table = SBEAMS::Connection::DataTable->new( BORDER => 0 );
+  $table->addRow( [ '&nbsp;', 'Protein', 'Peptides Observed' ] );
+  $table->setHeaderAttr( BOLD => 1 );
+  my $acc_string ='';
+  my $sep = '';
+  for my $gene ( @{$gene_list} ) {
+    my $cnt = 0;
+    if ( $atlas_hits->{$gene} ) {
+      $cnt += $atlas_hits->{$gene};
+    }
+    my $chk = ( $cnt ) ? 'checked' : '';
+    my $chk_box = "<INPUT TYPE=checkbox NAME=accession VALUE=$gene $chk></INPUT>"; 
+    $table->addRow( [ $chk_box, $gene, $cnt ] );
+    $acc_string .= $sep . $gene;
+    $sep ||= ',';
+  }
+  $table->alternateColors( FIRSTROW => 2, PERIOD => 1, BGCOLOR => '#DDDDDD', DEF_BGCOLOR => '#FFFFFF' );
+  $table->setColAttr( ALIGN => 'RIGHT', COLS => [3], ROWS => [2..$table->getRowNum()] );
+
+  if ($kegg_organism =~ /bbu/){
+     my @genes = map( /$kegg_organism:(.*)/, @{$gene_list} );
+     $gene_list = \@genes; 
+  }
+
+  my $organism = $atlas->getCurrentAtlasOrganism( parameters_ref => {} );
+  my $gaggle_info = $sbeams->getGaggleMicroformat( 
+                                          name => "Proteins in $params->{path_def}",
+                                      organism => $organism, 
+                                          data => $gene_list,
+                                        object => 'namelist',
+                                          type => 'direct' 
+  );
+
+  my $t6 = new Benchmark;
+  print parseTime( $t6, $t5, '' ) . " seconds <BR>\n";
+
+
+  print "Getting colored map from KEGG - ";
+  # Send gene/color info to kegg for a map
+  my $build_id = ( $params->{searchdb} eq 'srm' ) ? $atlas_build_id : $pabst_build_id;
+  my $url = $keggmap->getColoredPathway( seen => $seen,
+					 build_id => $build_id,
+					 searchdb => $params->{searchdb},
+					 genes => $gene_list,
+      );
+  
+  my $t7 = new Benchmark;
+  $log->debug( parseTime( $t7, $t6, "seconds to get color pathway" ) );
+  print parseTime( $t7, $t6, '' ) . " seconds <BR>\n";
+
+  print <<"  END";
+  <br>
+  $gaggle_info
+  <br>
+  $table
+  <INPUT TYPE=HIDDEN NAME=apply_action VALUE='gene_list'></INPUT> 
+  <INPUT TYPE=HIDDEN NAME=path_id VALUE='$params->{path_id}'></INPUT> 
+  </FORM>
+  <BR>
+  <HR WIDTH=600 ALIGN=LEFT>
+  END
+
+
+  print  "\n</DIV>\n";
+ 
+  # Get hashref of pathway info (mostly for image URL); 
+  # Get image map for links to peptide atlas 
+  my $image_map = $keggmap->get_image_map( coords => $processed->{coords},
+                                        name   => 'kegg_map',
+                                        links  => \@links,
+                                        colors  => $seen, 
+                                       searchdb => $params->{search_db},
+                                        text   => \@text,
+                                        img_src => $url );
+  my $legend = getExpressionLegend();
+  print "$legend<BR>\n";
+
+# Put pathway link here...
+
+  print "&nbsp;&nbsp;$image_map<BR>\n";
+
+  my @coordinates = @{$processed->{coords}};
+  
+  my $t8 = new Benchmark;
+  $log->debug( parseTime( $t5, $t4, "seconds to get finish" ) );
+
+# return $page;
+  return '';
+}
+
+sub getExpressionValues {
+
+  my %args = @_;
+  return '' unless $args{gene_list} && scalar( @{$args{gene_list}} );
+
+  my $gene_string = "'" . join( "','", @{$args{gene_list}} ) . "'";
+
+  # list of hits, either from Peptide or SRM Atlas
+  my %atlas_hits;
+
+  if ( $args{searchdb} eq 'srm' ) {
+    my $sql = qq~
+    SELECT DISTINCT biosequence_name, COUNT(*) 
+    FROM $TBAT_PABST_PEPTIDE PP 
+    JOIN $TBAT_PABST_PEPTIDE_MAPPING PM 
+      ON PM.pabst_peptide_id = PP.pabst_peptide_id
+    JOIN $TBAT_BIOSEQUENCE BS
+      ON BS.biosequence_id = PM.biosequence_id  
+    WHERE pabst_build_id = $args{pabst_build_id}
+      AND biosequence_name IN ( $gene_string )
+    GROUP BY biosequence_name
+    ~;
+    my $sth = $sbeams->get_statement_handle( $sql );
+    while ( my @row = $sth->fetchrow_array() ) {
+      $atlas_hits{$row[0]} = $row[1];
+    }
+
+  } else {  # Fetch from PeptideAtlas, original
+
+    my $search_type = ( $kegg_organism =~ /hsa|mmu|ssc|bta|rno|ecb|ptr/ ) ? 'Entrez GeneID' : 'ORF NAME';
+    $search_type = 'KEGG' if ( $kegg_organism =~ /bbu/);
+    my $sk_sql = qq~
+      SELECT DISTINCT resource_name, search_key_name
+      FROM $TBAT_SEARCH_KEY_ENTITY 
+      WHERE search_key_name IN ( $gene_string )
+      AND search_key_type = '$search_type'
+    ~;
+    my $sth = $sbeams->get_statement_handle( $sk_sql );
+    my %kegg2other;
+    my %other2kegg;
+    while ( my @row = $sth->fetchrow_array() ) {
+      $kegg2other{$row[1]} ||= {};
+      $kegg2other{$row[1]}->{$row[0]}++;
+  
+      $other2kegg{$row[0]} ||= {};
+      $other2kegg{$row[0]}->{$row[1]}++;
+    }
+    my $protstr = "'" . join( "','", keys( %other2kegg ) ) . "'\n";
+    my $sql =<<"    END";
+      SELECT DISTINCT biosequence_name, SUM(PI.n_observations), SUM(n_protein_mappings)
+      FROM $TBAT_PEPTIDE_INSTANCE PI
+      LEFT JOIN $TBAT_PEPTIDE_MAPPING PM
+        ON ( PI.peptide_instance_id = PM.peptide_instance_id )
+      LEFT JOIN $TBAT_BIOSEQUENCE BS
+        ON ( PM.matched_biosequence_id = BS.biosequence_id )
+      LEFT JOIN $TBAT_BIOSEQUENCE_SET BSS
+        ON ( BS.biosequence_set_id = BSS.biosequence_set_id )
+      WHERE biosequence_name IN  ( $protstr ) 
+      AND atlas_build_id = $atlas_build_id
+      AND biosequence_name NOT LIKE 'ENS%'
+      GROUP BY biosequence_name
+      ORDER BY biosequence_name
+    END
+    $sth = $sbeams->get_statement_handle( $sql );
+  
+    if ( $gene_string ) {
+      while ( my @row = $sth->fetchrow_array() ) {
+        for my $prot ( keys( %{$other2kegg{$row[0]}} ) ) {
+          $atlas_hits{$prot} += $row[1];
+        }
+      }
+    } else {
+    }
+  }
+
+  # define colors
+  my $seen = 'green';
+  my @bg;
+  my @fg;
+  my $gene_cnt = 0;
+  my @seen;
+  my $see;
+  for my $gene ( @{$args{gene_list}} ) {
+    # Has quotes if it is a string
+    $gene =~ s/\'//g;
+    # Assume it's neutral
+    my $color = '#E0FFFF';
+    if ( $atlas_hits{$gene} ) {
+      $gene_cnt++;
+      $color = $seen;
+      push @seen, 1; 
+      $see .= "Saw $gene\n";
+    } else {
+      push @seen, 0; 
+      $see .= "No saw $gene\n";
+    }
+    push @bg, $color;
+    push @fg, 'black';
+  }
+  return ( \@seen, \%atlas_hits, $gene_cnt );
+}
+
+sub getExpressionLegend {
+  my $cell = $sbeams->getGifSpacer(20); # . "<BR>\n";
+  my $table =<<"  END";
+  <table border='0'>
+   <tr> 
+    <td> Peptides Observed </td>
+    <td bgcolor='#98FB98'> <span class="legend"> $cell </span> </td>
+   </tr>
+   <tr> 
+    <td> No Peptides observed </td>
+    <td bgcolor='#FFFF00'> <span class="legend"> $cell </span> </td>
+   </tr>
+   <tr> 
+    <td> N/A </td>
+    <td > <span class="legend"> $cell </span> </td>
+   </tr>
+  </table>
+  END
+  return $table;
+#   <TR> 
+#    <TD> No peptides observed </TD>
+#    <TD BGCOLOR='#E0FFFF'> <SPAN> $cell </SPAN> </TD>
+#   </TR>
+}
+
+#+
+# Read/process CGI parameters
+#-
+sub process_params {
+  my $params = { null => 'filler' };
+
+  # Standard SBEAMS processing
+  $sbeams->parse_input_parameters( parameters_ref => $params, q => $q );
+
+#for ( keys( %$params ) ){ print "$_ = $params->{$_}<BR>" } 
+
+  # Process "state" parameters
+  $sbeams->processStandardParameters( parameters_ref => $params );
+
+  return $params;
+}
+
+#+
+# Extract wallclock seconds from time diff, append message, and return
+#-
+sub parseTime {
+  my @args = @_;
+  my $time = timestr(timediff( $args[0], $args[1] ));
+  $time =~ /(\d+) wallclock.*/;
+  return "$1 $args[2]";
+}
+
+#+
+# Translate kegg organism to Standard Atlas
+#-
+sub keggOrg2Std {
+  my $korg = shift;
+  return '' unless $korg; 
+  my %k2s = ( hsa => 'Human',
+              dme => 'Drosophila',
+              sce => 'Yeast',
+              bbu => 'BBurgdorferi_B31',
+              mmu => 'Mouse',
+              ssc => 'Pig',
+              eco => 'E Coli',
+              rno => 'Rat',
+              bta => 'Cow',
+              ecb => 'Horse',
+              ptr => 'Chimpanzee',
+              hal => 'Halobacterium',
+              mtu => 'Mybacterium tuberculosis'
+            );
+  return $k2s{$korg} || '';
+}
+
+__DATA__
+
+sub error_redirect {
+  my $msg = shift || '';
+  my $type = shift || 'Error';
+  $sbeams->set_page_message( msg => $msg, type => $type );
+  print $q->redirct( "treatmentList.cgi" );
+  exit;
+}
+

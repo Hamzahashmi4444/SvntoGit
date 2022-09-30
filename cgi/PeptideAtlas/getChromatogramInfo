@@ -1,0 +1,96 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : getChromatogramInfo
+#
+# Description : given SEL_chromatogram_id, return json object
+#
+# Terry Farrah
+#
+###############################################################################
+
+
+###############################################################################
+# Basic SBEAMS setup
+###############################################################################
+use strict;
+use FindBin;
+
+use lib "$FindBin::Bin/../../lib/perl";
+
+
+use File::Basename;
+use Carp;
+
+use vars qw ($sbeams $sbeamsMOD $q $current_contact_id $current_username
+             $PROG_NAME $USAGE %OPTIONS $QUIET $VERBOSE $DEBUG $DATABASE
+             $TABLE_NAME $PROGRAM_FILE_NAME $CATEGORY $DB_TABLE_NAME
+             @MENU_OPTIONS);
+
+use SBEAMS::Connection qw($q);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::Permissions;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::PeptideAtlas::Chromatogram;
+
+$sbeams = new SBEAMS::Connection;
+
+
+###############################################################################
+# Define global variables if any and execute main()
+###############################################################################
+main();
+
+
+###############################################################################
+# Main Program:
+#
+# If $sbeams->Authenticate() succeeds, print header, process the CGI request,
+# print the footer, and end.
+###############################################################################
+sub main {
+  exit unless ($current_username = $sbeams->Authenticate(
+      allow_anonymous_access=>1,
+    ));
+
+  #### Read in the default input parameters
+  my %parameters;
+  my $n_params_found = 
+  $sbeams->parse_input_parameters(q=>$q,parameters_ref=>\%parameters);
+
+  #### Process generic "state" parameters before we start
+  $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+  my $apply_action  = $q->param('apply_action');
+
+  my $json = processRequest(ref_parameters=>\%parameters);
+  if  ($sbeams->output_mode() eq 'html') {
+    my $header = "Content-type:text/x-json\n\n";
+    $json = $header . $json;
+  }
+  print $json;
+
+} # end main
+
+###############################################################################
+# processRequest
+###############################################################################
+sub processRequest {
+
+  #### Process the arguments list
+  my %args = @_;
+  my $ref_parameters = $args{'ref_parameters'}
+    || die "ref_parameters not passed";
+
+  # Create a chromatogram object so we can use its methods
+  my $cgram = new SBEAMS::PeptideAtlas::Chromatogram;
+  $cgram->setSBEAMS($sbeams);
+
+  my ($json_string, $foo) = $cgram->getChromatogramInfo($ref_parameters);
+  return $json_string;
+
+}

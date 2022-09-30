@@ -1,0 +1,2400 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : ShowObservedSpectrum
+#
+# Description : This CGI program displays a single spectrum in PeptideAtlas
+#
+# Based upon the ShowSpectrum.cgi in the Proteomics module by
+# Kerry & Eric Deutsch
+#
+###############################################################################
+
+
+###############################################################################
+# Basic SBEAMS setup
+###############################################################################
+use strict;
+use FindBin;
+
+use lib "$FindBin::Bin/../../lib/perl";
+use vars qw ($q $sbeams $sbeamsMOD $PROG_NAME
+             $current_username $massCalculator $TESTONLY $VERBOSE );
+
+use SBEAMS::Connection qw($q);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::PeptideAtlas::PeptideFragmenter;
+
+use SBEAMS::Proteomics::Tables;
+use SBEAMS::Proteomics::PeptideMassCalculator;
+use SBEAMS::Proteomics::SpecViewer;
+use SBEAMS::PeptideAtlas::ProtInfo;
+
+use File::Basename;
+use Data::Dumper;
+
+#use lib "/net/db/projects/Proteomics/lib";
+use lib "/net/db/projects/Proteomics/devED/lib";
+
+use Proteomics::Spectra::UniversalSpectrumIdentifier;
+use Proteomics::Response qw(processParameters);
+use Proteomics::Config;
+use Proteomics::Spectra::Spectrum;
+use Proteomics::Sequence::Peptide;
+
+use Carp;
+$SIG{__DIE__} = sub { &Carp::confess };
+use CGI::Carp qw (fatalsToBrowser);
+
+#$q = new CGI;
+$sbeams = new SBEAMS::Connection;
+$sbeamsMOD = new SBEAMS::PeptideAtlas;
+$sbeamsMOD->setSBEAMS($sbeams);
+
+$PROG_NAME="ShowObservedSpectrum";
+my $CLASS = $PROG_NAME;
+my $DEBUG = 0;
+my $VERBOSE = 0;       #### Set this to 1 to trace problems in spectrum finding
+
+my $output_mode = 'HTML';
+
+# Allowable neutral losses
+my @neutral_loss_masses = ();
+
+###############################################################################
+# Define global variables if any and execute main()
+###############################################################################
+main();
+
+
+###############################################################################
+# Main Program:
+#
+# If $sbeams->Authenticate() succeeds, print header, process the CGI request,
+# print the footer, and end.
+###############################################################################
+sub main {
+
+  #### Do the SBEAMS authentication and exit if a username is not returned
+  exit unless ($current_username = $sbeams->Authenticate(
+    permitted_work_groups_ref=>['PeptideAtlas_user','PeptideAtlas_admin',
+      'PeptideAtlas_readonly', 'PeptideAtlas_exec'],
+    #connect_read_only=>1,
+    allow_anonymous_access=>1,
+  ));
+
+
+  #### Process certain actions, then print the header, figure and do what the user wants, and print footer
+  processDatabaseActions();
+  $sbeamsMOD->display_page_header();
+  processRequest();
+  $sbeamsMOD->display_page_footer();
+
+  $sbeams->display_page_footer(close_tables=>'YES',
+    separator_bar=>'YES',display_footer=>'NO');
+
+} # end main
+
+
+###############################################################################
+# Process insert/update/delete, if any, then redirect
+###############################################################################
+sub processDatabaseActions {
+    my $redirect = 0;
+    my %parameters;
+
+    $sbeams->parse_input_parameters(q=>$q,parameters_ref=>\%parameters);
+    $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+    my $apply_action  = $q->param('apply_action');
+
+    my $prot_info = new SBEAMS::PeptideAtlas::ProtInfo;
+    $TESTONLY = 0;
+    $prot_info->setSBEAMS($sbeams);
+    $prot_info->setVERBOSE($VERBOSE);
+    $prot_info->setTESTONLY($TESTONLY);
+
+    ## get original value 
+    my $orig_spectrum_annotation_level = 0; 
+    if($parameters{spectrum_annotation_id}){
+      my $spectrum_annotation_id = $parameters{spectrum_annotation_id};
+      my $sql = qq~ 
+        SELECT max(spectrum_annotation_level_id)
+        FROM $TBAT_SPECTRUM_ANNOTATION 
+        WHERE spectrum_annotation_id = $spectrum_annotation_id
+      ~;
+      my @result = $sbeams->selectOneColumn($sql);
+      $orig_spectrum_annotation_level = $result[0];
+    }
+    if ($apply_action eq "UPDATE ANNOTATION") {
+      my %rowdata = (
+	spectrum_annotation_level_id => $parameters{user_spectrum_annotation},
+	comment => $parameters{user_spectrum_commment}
+	  );
+      my $PK = $sbeams->updateOrInsertRow(
+	update => 1,
+	table_name => $TBAT_SPECTRUM_ANNOTATION,
+	rowdata_ref => \%rowdata,
+	PK => 'spectrum_annotation_id',
+	PK_value => $parameters{spectrum_annotation_id},
+	return_PK => 1,
+	add_audit_parameters => 1
+	  );
+
+      if ($PK) { 
+        my $action = '';
+        if ($orig_spectrum_annotation_level <= 2 && $parameters{user_spectrum_annotation} > 2 ){
+	  $action = 'remove';
+        }
+	elsif($orig_spectrum_annotation_level > 2 && $parameters{user_spectrum_annotation} <= 2 ){
+	  $action = 'add';
+        }
+
+        if($action){
+	  $prot_info -> update_protInfo (
+	    spectrum_annotation_id => $parameters{spectrum_annotation_id}, 
+	    atlas_build_id=>$parameters{atlas_build_id},
+	    action => $action);
+        }
+        $sbeams->set_page_message( type => 'Info',  msg => "Your annotation record has been updated." ); 
+      }
+      else {
+	$sbeams->set_page_message( type => 'Error', msg => "ERROR: There was a problem updating your annotation record." );
+      }
+
+      $redirect++;
+    }
+    elsif ($apply_action eq "ADD ANNOTATION") {
+      my %rowdata = (
+	annotator_contact_id => $sbeams->getCurrent_contact_id(),
+	spectrum_identification_id => $parameters{spectrum_identification_id},
+	spectrum_id => $parameters{spectrum_id},
+	identified_peptide_sequence => $parameters{peptide},
+	identified_peptide_charge => $parameters{assumed_charge},
+	spectrum_annotation_level_id => $parameters{user_spectrum_annotation},
+	comment => $parameters{user_spectrum_commment}
+	  );
+
+      my $PK = $sbeams->updateOrInsertRow(
+	insert => 1,
+	table_name => $TBAT_SPECTRUM_ANNOTATION,
+	rowdata_ref => \%rowdata,
+	return_PK => 1,
+	add_audit_parameters => 1
+	  );
+
+      if ($PK) { 
+        if ($parameters{user_spectrum_annotation} > 2 ){
+	  $prot_info -> update_protInfo (
+	    spectrum_annotation_id => $PK,
+	    atlas_build_id=>$parameters{atlas_build_id},
+	    action => 'remove',
+	      );
+        }
+        $sbeams->set_page_message( type => 'Info',  msg => "Your annotation record has been added." );
+      }
+      else {
+	$sbeams->set_page_message( type => 'Error', msg => "ERROR: There was a problem inserting your annotation record." );
+      }
+
+      $redirect++;
+    }
+    elsif ($apply_action eq "DELETE ANNOTATION") {
+      my %rowdata = (
+	record_status => 'D'
+	  );
+
+      my $PK = $sbeams->updateOrInsertRow(
+	update => 1,
+	table_name => $TBAT_SPECTRUM_ANNOTATION,
+	rowdata_ref => \%rowdata,
+	PK => 'spectrum_annotation_id',
+	PK_value => $parameters{spectrum_annotation_id},
+	return_PK => 1,
+	add_audit_parameters => 1
+	  );
+
+      if ($PK) { 
+        ## annotation has low value, need to add back obs
+        if ($orig_spectrum_annotation_level > 2){
+	  $prot_info -> update_protInfo (
+	    spectrum_annotation_id => $PK,
+	    atlas_build_id=>$parameters{atlas_build_id},
+	    action => 'add',
+	      );
+        }
+        $sbeams->set_page_message( type => 'Info',  msg => "Your annotation record has been deleted." ); 
+      }
+      else {
+	$sbeams->set_page_message( type => 'Error', msg => "ERROR: There was a problem deleting your annotation record." );
+      }
+
+      $redirect++;
+    }
+
+    if ($redirect) {
+      $q->delete( 'apply_action' );
+      print $q->redirect( $q->self_url() );
+      exit;
+    }
+
+}
+
+
+###############################################################################
+# Process Request
+###############################################################################
+sub processRequest {
+    #### Define some general variables
+    my ($i,$element,$key,$value,$sql);
+
+    #### Parse general parameters
+    my %parameters;
+    $sbeams->parse_input_parameters(q=>$q,parameters_ref=>\%parameters);
+    $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+    my $apply_action  = $q->param('apply_action');
+
+    #### Determine and set the output_mode
+    $output_mode = uc( $sbeams->output_mode() || scalar $q->param('output_mode') || scalar $q->param('outputMode') || '' );
+    my %allowed_output_modes = ( 'HTML'=>'HTML', 'JSON'=>'JSON', 'TEXT'=>'TEXT', 'TXT'=>'TEXT' );
+    if ( $allowed_output_modes{$output_mode} ) {
+      $output_mode = $allowed_output_modes{$output_mode};
+    } else {
+      $output_mode = 'HTML';
+    }
+
+    my $verbose = $VERBOSE;
+
+    #### If debugging level is 2 or more, print out CGI input information
+    if ( $verbose >= 2 ) {
+      print("<PRE>\n");
+      $sbeams->printDebuggingInfo($q);
+      print("</PRE>\n");
+  }
+
+    #### Define the spectrum array. Need something fancier than this
+    my @spectrum_array;
+    my $charge = $parameters{assumed_charge};
+    my $peptidoform = $parameters{peptide};
+    my $convertedPeptidoformStr = $parameters{peptide};
+    my $scanNumber = 0;
+    my $nativeId = '';
+    my $spectrumProperties = { 'filterLine'=> '', 'fragmentation_type_id'=> '' };
+    my $observedPrecursorMz = 0.0;
+    my $spectrumName = '';
+
+
+    #### Get the HTML to display the tabs
+    my $tabMenu = $sbeamsMOD->getTabMenu(
+      parameters_ref => \%parameters,
+      program_name => 'none',
+	);
+    if ($output_mode eq 'HTML') {
+      print $tabMenu->asHTML();
+    }
+
+
+    #### If a Universal Spectral Identifier is supplied, interpret it
+    my $usiStr = $q->param('USI') || $q->param('usi') || $parameters{usi};
+    if ( $usiStr ) {
+      print("INFO: Received USI string '$usiStr' for processing<BR>\n") if ($verbose);
+      my $result = interpretUSI( usiStr=>$usiStr, outputDestination=>'STDERR' );
+      print("INFO: peptidoform is $result->{peptidoform}<BR>\n") if ($verbose);
+
+      #### If a successful interpretation
+      if ( $result->{status} eq 'OK' ) {
+        $peptidoform = $result->{peptidoform} if ( $result->{peptidoform} );
+        $charge = $result->{charge} if ( $result->{charge} );
+	$scanNumber = $result->{index};
+	$spectrumName = $usiStr;
+
+	#### If it is a PXL identifier
+	if ( $result->{datasetIdentifier} =~ /PXL/ ) {
+	  my $getSpectrumResult = getSpectrumFromProteomeCentral( usiStr=>$usiStr , verbose=>0, debug=>0, quiet=>0, outputDestination=>'STDERR' );
+	  if ( $getSpectrumResult->{status} eq 'OK' ) {
+	    @spectrum_array = @{$getSpectrumResult->{mz}};
+	    $observedPrecursorMz = $getSpectrumResult->{observedPrecursorMz};
+	    $peptidoform = $getSpectrumResult->{peptideStr} unless ( $peptidoform );
+	    $charge = $getSpectrumResult->{charge} unless ( $charge );
+            #print("INFO: Read ".length(@spectrum_array)." peaks\n");
+            #print("INFO: output_mode = $output_mode\n");
+            if ( $output_mode ne 'HTML' ) {
+              writeSpectrum(proxiSpectrum=>$getSpectrumResult->{proxiSpectrum}, output_mode=>$output_mode);
+              return;
+            }
+
+          } else {
+	    print "ERROR: Unable to read peaks.\n";
+            return;
+          }
+
+	#### Else it must be a PXD identifier
+        } else {
+	  my $filePath = $result->{mzMLFilePath};
+	  my $getSpectrumResult = getSpectrumFromMzmlFile( filePath=> $filePath, scanNumber=>$scanNumber, verbose=>$verbose, debug=>0, quiet=>0, outputDestination=>'STDERR' );
+	  if ( $getSpectrumResult->{status} eq 'OK' ) {
+	    @spectrum_array = @{$getSpectrumResult->{mz}};
+	    $observedPrecursorMz = $getSpectrumResult->{observedPrecursorMz};
+	    $nativeId = $getSpectrumResult->{nativeId} if ($getSpectrumResult->{nativeId});
+	    $spectrumProperties->{'filterLine'} = $getSpectrumResult->{'filterLine'} if ($getSpectrumResult->{'filterLine'});
+	    $spectrumProperties->{'fragmentation_type_id'} = $getSpectrumResult->{'fragmentation_type_id'} if ($getSpectrumResult->{'fragmentation_type_id'});
+	    $scanNumber = $getSpectrumResult->{scanNumber} if ($getSpectrumResult->{scanNumber});
+
+	    if ( $charge ) {
+
+              #### If there's already a charge state, then update it, else add it
+              my $attribute_updated = 0;
+              for my $attribute ( @{$getSpectrumResult->{proxiSpectrum}->{attributes}} ) {
+                if ( $attribute->{'accession'} eq "MS:1000041" ) {
+                  $attribute->{'value'} = $charge;
+                  $attribute_updated = 1;
+	        }
+	      }
+              if ( ! $attribute_updated ) {
+                push(@{$getSpectrumResult->{proxiSpectrum}->{attributes}}, { accession=>"MS:1000041", name=>"charge state", value=>$charge } );
+	      }
+
+              my $spectrum_name = "$result->{peptidoform}/$charge";
+              if ( $result->{original_peptidoform} ) {
+               $spectrum_name = "$result->{original_peptidoform}/$charge";
+	      }
+	      push(@{$getSpectrumResult->{proxiSpectrum}->{attributes}}, { accession=>"MS:1003061", name=>"spectrum name", value=>$spectrum_name } );
+	      my $pep = Proteomics::Sequence::Peptide->new(sequenceString=>$peptidoform);
+	      my $unmodified_peptide_sequence = $pep->getSequenceString();
+	      push(@{$getSpectrumResult->{proxiSpectrum}->{attributes}}, { accession=>"MS:1000888", name=>"unmodified peptide sequence", value=>$unmodified_peptide_sequence } );
+	      #push(@{$getSpectrumResult->{proxiSpectrum}->{attributes}}, { accession=>"MS:1009999", name=>"delta mass peptidoform sequence", value=>$pep->{deltaMassSequenceString} } );
+	    }
+
+            if ( $output_mode ne 'HTML' ) {
+              writeSpectrum(proxiSpectrum=>$getSpectrumResult->{proxiSpectrum}, output_mode=>$output_mode);
+              return;
+            }
+
+          } else {
+            if ( $output_mode eq 'HTML' ) {
+	      print "ERROR: Unable to read peaks.\n";
+	    } else {
+              writeResponse(response=>$getSpectrumResult, output_mode=>$output_mode);
+	    }
+	    return;
+          }
+
+        }
+
+
+      #### Otherwise this USI not available
+      } else {
+	writeResponse(response=>$result, output_mode=>$output_mode);
+	if ( $output_mode eq 'HTML' ) {
+          #print("<BR><BR><BR><H1><font color=\"red\">One of the main PeptideAtlas storage disk arrays has failed. The disk array is being rebuilt and all data must be restored from backup tape. This process is expected to be complete by January 24, 2020. Until then, the spectrum you have requested is unavailable. We apologize for the problem.</font></H1><BR><BR>\n");
+	  print("<BR><BR><BR><H1><font color=\"red\">The spectrum you have requested is not found in the expected location. Please report this problem.</font></H1><BR><BR>\n");
+        }
+        return;
+      }
+
+    } 
+
+
+    #### If a spectrum_identification_id was provided (via inside the PeptideAtlas drill-down interface, not via a USI), then try to load it
+    my $proteomics_search_batch_id = -1;
+    if ( $parameters{spectrum_identification_id} ) {
+
+      #### Ensure we have a build_id, too
+      unless ($parameters{'atlas_build_id'}) {
+        print "ERROR: need atlas_build_id parameter.\n";
+        return;
+      }
+
+      #### Get the peak list for this spectrum
+      print("INFO: Attempting to load the spectrum via spectrum_identification_id=$parameters{spectrum_identification_id}<BR>\n") if ($verbose);
+      my %spectrum;
+      ($proteomics_search_batch_id, %spectrum) = get_spectrum(
+        spectrum_identification_id => $parameters{spectrum_identification_id},
+        atlas_build_id => $parameters{atlas_build_id},
+        parameters => \%parameters, verbose=>$verbose,
+      );
+      $nativeId = $spectrum{nativeId};
+      $spectrumProperties->{'filterLine'} = $spectrum{'filterLine'} if ($spectrum{'filterLine'});
+      $spectrumProperties->{'fragmentation_type_id'} = $spectrum{'fragmentation_type_id'} if ($spectrum{'fragmentation_type_id'});
+
+      #### If a spectrum came back, transform it
+      if (%spectrum) {
+	my ($i,$mass,$intensity,$massmin);
+	my ($massmax,$intenmax)=(0,0);
+
+	#### Build a Lorikeet-ready mass,intensity pair array for Lorikeet
+	for ($i=0; $i<$spectrum{n_peaks}; $i++) {
+	  $mass = $spectrum{mz}->[$i];
+	  $intensity = $spectrum{intensities}->[$i];
+	  push(@spectrum_array,[$mass,$intensity]);
+	  $massmin = $mass if ($i == 0);
+	  $massmax = $mass if ($mass > $massmax);
+	  $intenmax = $intensity if ($intensity > $intenmax);
+        }
+      }
+
+      #### Then also find the mass modifications
+      my $sql = qq~
+            SELECT peptide_sequence,peptide_charge,monoisotopic_parent_mz,massdiff,
+                   MPI.modified_peptide_sequence,
+	           S.spectrum_id, S.spectrum_name, S.start_scan, S.fragmentation_type_id
+              FROM $TBAT_SPECTRUM_IDENTIFICATION SI
+              JOIN $TBAT_MODIFIED_PEPTIDE_INSTANCE MPI
+                   ON ( SI.modified_peptide_instance_id = MPI.modified_peptide_instance_id )
+              JOIN $TBAT_PEPTIDE_INSTANCE PI
+                   ON ( MPI.peptide_instance_id = PI.peptide_instance_id )
+             INNER JOIN $TBAT_PEPTIDE P
+                   ON ( PI.peptide_id = P.peptide_id )
+              LEFT JOIN $TBAT_SPECTRUM S
+                   ON ( SI.spectrum_id = S.spectrum_id )
+            WHERE spectrum_identification_id = '$parameters{spectrum_identification_id}'
+      ~;
+
+      my @rows = $sbeams->selectSeveralColumns($sql);
+
+      foreach my $row (@rows) {
+	my ($seq, $chg, $mz, $massdiff, $mod_seq, $spectrum_id, $spectrum_name, $start_scan,$fragmentation_type_id) = @{$row};
+	$peptidoform = $mod_seq unless ( $peptidoform );
+	$charge = $chg;
+	$observedPrecursorMz = int( ( $mz + $massdiff/$chg ) *10000 + 0.5) / 10000;
+	$parameters{'spectrum_id'} = $spectrum_id;
+	$spectrumName = $spectrum_name;
+	$scanNumber = $start_scan;
+	$parameters{'fragmentation_type_id'} = $fragmentation_type_id;
+      }
+
+      #### Try to determine the USI for this spectrum
+      my $sql = qq~
+            SELECT sample_accession,repository_identifiers
+              FROM $TBAT_SPECTRUM_IDENTIFICATION SI
+              JOIN $TBAT_SPECTRUM SPEC
+                   ON ( SI.spectrum_id = SPEC.spectrum_id )
+              JOIN $TBAT_SAMPLE S
+                   ON ( SPEC.sample_id = S.sample_id )
+            WHERE spectrum_identification_id = '$parameters{spectrum_identification_id}'
+      ~;
+
+      @rows = $sbeams->selectSeveralColumns($sql);
+
+      #print "sample_accession \t repository_identifiers<BR>\n";
+      my ($sample_accession,$repository_identifiers);
+      foreach my $row ( @rows ) {
+	#print join("\t",@{$row})."<BR>\n";
+	($sample_accession,$repository_identifiers) = @{$row};
+      }
+
+      if ( $repository_identifiers ) {
+	#print "try to parse $repository_identifiers<BR>\n";
+	my $datasetIdentifier = '';
+	my @identifiers = split("[,;]",$repository_identifiers);
+	foreach my $identifier ( @identifiers ) {
+	  next if ( $identifier =~ /RPXD/ );
+	  if ( $identifier =~ /(PXD\d+)/ ) {
+	    $datasetIdentifier = $1;
+	    my $msrunName = $spectrumName;
+	    $msrunName =~ s/\.\d+\.\d+\.\d+$//;
+
+	    #### If the peptidoform has a mass mod on it, then feed it through a converter to UniMod form
+	    $convertedPeptidoformStr = $peptidoform;
+	    if ( $peptidoform =~ /[\[\{]/ ) {
+	      my $pep = Proteomics::Sequence::Peptide->new(sequenceString=>$peptidoform);
+	      $convertedPeptidoformStr = $pep->{modifiedSequenceString};
+	    }
+
+	    #### Manually create the USI string and store it
+
+	    #### Some testing values for debugging
+	    #$nativeId = "controllerType=0 controllerNumber=1 scan=1872";
+	    #$nativeId = "sample=1 period=1 cycle=1872 experiment=1";
+
+	    #print("<BR><BR><BR>nativeId=$nativeId<BR><BR><BR><BR>\n");
+
+	    #### If there is a nativeId and this is not a Thermo spectrum, try to form a more complex USI
+	    if ( $nativeId && $nativeId !~ /controllerType/ ) {
+	      my $compactNativeId = getCompactNativeId(nativeId=>$nativeId);
+	      if ( $compactNativeId ) {
+		$usiStr = "mzspec:$datasetIdentifier\:$msrunName:nativeId:$compactNativeId:$convertedPeptidoformStr/$charge";
+	      } else {
+		$usiStr = "mzspec:$datasetIdentifier\:$msrunName:ERROR:ERROR:$convertedPeptidoformStr/$charge";
+	      }
+
+	    #### Otherwise if no nativeId or Thermo, just call back to scan numbers
+	    } else {
+	      $usiStr = "mzspec:$datasetIdentifier\:$msrunName:scan:$scanNumber:$convertedPeptidoformStr/$charge";
+	    }
+
+	    #### Artificially store it in the parameters as if it had been passed
+	    $parameters{USI} = $usiStr;
+	  }
+        }
+      }
+    }
+
+
+    #### Show the universal spectrum identifier input box
+    my $htmlBuffer = getUSIInputForm( usi => $usiStr, parameters => \%parameters );
+    if ( $output_mode eq 'HTML' ) {
+      print $htmlBuffer;
+    } else {
+      print "Please specify the USI or PeptideAtlas spectrum_identification_id\n";
+    }
+
+    #### If there's no USI and no spectrum identifier, then just quietly finish after displaying the USI input form
+    unless ( $usiStr || $parameters{'spectrum_identification_id'} ) {
+      if ( $output_mode eq 'HTML' ) {
+        print "Please specify the desired Universal Spectrum Identifier above an click [VIEW]<BR>\n";
+      }
+      return;
+    }
+
+    #### If the user is specifying some alternate interpretations, switch to those
+    # ToDo: should check these values for integrity
+    $peptidoform = $parameters{alt_sequence} if ( $parameters{alt_sequence});
+    $charge = $parameters{'alt_charge'} if ( $parameters{'alt_charge'} );
+
+    #### Display the header
+    if ( $peptidoform ) {
+      my $peptideformString = $convertedPeptidoformStr || $peptidoform;
+      print "<script>document.title = 'PeptideAtlas Spectrum: $peptideformString';</script>";
+      print "<h1>Spectrum for $peptideformString <sup>+$charge</sup></h1>\n";
+      print '<h3 id="annotations_summary" style="display:none">-- No annotations here --</h3>';
+    }
+
+
+
+    ### Run the heuristic PSM evaluator if requested
+    if ($parameters{'eval'}) {
+      print "<b>Heuristic PSM evaluation:</b><br>\n";
+
+      #### Get the expected fragments for this peptide
+      #### returns \@sortedProductIons where each ion is a hash ref
+      #### with mz, series (e.g. y), ordinal, charge, label, label_st,
+      #### bond (dipeptide)
+      #### label has ^2 notation. label_st has ++ notation.
+      my $fragmenter = new SBEAMS::PeptideAtlas::PeptideFragmenter;
+      my $sortedProductIons_aref = $fragmenter->getExpectedFragments(
+				modifiedSequence =>$peptidoform,
+				charge=>$charge,
+      );
+      my @sortedProductIons = @{$sortedProductIons_aref};
+
+
+      #### Get the observed fragments for this spectrum from the spectrast file.
+
+      #### Get the data_location of the spectrum and raw speclib file
+      use SBEAMS::PeptideAtlas::Spectrum;
+      my $spectrum = new SBEAMS::PeptideAtlas::Spectrum;
+      my $data_location = $spectrum->get_data_location( proteomics_search_batch_id => $proteomics_search_batch_id );
+      ($data_location) = $spectrum->groom_data_location( data_location => $data_location );
+
+      #### Get peaks and annotations from raw library text file, if exists
+      use SBEAMS::PeptideAtlas::PSMEvaluator;
+      my $evaluator = new SBEAMS::PeptideAtlas::PSMEvaluator;
+      my @annotated_peaks = $evaluator->get_annotated_peaks_from_speclib(
+				data_location => $data_location,
+				spectrum_name => $parameters{spectrum_name},
+      );
+
+      #### Hand the expected and observed fragments to the heuristic PSM
+      #### evaluator!!!
+      if (scalar @annotated_peaks) {
+	my $evaluation = $evaluator->evaluate_PSM_heuristically(
+	  annotated_peaks_aref => \@annotated_peaks,
+	  sorted_product_ions_aref => $sortedProductIons_aref,
+	  modified_sequence => $peptidoform,
+	  charge => $charge,
+	    );
+	print "$evaluation<br>\n";
+      }
+      else {
+	print "Cannot retrieve annotated peaks; cannot evaluate.<br>\n";
+      }
+    }
+
+    #### Since the Lorikeet spectrum viewer apparently can't display a raw spectrum, fake an identification
+    my $noPeptide = 0;
+    unless ( $peptidoform ) {
+      print "<BR><font color=\"red\">The Lorikeet spectrum viewer is currently unable to display a spectrum without any peptide ion interpretation. A temporary hack while we fix this is to set the sequence to 'A'</font><BR><BR>\n";
+      $peptidoform = "A";
+
+      #### Set the charge to some input or a default of 1
+      if ( $parameters{alt_charge} ) {
+	$charge = $parameters{alt_charge};
+      } elsif ( $parameters{'assumed_charge'} ) {
+	$charge = $parameters{'assumed_charge'};
+      } else {
+	$charge = 1;
+      }
+
+      $noPeptide = 1;
+    }
+
+    #### Serialize the spectrum so that it can be parsed by the spectrum library parser
+    #### This is wasteful. FIXME
+    my @spectrumBuffer;
+    push(@spectrumBuffer,"Name: $peptidoform/$charge");
+    #push(@spectrumBuffer,"PrecursorMZ: $parameters{'precursor_mass'}");
+    push(@spectrumBuffer,"PrecursorMZ: $observedPrecursorMz");
+    push(@spectrumBuffer,"NumPeaks: ".scalar(@spectrum_array));
+    foreach my $peak ( @spectrum_array ) {
+      push(@spectrumBuffer,"$peak->[0]\t$peak->[1]\t?");
+    }
+
+
+    #### Print some debugging information
+    if ( $verbose >= 1 ) {
+      print "<PRE>\n";
+      print "charge=$charge,\n";
+      print "peptidoform = $peptidoform\n";
+      print "precursor_mass    = $parameters{'precursor_mass'}\n";
+      print "PrecursorMZ = $observedPrecursorMz\n";
+      print "nativeId = $nativeId\n";
+      print "filterLine = $spectrumProperties->{'filterLine'}\n" if ($spectrumProperties->{'filterLine'});
+      print "fragmentation_type_id = $spectrumProperties->{'fragmentation_type_id'}\n" if ($spectrumProperties->{'fragmentation_type_id'});
+      print "scanNumber = $scanNumber\n";
+      print "spectrumName = $spectrumName\n";
+      #print Data::Dumper->Dump([\@spectrum_array]);
+      print "</PRE>\n";
+    }
+
+
+    #### Set up the default ion series settings to display
+    my $series;
+    if ( $noPeptide ) {
+      $series = '0,0,0';
+    } elsif ( $charge == 1 ) {
+      $series = '1,0,0';
+    } elsif ( $charge == 2 ) {
+      $series = '1,1,0';
+    } else {
+      $series = '1,1,1';
+    }
+
+    #### Process the spectrum with my own annotator
+    my $spectrum = Proteomics::Spectra::Spectrum->new(peptideIon=>"$peptidoform/$charge");
+    #### Read the spectrum in from the text buffer
+    $spectrum->parseLibrarySpectrumEntry(buffer=>\@spectrumBuffer);
+
+    #### By default we will annotate in high resolution, but if it's ITMS fragmentation, then low resolution
+    my $ppm_flag = 1;
+    if ( $spectrumProperties->{filterLine} && $spectrumProperties->{filterLine} =~ /ITMS/ ) {
+      $ppm_flag = 0;
+    }
+    #### Reannotate it
+    $spectrum->reannotate( ppm => $ppm_flag );
+
+    #### If requested, create a Javascript data buffer for the spectrum with my annotations
+    my $jsSpectrumDataString;
+    if ( $parameters{SAWB_annotation} && $parameters{SAWB_annotation} eq "Reannotated" ) {
+      $jsSpectrumDataString  = $spectrum->display(format=>'Lorikeet');
+      $series = '0,0,0';
+    }
+
+    #### For CID
+    $parameters{'ShowA'} ||= "[$series]";
+    $parameters{'ShowB'} ||= "[$series]";
+    $parameters{'ShowC'} ||= '[0,0,0]';
+    $parameters{'ShowX'} ||= '[0,0,0]';
+    $parameters{'ShowY'} ||= "[$series]";
+    $parameters{'ShowZ'} ||= '[0,0,0]';
+
+    #### For HR IT ETD  and  LR IT ETD, show the c and z ions instead
+    if ($parameters{'fragmentation_type_id'} == 2 || $parameters{'fragmentation_type_id'} == 6) {
+      $parameters{'ShowA'} = '[0,0,0]';
+      $parameters{'ShowB'} = '[0,0,0]';
+      $parameters{'ShowC'} = "[$series]";
+      $parameters{'ShowX'} = '[0,0,0]';
+      $parameters{'ShowY'} = '[0,0,0]';
+      $parameters{'ShowZ'} = "[$series]";
+    }
+
+    #### Create a SpecViewer object and generate a Lorikeet display
+    if ( $peptidoform ) {
+      #### There is a weird Javascript/Lorikeet bug where if the scan begins with a 0, it is interpreted as an octal number! Strip off leading zeros
+      $scanNumber =~ s/^0+//;
+      my $lorikeet = new SBEAMS::Proteomics::SpecViewer;
+      my %lorikeetParameters = (
+          charge            => $charge,
+          modified_sequence => $peptidoform,
+          precursor_mass    => $observedPrecursorMz || 100,
+          scan              => $scanNumber,
+          name              => $spectrumName,
+          a_ions            => $parameters{'ShowA'},
+          b_ions            => $parameters{'ShowB'},
+          c_ions            => $parameters{'ShowC'},
+          x_ions            => $parameters{'ShowX'},
+          y_ions            => $parameters{'ShowY'},
+          z_ions            => $parameters{'ShowZ'},
+          spectrum          => \@spectrum_array,
+          selWinLow         => $parameters{selWinLow},
+          selWinHigh        => $parameters{selWinHigh},
+          ms1scanLabel      => $parameters{ms1scanLabel},
+          ms1peaks          => $parameters{ms1peaks},
+       jsSpectrumDataString => $jsSpectrumDataString
+      );
+      #### If this is an ion trap spectrum, then set low resolution parameters
+      if ( $spectrumProperties->{filterLine} && $spectrumProperties->{filterLine} =~ /ITMS/ ) {
+        $lorikeetParameters{massTolerance} = 0.6;
+        $lorikeetParameters{massErrorUnit} = 'Th';
+        $lorikeetParameters{peakDetect} = 'true';
+      #### Else default to high resolution
+      } else {
+        $lorikeetParameters{massTolerance} = 20;
+        $lorikeetParameters{massErrorUnit} = 'ppm';
+        $lorikeetParameters{peakDetect} = 'false';
+      }
+      print $lorikeet->generateSpectrum(
+        %lorikeetParameters
+      );
+    } else {
+      print "<BR><BR>The Lorikeet spectrum viewer is currently unable to display spectrum without any peptide ion interpretation. A temporary hack while we fix this is to set the sequence to 'PEPTIDE'<BR><BR>\n";
+    }
+
+
+    #### Store the observed spectrum data as a recallable resultset
+    my %dataset;
+    $dataset{data_ref} = \@spectrum_array;
+    $dataset{column_list_ref} = ['m/z','intensity'];
+    my $rs_set_name = "SETME";
+    $sbeams->writeResultSet(resultset_file_ref=>\$rs_set_name,
+      resultset_ref=>\%dataset,
+      file_prefix=>'spec_',
+      query_parameters_ref=>\%parameters
+    );
+
+
+    #### show hyperlinks for downloading the spectrum in various formats
+    print qq~
+        <BR>Download spectrum in Format: 
+        <a href="$CGI_BASE_DIR/GetResultSet.cgi/$rs_set_name.tsv?rs_set_name=$rs_set_name&format=tsv">TSV</a>,
+        <a href="$CGI_BASE_DIR/GetResultSet.cgi/$rs_set_name.xls?rs_set_name=$rs_set_name&format=excel">Excel</a>
+        <BR><BR>
+    ~;
+
+
+    #### write hidden in HTML some important parameters that need to be preserved
+    my $hidden_form_fields = qq~
+        <INPUT TYPE="hidden" NAME="spectrum_identification_id" VALUE="$parameters{spectrum_identification_id}">
+        <INPUT TYPE="hidden" NAME="atlas_build_id" VALUE="$parameters{atlas_build_id}">
+        <INPUT TYPE="hidden" NAME="assumed_charge" VALUE="$parameters{assumed_charge}">
+        <INPUT TYPE="hidden" NAME="peptide" VALUE="$parameters{peptide}">
+        <INPUT TYPE="hidden" NAME="USI" VALUE="$usiStr">
+    ~;
+
+    print &printUserAnnotations(
+			spectrum_id => $parameters{'spectrum_id'},
+			modified_sequence => $peptidoform,
+			charge => $parameters{'assumed_charge'},
+			spectrum_identification_id => $parameters{'spectrum_identification_id'},
+			form_fields => $hidden_form_fields
+    ) if ($parameters{'spectrum_identification_id'});
+
+    #### Display the spectrum analysis workbench
+    spectrumAnalysisWorkbench(
+      parameters => \%parameters,
+      spectrum_array => \@spectrum_array,
+      bufferedSpectrum => \@spectrumBuffer,
+      peptideIon => "$peptidoform/$charge",
+      hidden_form_fields => $hidden_form_fields,
+    );
+
+} # end processRequest
+
+
+###############################################################################
+# spectrumAnalysisWorkbench
+###############################################################################
+sub spectrumAnalysisWorkbench {
+  my %args = @_;
+  my $parameters = $args{parameters};
+  my $peptideIon = $args{peptideIon};
+  my $spectrum_array = $args{spectrum_array};
+  my $bufferedSpectrum = $args{bufferedSpectrum};
+  my $hidden_form_fields = $args{hidden_form_fields};
+
+
+  my ($html, $linkhtml) = $sbeams->make_toggle_section(
+    neutraltext => "Spectrum Analysis Workbench",
+    sticky => 1,
+    name => 'spectrumanalysisworkbench_div',
+    barlink => 1,
+    opendiv => 1,
+    visible => 1,
+    link => '<a name="SAWB">&nbsp;</a>',
+    content => ' ' );
+
+  print $linkhtml.$html;
+
+  #### Display the workbench controls
+  displayWorkbenchControls(
+    parameters => $parameters,
+    hidden_form_fields => $hidden_form_fields,
+  );
+
+  #### Display the spectrum as a text peak list
+  showSpectrumText(
+    parameters => $parameters,
+    spectrumBuffer => $bufferedSpectrum,
+    peptideIon => $peptideIon,
+  );
+
+  print "</div>\n<br><br>\n";
+}
+
+
+###############################################################################
+# displayWorkbenchControls
+###############################################################################
+sub displayWorkbenchControls {
+  my %args = @_;
+  my $parameters = $args{parameters};
+  my $hidden_form_fields = $args{hidden_form_fields};
+
+  my $displayModeControl = buildSelectListControl(
+    name => 'SAWB_DisplayMode',
+    value => $parameters->{SAWB_DisplayMode},
+    default => 'reannotatedSimple',
+    parameters => $parameters,
+    optionList => [
+      'original' => 'Original Spectrum',
+      'reannotatedSimple' => 'Reannotated Spectrum - Simple',
+      'reannotatedDifference' => 'Reannotated difference between alt and comp',
+      'reannotatedFull' => 'Reannotated Spectrum - Full',
+      'Lorikeet' => 'Lorikeet Arrays',
+      'denovo' => 'Interpret spectrum de Novo',
+    ],
+  );
+
+  my $normalizationControl = buildSelectListControl(
+    name => 'SAWB_normalization',
+    value => $parameters->{SAWB_normalization},
+    default => 'peakTo100',
+    parameters => $parameters,
+    optionList => [
+      'none' => 'None',
+      'peakTo100' => 'Normalize peak to 100%',
+    ],
+  );
+
+  my $annotationControl = buildSelectListControl(
+    name => 'SAWB_annotation',
+    value => $parameters->{SAWB_annotation},
+    default => 'Lorikeet',
+    parameters => $parameters,
+    optionList => [
+      'Lorikeet' => 'Lorikeet default annotations',
+      'Reannotated' => 'Reannotated interpretations',
+    ],
+  );
+
+  my $tmp = $parameters->{SAWB_minimumIntensity} || '';
+  my $minimumIntensityFilterControl = qq~<input type="text" name="SAWB_minimumIntensity" length="15" VALUE="$tmp">~;
+
+  #### If not manually set, set the high/low resolution control based on a possible fragmentation_type_id
+  if ( !defined($parameters->{SAWB_resolutionHighLow}) ) {
+    if ( $parameters->{fragmentation_type_id} ) {
+      if ($parameters->{fragmentation_type_id} == 5 || $parameters->{fragmentation_type_id} == 6) {
+	$parameters->{SAWB_resolutionHighLow} = 'low';
+      }
+    }
+  }
+
+  #### Create the high/low resolution control
+  my $resolutionHighLowControl = buildSelectListControl(
+    name => 'SAWB_resolutionHighLow',
+    value => $parameters->{SAWB_resolutionHighLow},
+    default => 'high',
+    parameters => $parameters,
+    optionList => [
+      'high' => 'High',
+      'low' => 'Low',
+    ],
+  );
+
+
+  #### If not manually set, set the fragmentation control based on a possible fragmentation_type_id
+  if ( !defined($parameters->{SAWB_fragmentation}) ) {
+    if ( $parameters->{fragmentation_type_id} ) {
+      if ($parameters->{fragmentation_type_id} == 2 || $parameters->{fragmentation_type_id} == 6) {
+	$parameters->{SAWB_fragmentation} = 'ETD';
+      }
+    }
+  }
+
+  #### Create the fragmentation type control
+  my $fragmentationControl = buildSelectListControl(
+    name => 'SAWB_fragmentation',
+    value => $parameters->{SAWB_fragmentation},
+    default => 'CID',
+    parameters => $parameters,
+    optionList => [
+      'CID' => 'CID',
+      'ETD' => 'ETD',
+    ],
+  );
+
+
+  #### Determine defaults for alternate sequence
+  my $alt_sequence = $parameters->{alt_sequence} || '';
+  my $alt_charge = $parameters->{alt_charge} || $parameters->{assumed_charge} || '2';
+  my $comp_sequence = $parameters->{comp_sequence} || '';
+
+  #### Create the alternate charge control
+  my $alternateChargeControl = buildSelectListControl(
+    name => 'alt_charge',
+    value => $alt_charge,
+    default => '2',
+    parameters => $parameters,
+    optionList => [
+      '1' => '1',
+      '2' => '2',
+      '3' => '3',
+      '4' => '4',
+      '5' => '5',
+    ],
+  );
+
+  print qq~<form method="post" action="$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROG_NAME" style="background:#f3f1e4;border-bottom:1px solid #5e6a71;border-top:1px solid #5e6a71;padding:5px 15px;">
+      $hidden_form_fields
+      Alternate sequence: <INPUT TYPE="text" NAME="alt_sequence" SIZE="40" VALUE="$alt_sequence"></INPUT>
+      Comparison sequence: <INPUT TYPE="text" NAME="comp_sequence" SIZE="40" VALUE="$comp_sequence"></INPUT>
+      $alternateChargeControl<BR>
+      Visual Display: $annotationControl<BR>
+      Text Display: $displayModeControl<BR>
+      Normalization: $normalizationControl
+      Minimum Intensity: $minimumIntensityFilterControl<BR>
+      Resolution: $resolutionHighLowControl &nbsp;&nbsp;&nbsp;
+      Fragmentation: $fragmentationControl
+      <input style='margin-left:400px;' type='submit' value='REFRESH'>
+    </form>
+  ~;
+
+  return;
+
+}
+
+
+###############################################################################
+# buildSelectListControl
+###############################################################################
+sub buildSelectListControl {
+  my $METHOD = 'buildSelectListControl';
+  my %args = @_;
+  my $parameters = $args{parameters} || die("ERROR [buildSelectListControl]: parameters not passed");
+  my $name = $args{name} || die("ERROR [buildSelectListControl]: name not passed");
+  my $value = $args{value} || '';
+  my $default = $args{default} || '';
+  my $optionList = $args{optionList} || die("ERROR [buildSelectListControl]: optionList not passed");
+
+  if ( $default && $value eq '' ) {
+    $value = $default;
+    $parameters->{$name} = $value;
+  }
+
+  my $buffer = qq~<SELECT NAME="$name">\n~;
+
+  my @optionList = @{$optionList};
+  while ( @optionList ) {
+    my $optionKey = shift(@optionList);
+    my $optionPrettyName = shift(@optionList);
+    my $selected = '';
+    $selected = ' SELECTED' if ( $value eq $optionKey );
+    $buffer .= qq~  <OPTION$selected VALUE="$optionKey">$optionPrettyName</OPTION>\n~;
+  }
+
+  $buffer .= qq~</SELECT>\n~;
+
+  return $buffer;
+
+}
+
+
+###############################################################################
+# showSpectrumText
+###############################################################################
+sub showSpectrumText {
+  my %args = @_;
+  my $parameters = $args{parameters};
+  my $peptideIon = $args{'peptideIon'};
+  my $spectrumBuffer = $args{'spectrumBuffer'};
+
+  my $spectrum = Proteomics::Spectra::Spectrum->new(peptideIon=>$peptideIon);
+
+  #### If ETD is specified, then set that fragmenation type to ETD
+  if ($parameters->{SAWB_fragmentation} eq 'ETD') {
+    $spectrum->setFragmentationType('ETD');
+  }
+
+  #print "<PRE>\n";
+  #$spectrum->getCalculatedFragments();
+  #$spectrum->show();
+  #print "</PRE>\n";
+
+  #### Read the spectrum in from the text buffer
+  $spectrum->parseLibrarySpectrumEntry(buffer=>$spectrumBuffer);
+
+  #### If normalization was requested, apply it
+  if ( $parameters->{SAWB_normalization} eq 'none' ) {
+  } elsif ( $parameters->{SAWB_normalization} eq 'peakTo100' ) {
+    $spectrum->normalizeSpectrum(normalizationType=>'maxPeak',newLevel=>100);
+  } else {
+    print "Unrecognized SAWB_normalization '$parameters->{SAWB_normalization}'\n";
+  }
+
+  #### If a minimum filtering threshold was specified, apply it
+  if ( $parameters->{SAWB_minimumIntensity} =~ /^\s*([\d\.\-\+]+)\s*$/ ) {
+    $spectrum->filter( minimumIntensity => $1 );
+  }
+
+  #print "Content-type: text/plain\n\n";
+  print "<PRE>\n";
+
+  #### Set the reannotation resolution
+  my $usePPMTolerance = 1;
+  $usePPMTolerance = 0 if ( $parameters->{SAWB_resolutionHighLow} eq 'low' );
+
+  if ( $parameters->{SAWB_DisplayMode} eq 'original' ) {
+    $spectrum->show(format=>'simple');
+
+  } elsif ( $parameters->{SAWB_DisplayMode} eq 'reannotatedSimple' ) {
+    $spectrum->reannotate( ppm => $usePPMTolerance );
+    $spectrum->show(format=>'simple');
+
+  } elsif ( $parameters->{SAWB_DisplayMode} eq 'reannotatedDifference' ) {
+    $spectrum->reannotate( ppm => $usePPMTolerance, exhaustive=>1 );
+    use Clone 'clone';
+    my $compSpectrum = clone($spectrum);
+    $compSpectrum->setModifiedSequence($parameters->{comp_sequence});
+    $compSpectrum->reannotate( ppm => $usePPMTolerance, exhaustive=>1 );
+    #$spectrum->show(format=>'simple',secondary=>$compSpectrum);
+    #$compSpectrum->show(format=>'simple',secondary=>$compSpectrum);
+    $spectrum->show(format=>'difference',secondary=>$compSpectrum);
+
+
+  } elsif ( $parameters->{SAWB_DisplayMode} eq 'reannotatedFull' ) {
+    $spectrum->reannotate( ppm => $usePPMTolerance );
+    $spectrum->show(format=>'full');
+
+  } elsif ( $parameters->{SAWB_DisplayMode} eq 'Lorikeet' ) {
+    $spectrum->reannotate( ppm => $usePPMTolerance );
+    $spectrum->show(format=>'Lorikeet');
+
+  } elsif ( $parameters->{SAWB_DisplayMode} eq 'denovo' ) {
+    my %deNovoModifications = ( 'C[160]'=>1, 'M[147]'=>1 );
+    #my %deNovoModifications = ( 'C[160]'=>1, 'M[147]'=>1, 'S[167]'=>1, 'T[181]'=>1 );
+    if ( $peptideIon =~ /n\[145\]/ ) {
+      %deNovoModifications = ( 'n[145]'=> 1,'K[272]'=>1,'C[160]'=>1, 'M[147]'=>1 );
+    }
+    if ( $peptideIon =~ /n\[230\]/ ) {
+      %deNovoModifications = ( 'n[230]'=> 1,'K[357]'=>1,'C[160]'=>1, 'M[147]'=>1 );
+    }
+    if ( $peptideIon =~ /n\[43\]/ ) {
+      %deNovoModifications = ( 'n[43]'=> 1,'C[160]'=>1, 'M[147]'=>1 );
+    }
+    $spectrum->readSequenceDeNovo(
+      modifications => \%deNovoModifications,
+      ppm => $usePPMTolerance,
+      #bestTolerance => 15,
+      #stdTolerance => 15,
+    );
+    $spectrum->show(format=>'simple');
+
+  } else {
+    print "Unrecognized SAWB_DisplayMode '$parameters->{SAWB_DisplayMode}'\n";
+    $spectrum->show(format=>'simple');
+  }
+
+  print "\n\n\n";
+  print "</PRE>\n";
+
+  return;
+}
+
+
+###############################################################################
+# get_spectrum
+###############################################################################
+sub get_spectrum
+{
+  my %args = @_;
+
+  my $spectrum_identification_id = $args{'spectrum_identification_id'};
+  my $atlas_build_id = $args{'atlas_build_id'};
+  my $parameters = $args{parameters};
+  my $verbose = $args{verbose} || 0;
+
+  #### Ensure required parameters are provided
+  unless ($spectrum_identification_id) {
+    print "\nERROR: get_spectrum needs spectrum_identification_id. ".
+          "Got atlas_build_id $atlas_build_id.\n\n";
+    return;
+  }
+  unless ($atlas_build_id) {
+    print "\nERROR: get_spectrum needs atlas_build_id. ".
+          "Got spectrum_identification_id $spectrum_identification_id.\n\n";
+    return;
+  }
+
+  my $sql = qq~
+    SELECT proteomics_search_batch_id,spectrum_name,ab.data_path
+      FROM $TBAT_SPECTRUM S
+      JOIN $TBAT_SPECTRUM_IDENTIFICATION SI
+           ON (S.spectrum_id = SI.spectrum_id )
+      JOIN $TBAT_ATLAS_SEARCH_BATCH ASB
+           ON (SI.atlas_search_batch_id = ASB.atlas_search_batch_id )
+      JOIN $TBAT_ATLAS_BUILD_SAMPLE ABS ON (ABS.SAMPLE_ID = ASB.SAMPLE_ID)
+      JOIN $TBAT_ATLAS_BUILD AB ON (AB.ATLAS_BUILD_ID = ABS.ATLAS_BUILD_ID)
+     WHERE SI.spectrum_identification_id = $spectrum_identification_id 
+     AND   ab.atlas_build_id = $atlas_build_id
+  ~;
+
+  my @rows = $sbeams->selectSeveralColumns($sql);
+  unless (@rows) {
+    print "\nERROR: Unable to get search batch information for ".
+      "spectrum_identification_id '$spectrum_identification_id'.\n\n";
+    return;
+  }
+  my $search_batch_id = $rows[0]->[0];
+  my $spectrum_name = $rows[0]->[1];
+  my $build_path = $rows[0]->[2];
+  my $fraction_tag;
+  if ($spectrum_name =~ /^(.+)\.(\d+)\.(\d+)\.\d$/) {
+    $fraction_tag = $1;
+  } else {
+    die("ERROR: Unable to parse fraction name from '$spectrum_name'");
+  }
+
+  print "INFO: search_batch_id = $search_batch_id<BR>\n" if ( $verbose );
+  print "INFO: spectrum_name = $spectrum_name<BR>\n" if ( $verbose );
+  print "INFO: fraction_tag = $fraction_tag<BR>\n" if ( $verbose );
+
+
+  use SBEAMS::PeptideAtlas::Spectrum;
+  my $spectra = new SBEAMS::PeptideAtlas::Spectrum;
+  $spectra->setSBEAMS($sbeams);
+
+  my @mass_intensities = ();
+ 
+  #### Get the data_location of the spectrum
+  my $data_location = $spectra->get_data_location(
+    proteomics_search_batch_id => $search_batch_id,
+  );
+  if ($data_location =~ /.*archive\//){
+    $data_location =~ s/.*archive\///;
+  }
+
+  my $library_idx_file = "/regis/sbeams/archive/$data_location/RAW.specidx";
+  my $comp_idx_file = "/regis/sbeams/archive/$data_location/RAW.compspecidx";
+  #print "Library file=$library_idx_file\n";
+
+  if ( !-e $library_idx_file && !-e $comp_idx_file ) { 
+    $build_path ="/net/db/projects/PeptideAtlas/pipeline/output/$build_path"; 
+    $build_path =~ /.*\/(.*)\/DATA_FILES/;
+    $library_idx_file ="$build_path/$1_all_raw.specidx";
+    $comp_idx_file ="$build_path/$1_all_raw.compspecidx";
+  }
+
+  my %spectrum;
+  my $buffer;
+
+  #### EWD added short circuit to try to use new local methods of finding spectrum
+  ($data_location, $buffer) = $spectra->groom_data_location( data_location => $data_location, history_buffer => '' );
+  print("Trying getSpectrumFromMzmlFile<BR>\n") if ( $verbose);
+  print("data_location=$data_location, fraction_tag=$fraction_tag, spectrum_name=$spectrum_name<BR>\n") if ( $verbose);
+  my $scan_number = 0;
+  if ( $spectrum_name =~ /.+\.(\d+)\.(\d+)\.(\d+)$/ ) {
+    $scan_number = $1;
+  }
+  my $result = getSpectrumFromMzmlFile( filePath => "$data_location/$fraction_tag.mzML", scanNumber => $scan_number );
+  #print Data::Dumper->Dump([$result])."<BR>\n";
+  if ( $result->{nErrors} == 0 ) {
+    $spectrum{mz} = $result->{proxiSpectrum}->{mzs};
+    $spectrum{intensities} = $result->{proxiSpectrum}->{intensities};
+    $spectrum{n_peaks} = scalar(@{$spectrum{mz}});
+    $spectrum{observedPrecursorMz} = $result->{observedPrecursorMz};
+    $spectrum{nativeId} = $result->{nativeId};
+    $spectrum{filterLine} = $result->{filterLine};
+    $spectrum{fragmentation_type_id} = $result->{fragmentation_type_id};
+    #### Silliness to fool later if statements. ugh.
+    @mass_intensities = ( [1,1] );
+  }
+
+  if ( ! @mass_intensities) {
+    print("Trying getSpectrumPeaks_plotmsms<BR>\n") if ( $verbose);
+    @mass_intensities = $spectra->getSpectrumPeaks_plotmsms(
+      proteomics_search_batch_id => $search_batch_id,
+      spectrum_name => $spectrum_name,
+      fraction_tag => $fraction_tag,
+      parameters => $parameters,
+    );
+    print("Length of mass intensitities is " . scalar(@mass_intensities) . "<BR>\n") if ( $verbose);
+  }
+
+  if ( ! @mass_intensities) {
+    print("Trying getSpectrumPeaks<BR>\n") if ( $verbose);
+    @mass_intensities = $spectra->getSpectrumPeaks(
+      proteomics_search_batch_id => $search_batch_id,
+      spectrum_name => $spectrum_name,
+      fraction_tag => $fraction_tag,
+      );
+    print("Length of mass intensitities is " . scalar(@mass_intensities) . "<BR>\n") if ( $verbose);
+  }
+
+  if ( ! @mass_intensities and (-e $library_idx_file || -e $comp_idx_file )) {
+    print("Trying getSpectrumPeaks_Lib<BR>\n") if ( $verbose);
+    @mass_intensities = $spectra->getSpectrumPeaks_Lib(
+    spectrum_name => $spectrum_name,
+    library_idx_file => $library_idx_file,
+   );
+    print("Length of mass intensitities is " . scalar(@mass_intensities) . "<BR>\n") if ( $verbose);
+  }
+
+
+  #### If we still have no spectrum data, then bail out
+  unless (@mass_intensities) {
+    print "\nERROR: Unable to get m/z,intensity pairs for ".
+      "spectrum_identification_id '$spectrum_identification_id'.\n\n";
+    return;
+  }
+
+  #### Extract rows into two arrays of masses and intensities
+  my (@masses,@intensities);
+  for (my $i=0; $i<=$#mass_intensities; $i++) {
+    push(@masses,$mass_intensities[$i]->[0]);
+    push(@intensities,$mass_intensities[$i]->[1]);
+  }
+
+  #### If the spectrum isn't already there, then put the data into hash and return
+  if ( ! $spectrum{mz} ) {
+    $spectrum{n_peaks} = $#mass_intensities + 1;
+    $spectrum{mz} = \@masses;
+    $spectrum{intensities} = \@intensities;
+  }
+
+  # have to return scalar before hash
+  return ($search_batch_id, %spectrum);
+
+}
+
+
+###############################################################################
+# printUserAnnotations
+# get and display user annotations, if any
+###############################################################################
+sub printUserAnnotations {
+    my %args = @_;
+
+    my $buffer;
+    my $total = 0; # this starts as a counter, then becomes a string
+    my $show_form = 1;
+    my $line_sep = "<tr><td colspan='2'><hr></td></tr>";
+
+    my $sql = qq~
+	SELECT SA.spectrum_annotation_id, SA.comment, SA.date_modified,
+	       SA.spectrum_identification_id, SA.identified_peptide_sequence, SA.identified_peptide_charge,
+	       SL.spectrum_annotation_level_id, SL.level_name,
+	       C.first_name, C.last_name,
+	       UL.username
+	  FROM $TBAT_SPECTRUM_ANNOTATION SA
+    INNER JOIN $TBAT_SPECTRUM_ANNOTATION_LEVEL SL
+            ON ( SA.spectrum_annotation_level_id = SL.spectrum_annotation_level_id )
+    INNER JOIN $TB_CONTACT C
+            ON ( annotator_contact_id = C.contact_id )
+    INNER JOIN $TB_USER_LOGIN UL
+            ON ( UL.contact_id = annotator_contact_id )
+	 WHERE spectrum_id = '$args{spectrum_id}'
+	   AND SA.record_status = 'N'
+      ORDER BY SA.date_modified DESC
+        ~;
+
+    my @rows = $sbeams->selectSeveralColumns($sql);
+
+    $buffer = qq~
+	<a name="user_annotations"></a>
+	<table width="100%" class="table_setup">
+	~;
+
+    if (@rows) {
+	foreach my $row (@rows)
+	{
+	    my ($annot_id, $comment, $date, $ident_id, $sequence, $charge, $level_id, $level, $first, $last, $uname) = @{$row};
+	    $total++;
+
+	    if ($args{modified_sequence}.$args{charge} eq $sequence.$charge) {
+		$buffer .= "<tr id='${uname}${annot_id}_annot_tr'><th valign='top'>$level</th><td>$first $last ($date)<br>\n";
+	    }
+	    else {
+		my $link = $q->self_url();
+		$link =~ s/\?.*//;  # clear querystring
+		$link .= "?spectrum_identification_id=$ident_id;peptide=$sequence;assumed_charge=$charge";
+
+		$buffer .= "<tr bgcolor='#dddddd' id='${uname}${annot_id}_annot_tr'><th valign='top'>$level<br /><a href='$link' style='color:red'>$sequence +$charge</a></th><td>$first $last ($date)<br>\n";
+	    }
+
+	    my $disp_comment = $comment;
+	    $disp_comment =~ s|\n|<br>\n|g; # display carriage returns
+	    $buffer .= "$disp_comment\n";
+
+	    if ( ($uname eq $current_username) &&
+		 ($args{modified_sequence}.$args{charge} eq $sequence.$charge) ) {
+		$show_form = 0;
+
+		$buffer .= qq~
+		    <br>
+                    <a style='margin-left:-50px;' href='javascript:showEditForm();'>Edit my annotation</a> | <a href='javascript:confirm_delete();'>Delete</a>
+		    <form id="delete_annotation" method="post" action="$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROG_NAME">
+		    $args{form_fields}
+		    <input type='hidden' name='spectrum_annotation_id' value='$annot_id'>
+   		    <input type='hidden' name='apply_action' value='DELETE ANNOTATION'></form>
+		    ~;
+
+		$buffer .= "</td></tr>\n";
+
+		$buffer .= &printUserAnnotationsForm(
+						     form_type => 'update',
+						     uname => $uname,
+						     default_level_id => $level_id,
+						     default_comment => $comment,
+						     annot_id => $annot_id,
+						     extra_form_fields => $args{form_fields}
+						     );
+	    }
+
+	    $buffer .= "</td></tr>\n$line_sep\n";
+	}
+
+    } else {
+	$buffer .= qq~
+	    <tr><td colspan='2'><h3 style='display:inline;'>There are no user annotations for this spectrum</h3></td></tr>
+	    $line_sep
+	    ~;
+    }
+
+
+    if ($current_username eq 'guest') {
+	my $url = $q->self_url();
+	$url .= '&force_login=yes';
+
+	$buffer .= qq~
+	    <tr><td>&nbsp;</td>
+	    <td><a href='$url'>Log into PeptideAtlas</a> to add an annotation for this spectrum<br /></td></tr>
+	    $line_sep
+	    ~;
+
+    } elsif ($show_form) {
+	$buffer .= "<tr id='${current_username}add_annot_tr'><td valign='top'><a href='javascript:showEditForm();'>[ + ] Add annotation</a></td><td>&nbsp;</td></tr>\n";
+
+	$buffer .= &printUserAnnotationsForm(
+					     form_type => 'add',
+					     uname => $current_username,
+					     spectrum_id => $args{spectrum_id},
+					     extra_form_fields => $args{form_fields}
+					     );
+
+	$buffer .= "</td></tr>\n$line_sep\n";
+    }
+
+    $buffer .= "</table>\n";
+
+    # get average
+    $sql = qq~
+ 	SELECT ROUND(AVG(SL.level_probability)*100,0) AS avg_prob_pct,
+	       COUNT(*)
+	  FROM $TBAT_SPECTRUM_ANNOTATION_LEVEL SL
+    INNER JOIN $TBAT_SPECTRUM_ANNOTATION SA
+            ON ( SA.spectrum_annotation_level_id = SL.spectrum_annotation_level_id )
+	 WHERE spectrum_id = '$args{spectrum_id}'
+	   AND identified_peptide_sequence = '$args{modified_sequence}'
+	   AND identified_peptide_charge = '$args{charge}'
+	   AND SA.record_status = 'N'
+        ~;
+
+    @rows = $sbeams->selectSeveralColumns($sql);
+
+    my ($avg, $num) = @{$rows[0]};
+    if ($total != $num) {
+	$total = "($total total)";
+    } else {
+	$total = '';
+    }
+
+    my $innerHTML;
+
+    if ($num == 1) {
+	$innerHTML = "There is <a href=\"#user_annotations\">one user annotation</a> $total for this spectrum, with a score of <b>$avg%</b>";
+    } elsif ($num > 1) {
+	$innerHTML = "There are <a href=\"#user_annotations\">$num user annotations</a> $total for this spectrum, with an average score of <b>$avg%</b>";
+    }
+
+    $buffer .=<< "EOJS" if $innerHTML;
+<SCRIPT LANGUAGE="JavaScript" TYPE="text/javascript">
+    document.getElementById("annotations_summary").innerHTML = '$innerHTML';
+    document.getElementById("annotations_summary").style.display = 'inline';
+</SCRIPT>
+EOJS
+
+    return scalar $sbeams->make_toggle_section(
+      neutraltext => "User Annotations ($num)",
+      sticky => 1,
+      name => 'userannotations_div',
+      barlink => 1,
+      visible => ($num > 0),
+      content => $buffer );
+}
+
+
+###############################################################################
+# printUserAnnotationsForm
+# get and display user annotations, if any
+###############################################################################
+sub printUserAnnotationsForm {
+    my %args = @_;
+
+    $args{form_type} ||= 'add';
+    $args{uname} ||= 'user_anon';
+    $args{default_level_id} ||= 0;
+    $args{default_comment} ||= '';
+    $args{annot_id} ||= 0;
+    $args{extra_form_fields} ||= '';
+
+    my $trname = $args{uname};
+    $trname .= ($args{form_type} eq 'add') ? 'add' : $args{annot_id};
+
+    my $buffer = qq~
+	<script>
+	<!--
+	function showEditForm() {
+	    document.getElementById('${trname}_annot_tr').style.display = 'none';
+	    document.getElementById('${trname}_form_tr').style.display = 'table-row';
+	}
+        function hideEditForm() {
+	    document.getElementById('${trname}_annot_tr').style.display = 'table-row';
+	    document.getElementById('${trname}_form_tr').style.display = 'none';
+	}
+
+        function confirm_delete() {
+	    var del = confirm("Are you sure you want to delete your comment?");
+	    if (del==true) {
+		document.getElementById("delete_annotation").submit();
+	    }
+	}
+        // -->
+	</script>
+	~;
+
+    # add a hidden <tr> for edit form
+    my $sql = qq~
+	SELECT spectrum_annotation_level_id, level_probability, level_name, level_description
+	FROM $TBAT_SPECTRUM_ANNOTATION_LEVEL
+	WHERE record_status = 'N'
+	ORDER BY sort_order
+	~;
+
+    my @levels = $sbeams->selectSeveralColumns($sql);
+
+    my $select = "<SELECT NAME='user_spectrum_annotation'>\n";
+    foreach my $levrow (@levels)
+    {
+	my ($lev_id, $lev_prob, $lev_name, $lev_desc) = @{$levrow};
+
+	my $sel = ( "$args{default_level_id}" eq "$lev_id" ) ? 'SELECTED' : '';
+	my $desc = $sbeams->escapeXML(value => $lev_desc);
+
+	$select .= "<OPTION TITLE='$desc' VALUE='$lev_id' $sel>$lev_name</OPTION>\n";
+    }
+    $select .= "</SELECT>";
+
+    my $form_action = "ADD";
+    if ($args{form_type} eq 'update') {
+	$form_action = "UPDATE";
+	$args{extra_form_fields} .= "<INPUT TYPE='hidden' NAME='spectrum_annotation_id' VALUE='$args{annot_id}'>";
+
+    } else {
+	$args{extra_form_fields} .= "<INPUT TYPE='hidden' NAME='spectrum_id' VALUE='$args{spectrum_id}'>";
+    }
+
+    $buffer .= qq~
+	<tr style='display:none' id='${trname}_form_tr'>
+	<th valign='top'>
+	<form method="post" action="$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROG_NAME">
+	$args{extra_form_fields}
+	$select</th>
+	<td><textarea rows='6' cols='80' name='user_spectrum_commment'>$args{default_comment}</textarea><br>
+	<div><input type='submit' name='apply_action' value='$form_action ANNOTATION'><a style='margin-left:75px;' class='pa-smg' href='javascript:hideEditForm();'>CANCEL</a></div>
+        </form>
+	~;
+
+    # caller will close the td and tr
+    return $buffer;
+
+}
+
+
+###############################################################################
+# getUSIInputForm
+###############################################################################
+sub getUSIInputForm {
+  my $METHOD = 'getUSIInputForm';
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $DEBUG );
+  my %parameters = @_;
+
+  #### Set up a response object
+  my $response = Proteomics::Response->new();
+
+  #### Process standard parameters
+  my $debug = processParameters( name=>'debug', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$DEBUG, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $verbose = processParameters( name=>'verbose', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$VERBOSE, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $quiet = processParameters( name=>'quiet', required=>0, allowUndef=>0, default=>0, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $outputDestination = processParameters( name=>'outputDestination', required=>0, allowUndef=>0, default=>'STDERR', parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $debug && !$DEBUG );
+
+  #### Process specific parameters
+  my $cgiParameters = processParameters( name=>'parameters', required=>0, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+  my $usi = processParameters( name=>'usi', required=>0, allowUndef=>1, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+
+  #### Die if any unexpected parameters are passed
+  my $unexpectedParameters = '';
+  foreach my $parameter ( keys(%parameters) ) { $unexpectedParameters .= "ERROR: unexpected parameter '$parameter'\n"; }
+  die("CALLING ERROR [$METHOD]: $unexpectedParameters") if ($unexpectedParameters);
+
+  #### Return if there was a problem with the required parameters
+  return $response if ( $response->{errorCode} =~ /MissingParameter/i );
+ 
+  #### If it wasn't passed, check the CGI parameters
+  unless ( $usi ) {
+    $usi = $cgiParameters->{USI} || $cgiParameters->{usi};
+  }
+  $usi = "" unless ( $usi );
+
+  my $buffer = qq~
+       <script>
+       function fillInUSI(input_field) {
+           var exampleUSIs = [
+                 "mzspec:PXD000561:Adult_Urinarybladder_bRP_Elite_71_f14:scan:1872:FSGSSSGADR/2",
+                 "mzspec:PXD000865:00603_F01_P004608_B00F_A00_R1:scan:14453:SSLLDVLAAR/2",
+                 "mzspec:PXD002286:081213-Wittie-Phos-1A:scan:14366:MVC[Carbamidomethyl]S[Phospho]PVTVR/2",
+                 "mzspec:PXD001464:CL_1hRP_rep3:nativeId:1,1,2740,10:Q[Gln->pyro-Glu]IGDALPVSC[Carbamidomethyl]TISASR/2",
+                 "mzspec:PXD002255:ES_XP_Ubi_97H_HCD_349:scan:9617:LAEIYVNSSFYK/2"
+            ];
+         document.USIForm.USI.value = exampleUSIs[Math.floor((Math.random()*exampleUSIs.length))];
+         return;
+       }
+       </script>
+    <form name="USIForm" method="post" action="$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROG_NAME" style="background: #f3f1e4;padding: 5px;border-bottom: 1px solid #5e6a71;border-top:1px solid #5e6a71;">
+    <font size="+1">Universal Spectrum Identifier:</font>&nbsp;&nbsp;&nbsp;<a target="_blank" href="http://psidev.info/usi/">(what's this?)</a>&nbsp;&nbsp;&nbsp;
+          <input type="button" name="example_button" value="example" onClick="fillInUSI(example_button)"><br>
+    <input type="text" name="USI" size="100" value="$usi"></input>
+    <input type='submit' value='VIEW'>
+    </form>
+  ~;
+
+  return $buffer;
+
+}
+
+
+###############################################################################
+# interpretUSI
+###############################################################################
+sub interpretUSI {
+  my $METHOD = 'interpretUSI';
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $DEBUG );
+  my %parameters = @_;
+
+  #### Set up a response object
+  my $response = Proteomics::Response->new();
+
+  #### Process standard parameters
+  my $debug = processParameters( name=>'debug', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$DEBUG, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $verbose = processParameters( name=>'verbose', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$VERBOSE, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $quiet = processParameters( name=>'quiet', required=>0, allowUndef=>0, default=>0, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $outputDestination = processParameters( name=>'outputDestination', required=>0, allowUndef=>0, default=>'STDERR', parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $debug && !$DEBUG );
+
+  #### Process specific parameters
+  my $usiStr = processParameters( parameters=>\%parameters, caller=>$METHOD, name=>'usiStr', required=>1, allowUndef=>0, response=>$response );
+
+  #### Die if any unexpected parameters are passed
+  my $unexpectedParameters = '';
+  foreach my $parameter ( keys(%parameters) ) { $unexpectedParameters .= "ERROR: unexpected parameter '$parameter'\n"; }
+  die("CALLING ERROR [$METHOD]: $unexpectedParameters") if ($unexpectedParameters);
+
+  #### Return if there was a problem with the required parameters
+  return $response if ( $response->{errorCode} =~ /MissingParameter/i );
+ 
+  #### There may be some error messages for info messages coming, so switch to PRE mode
+  #print "Content-type: text/plain\n\n";
+  #print "<PRE>\n";
+  $debug = $VERBOSE;
+
+  #### Clean the string a little
+  $usiStr =~ s/^\s+//;
+  $usiStr =~ s/\s+$//;
+
+  #### Parse the passed USI
+  my $usi = Proteomics::Spectra::UniversalSpectrumIdentifier->new( usi=>$usiStr );
+  #print "<PRE>\n";
+  my $result = $usi->parse( verbose=>$verbose, debug=>$verbose,  outputDestination=>'STDERR' );
+  #print(Data::Dumper->Dump([$result]))."\n";
+  #print "</PRE>\n";
+
+  #### If the USI string was not successfully parsed, then just return
+  if ( $result->{status} ne 'OK' ) {
+    if ( $output_mode eq 'HTML' ) {
+      print "Content-type: text/plain\n\n";
+      print "<PRE>\n";
+      print "Provided identifier=$usiStr\n";
+      $result->show();
+      print "</PRE>\n";
+    }
+    $response->mergeResponse( sourceResponse=>$result, verbose=>0, debug=>0, outputDestination=>$outputDestination );
+    $response->{statusCode} = 400;
+    return $response;
+  }
+
+  my $datasetIdentifier = $usi->{datasetIdentifier};
+  my $msRunName = $usi->{msRunName};
+  my $indexFlag = $usi->{indexFlag};
+  my $index = $usi->{index};
+  my $interpretation = $usi->{interpretation};
+  my $peptidoform = $usi->{peptidoform};
+  my $charge = $usi->{charge};
+
+  #### If the peptidoform has mass mods in it, then convert it to TPP notation
+  if ( $peptidoform =~ /[\[\{\(]/ ) {
+    #print "<PRE>\n";
+    #print "INFO: Peptidoform=$peptidoform\n";
+    my $pep = Proteomics::Sequence::Peptide->new(sequenceString=>$peptidoform);
+    $peptidoform = $pep->{modifiedTPP4SequenceString};
+    #print "</PRE>\n";
+  }
+
+
+  #### If this is a PXL, just return the interpreted USI
+  if ( $datasetIdentifier =~ /PXL/ ) {
+    $response->{datasetIdentifier} = $datasetIdentifier;
+    $response->{msRunName} = $msRunName;
+    $response->{index} = $index;
+    $response->{indexFlag} = $indexFlag;
+    $response->{interpretation} = $interpretation;
+    $response->{peptidoform} = $peptidoform;
+    $response->{charge} = $charge;
+    return($response);
+  }
+
+
+  #### Otherwise it must be a PXD, try to find it
+  #print "datasetIdentifier=$datasetIdentifier\n";
+  my $sql = qq~ 
+    SELECT SAMPLE_ID,
+           SAMPLE_ACCESSION,
+           S.SEARCH_BATCH_ID,
+           IS_PUBLIC,
+           REPOSITORY_IDENTIFIERS,
+           DATA_LOCATION
+      FROM $TBAT_SAMPLE S
+      JOIN $TBPR_SEARCH_BATCH SB ON ( SB.search_batch_id = S.search_batch_id )
+     WHERE repository_identifiers LIKE '\%$usi->{datasetIdentifier}\%'
+    ~;
+  my @rows = $sbeams->selectSeveralColumns($sql);
+  my $nRows = scalar(@rows);
+  if ($nRows == 0){
+    my $sql = qq~
+      SELECT DATASET_ID,
+             NULL,
+             NULL,
+             'Y', 
+             DATASET_IDENTIFIER,
+             LOCAL_DATA_LOCATION
+      FROM $TBAT_PUBLIC_DATA_REPOSITORY
+      WHERE DATASET_IDENTIFIER LIKE '\%$usi->{datasetIdentifier}\%'
+      AND LOCAL_DATA_LOCATION like '%sbeams%'
+    ~;
+    @rows = $sbeams->selectSeveralColumns($sql);
+    $nRows = scalar(@rows);
+  }
+
+  my $foundFile = '';
+  my $nFoundFiles = 0;
+  my $foundFiles = [];
+
+  #### Turn quiet mode on, so that problems are not immediately spit out to STDOUT
+  $quiet = 1;
+
+  #### If no rows returned, then we don't have this dataset
+  if ( $nRows == 0 ) {
+
+    #### Make one more effort to find the dataset in a manual override file
+    print "INFO: found $nRows sample(s) matching dataset '$usi->{datasetIdentifier}', but trying the supplemental mapping lookup<BR>\n" if ( $debug );
+    if ( open(INFILE,"/regis/sbeams/archive/supplemental_PXD_mapping.tsv") ) {
+      while ( my $line = <INFILE> ) {
+	chomp($line);
+	my @columns = split("\t",$line);
+	if ( $columns[0] eq $datasetIdentifier ) {
+	  @rows = ( [ 0,0,0,0,0,$columns[1] ] );
+	  $nRows = 1;
+	  print "INFO: Found in supplemental at $columns[1]<BR>\n" if ( $debug );
+
+        }
+      }
+      close(INFILE);
+    }
+
+    if ( $nRows == 0 ) {
+      $response->logEvent( status=>'ERROR', level=>'ERROR', errorCode=>'DatasetNotHere', statusCode=>404, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+         message=>"Dataset '$datasetIdentifier' is not stored here at PeptideAtlas.");
+      return $response;
+    }
+  }
+
+  #### Otherwise we seem to have it, so try to determine its location
+  if ( $nRows > 0 ) {
+    print "INFO: found $nRows sample(s) matching dataset '$usi->{datasetIdentifier}'<BR>\n" if ( $debug );
+
+    my $foundHere = 0;
+
+    foreach my $row ( @rows ) {
+
+      #### If we already found something in a previous iteration, then finish
+      last if ( $foundHere );
+
+      my ($sample_id,$sample_accession,$search_batch_id,$is_public,$repository_identifiers,$data_location) = @{$row};
+      print("INFO: data_location is $data_location<BR>\n") if ( $debug );
+
+      #### If this is a relative path, then try some prefixes
+      my @possible_prefixes = ( '/proteomics/peptideatlas/archive', '/regis/sbeams/archive' );
+      for my $possible_prefix ( @possible_prefixes ) {
+        print("INFO: data_location is a relative path, trying prefix $possible_prefix<BR>\n") if ( $debug );
+        if ( -d "$possible_prefix/$data_location" ) {
+          $data_location = "$possible_prefix/$data_location";
+        }
+      }
+
+      #### Is this a directory?
+      unless ( -d $data_location ) {
+        $response->logEvent( status=>'ERROR', level=>'ERROR', errorCode=>'InvalidDataLocation', statusCode=>500, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+          message=>"Although the dataset '$datasetIdentifier' was found, the internal data location appears to be invalid. This needs to be fixed. Please report this error. Looking for data location '$data_location'");
+	return($response)
+      }
+
+      #### Set some other places to look
+      my @locations = ( "$data_location/data", "$data_location/../data", "$data_location", "$data_location/.." );
+
+      #### If the MSRun name has a suffix of .mzML, strip that
+      $msRunName =~ s/\.mzML$//;
+
+      #### Loop over the various places to find it
+      my $iLocation = 0;
+      foreach my $location ( @locations ) {
+
+	#### If we already found this one, then finish
+	last if ( $foundHere );
+
+        #### Try to find the mzML files here
+        print("INFO: Looking for $location/$msRunName.*mzML*<BR>") if ( $debug );
+        my @files = glob("$location/$msRunName.*mzML*");
+	if ( scalar(@files) > 0 ) {
+	  print("INFO: Found here<BR>") if ( $debug );
+	  foreach my $file ( @files ) {
+	    if ( $file =~ /mzML/ ) {
+	      print(" - Adding $file<BR>") if ( $debug );
+	      $nFoundFiles++;
+	      $foundFile = $file;
+              $foundHere = 1;
+	      push(@{$foundFiles},[$iLocation,$foundFile]);
+            }
+          }
+	  print("INFO: nFoundfiles=$nFoundFiles<BR>") if ( $debug );
+        }
+        $iLocation++;
+      }
+
+      #### If that all fails (as sometimes happens with a supplemental mapping) try a `find`
+      if ( $nFoundFiles == 0 ) {
+        print("INFO: Did not find what we are looking for. Try a find in $data_location<BR>") if ( $debug );
+	my @files = `find $data_location -name '$msRunName.*mzML*'`;
+	foreach my $file ( @files ) {
+	  chomp($file);
+	  print(" - Adding $file<BR>\n") if ( $debug );
+	  $nFoundFiles++;
+	  $foundFile = $file;
+	  $foundHere = 1;
+	  push(@{$foundFiles},[$iLocation,$foundFile]);
+        }
+      }
+
+    }
+  }
+
+  print("INFO: nFoundfiles=$nFoundFiles<BR>") if ( $debug );
+
+  #### If no files were found, this must be a bad MS Run name
+  if ( $nFoundFiles == 0 ) {
+    $response->logEvent( status=>'ERROR', level=>'ERROR', errorCode=>'MsRunNotFound', statusCode=>400, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+      message=>"Although the dataset '$datasetIdentifier' was found, no mzML file root '$msRunName' was found");
+    return $response;
+
+  #### If there are multiple files found, this is a challenge
+  } elsif ( $nFoundFiles > 1 ) {
+    print("INFO: We found multiple files here. How will be decide which one to use?<BR>\n") if ( $debug );
+    $nFoundFiles = 0;
+    my $nNoFragFiles = 0;
+    my $foundNoFragFile = '';
+    for my $level ( (0,1,2,3,4) ) {
+      foreach my $file ( @{$foundFiles} ) {
+        print("  - $file->[0] - $file->[1]<BR>\n") if ( $debug );
+        if ( $file->[0] == $level ) {
+	  $nFoundFiles++;
+          $foundFile = $file->[1];
+	  if ( $foundFile !~ /ITCID/ && $foundFile !~ /HCD/ ) {
+	    $nNoFragFiles++;
+	    $foundNoFragFile = $foundFile;
+	  }
+        }
+      }
+      #### If we only found 1 file at this level, go with that
+      if ( $nFoundFiles == 1 ) {
+        print("INFO: We found only one file a level $level so go with that<BR>\n") if ( $debug );
+        last;
+      } elsif ( $nFoundFiles > 1 ) {
+	if ( $nNoFragFiles == 1 ) {
+          print("INFO: We several files at level $level but only one without ITCID or HCD in the path, so hope for that one.<BR>\n") if ( $debug );
+	  $nFoundFiles = 1;
+	  $foundFile = $foundNoFragFile;
+          last;
+        } else {
+          #$response->logEvent( status=>'ERROR', level=>'ERROR', errorCode=>'FoundMultipleMatchingMsRuns', statusCode=>500, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+          #  message=>"Under dataset '$datasetIdentifier', multiple mzML files with file root '$msRunName' were found. This cannot be properly handled yet");
+          #return $response;
+          print("INFO: We several files at level $level so we'll just pick one and hope for the best<BR>\n") if ( $debug );
+	  $nFoundFiles = 1;
+	  #$foundFile = $foundNoFragFile;
+          last;
+        }
+      }
+    }
+  }
+
+  #### If we found just one file, let's go with that
+  if ( $nFoundFiles == 1 ) {
+    print "INFO: Found data file for this MS run: $foundFile<BR>\n" if ( $debug );
+    $response->{datasetIdentifier} = $datasetIdentifier;
+    $response->{mzMLFilePath} = $foundFile;
+    $response->{msRunName} = $msRunName;
+    $response->{index} = $index;
+    $response->{indexFlag} = $indexFlag;
+    $response->{interpretation} = $interpretation;
+    $response->{peptidoform} = $peptidoform;
+    $response->{original_peptidoform} = $usi->{peptidoform};
+    $response->{charge} = $charge;
+  }
+
+  #print "</PRE>\n";
+  return $response;
+}
+
+
+###############################################################################
+# getSpectrumFromMzmlFile
+###############################################################################
+sub getSpectrumFromMzmlFile {
+  my $METHOD = 'getSpectrumFromMzmlFile';
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $DEBUG );
+  my %parameters = @_;
+
+  #### Set up a response object
+  my $response = Proteomics::Response->new();
+
+  #### Process standard parameters
+  my $debug = processParameters( name=>'debug', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$DEBUG, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $verbose = processParameters( name=>'verbose', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$VERBOSE, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $quiet = processParameters( name=>'quiet', required=>0, allowUndef=>0, default=>0, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $outputDestination = processParameters( name=>'outputDestination', required=>0, allowUndef=>0, default=>'STDERR', parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $debug && !$DEBUG );
+
+  #$verbose = 1;
+  #print("Forcing verbose=1<BR>\n");
+
+  #### Process specific parameters
+  my $filePath = processParameters( name=>'filePath', required=>1, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+  my $scanNumber = processParameters( name=>'scanNumber', required=>1, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+
+  #### Die if any unexpected parameters are passed
+  my $unexpectedParameters = '';
+  foreach my $parameter ( keys(%parameters) ) { $unexpectedParameters .= "ERROR: unexpected parameter '$parameter'\n"; }
+  die("CALLING ERROR [$METHOD]: $unexpectedParameters") if ($unexpectedParameters);
+
+  #### Return if there was a problem with the required parameters
+  return $response if ( $response->{errorCode} =~ /MissingParameter/i );
+ 
+  #### Check to make sure the file exists
+  my $eol = "<BR>\n";
+  unless ( -e $filePath ) {
+    print "Did not find the expected file '$filePath'$eol" if ($verbose);
+    my $found = 0;
+    use File::Basename;
+    my ($file,$path) = fileparse($filePath);
+    print "file=$file$eol" if ($verbose);
+    print "path=$path$eol" if ($verbose);
+
+    #### If not, try it with a .gz at the end
+    if ( ! $found ) {
+      my $altFilePath = "$filePath.gz";
+      print "Trying alternate file '$altFilePath'$eol" if ($verbose);
+      if ( -e "$altFilePath" ) {
+	$filePath = $altFilePath;
+	print "Found '$altFilePath'$eol" if ($verbose);
+	$found = 1;
+      }
+    }
+
+    #### If still not, try in a parallel data/ directory
+    if ( ! $found ) {
+      my $altFilePath = "$path/../data/$file";
+      print "Trying alternate file '$altFilePath'$eol" if ($verbose);
+      if ( -e "$altFilePath" ) {
+	$filePath = $altFilePath;
+	print "Found '$altFilePath'$eol" if ($verbose);
+	$found = 1;
+      }
+    }
+
+    #### If still not, try in a parallel data/ directory and with a .gz at the end
+    if ( ! $found ) {
+      my $altFilePath = "$path/../data/$file.gz";
+      print "Trying alternate file '$altFilePath'$eol" if ($verbose);
+      if ( -e "$altFilePath" ) {
+	$filePath = $altFilePath;
+	print "Found '$altFilePath'$eol" if ($verbose);
+	$found = 1;
+      }
+    }
+
+    #### If still not, admit defeat
+    if ( ! $found ) {
+      $response->logEvent( level=>'ERROR', errorCode=>'MsRunFileNotFound', statusCode=>400, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+        message=>"Specified filePath '$filePath' is not a file");
+      return $response;
+    }
+  }
+
+  #### If the scanNumber has a comma, assume it is a nativeId and try to translate it
+  if ( $scanNumber =~ /,/ ) {
+    my $mappingFile = $filePath;
+    $mappingFile =~ s/\.gz$//;
+    $mappingFile =~ s/mzML$//;
+    $mappingFile .= 'txt';
+    print("INFO: Checking for nativeId mapping file '$mappingFile'<BR>\n") if ($verbose);
+    if ( -e $mappingFile ) {
+      if ( open(INFILE,$mappingFile) ) {
+	print("INFO: Reading nativeId mapping file '$mappingFile'<BR>\n") if ($verbose);
+	my $iLine = 0;
+	while ( my $line = <INFILE> ) {
+	  chomp($line);
+	  my @columns = split("\t",$line);
+	  my $compactNativeId=$columns[3];
+	  $compactNativeId =~ s/\s+/,/g;
+	  $compactNativeId =~ s/[A-Za-z=]+//g;
+	  if ( $compactNativeId eq $scanNumber ) {
+	    $scanNumber = $columns[0];
+	    print("INFO: Found scanNumber $scanNumber for compactNativeId '$compactNativeId'<BR>\n") if ($verbose);
+	    last;
+	  }
+	  #print("INFO: Reading compactNativeId '$compactNativeId'<BR>\n") if ($verbose && $columns[3] =~ /1475/);
+	  $iLine++;
+        }
+      }
+    }
+  }
+
+
+  #### Create a virtual filename to fetch the spectrum
+  #### Note that we have to use an EL7 compiled version while the server is still on EL7
+  my $filename = "/proteomics/sw/tpp-6.0.0/bin/readmzXML $filePath $scanNumber |";
+  # Switch temporarily to Luis's compiled version
+  #my $filename = "/proteomics/lmendoza/sw/tpp/bin/readmzXML $filePath $scanNumber |";
+  print "Fetch command: $filename\n" if ($verbose);
+
+  #### Try to open the spectrum for reading
+  unless (open(DTAFILE,$filename)) {
+    $response->logEvent( status=>'ERROR', level=>'ERROR', errorCode=>'MsRunFileNotReadable', statusCode=>500, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+      message=>"Specified filePath '$filePath' exists, but cannot be read");
+    return $response;
+  }
+
+  #### Read the spectrum data
+  my @mz_intensities;
+  my $observedPrecursorMz = 0;
+  my $charge = 0;
+  my $nativeId = '';
+  my $filterLine = '';
+  while (my $line = <DTAFILE>) {
+    $line =~ s/[\r\n]//g;
+    print "$line<BR>\n" if ($verbose);
+
+    #### Extract the precursor mz and charge information from that line
+    if ( $line =~ /precursorMZ: ([\d\.]+)/ ) {
+      $observedPrecursorMz = $1;
+      next;
+    }
+    if ( $line =~ /precursorZ: ([\d]+)/ ) {
+      $charge = $1;
+      next;
+    }
+
+    if ( $line =~ /nativeId:\s*(.+)/ ) {
+      $nativeId = $1;
+      next;
+    }
+
+    if ( $line =~ /filterLine:\s*(.+)/ ) {
+      $filterLine = $1;
+      next;
+    }
+
+    #### Skip if this isn't a mass intensity line
+    next if ($line !~ /mass.*inten/);
+
+    #### Extract and store mass intensity information
+    $line =~ /mass\s+(\S+)\s+inten\s+(\S+)/;
+    my $mz = $1 * 1.0;
+    my $intensity = $2 * 1.0;
+    push(@mz_intensities,[$mz, $intensity]);
+  }
+  close(DTAFILE);
+
+  #### If there were no values, print diagnostics and return
+  if ( scalar @mz_intensities == 0 ) {
+    $response->logEvent( status=>'ERROR', level=>'ERROR', errorCode=>'ScanNotFound', statusCode=>404, verbose=>$verbose, debug=>$debug, quiet=>$quiet,
+      message=>"No peaks returned from extraction attempt of scan $scanNumber from file '$filePath'");
+    return $response;
+   }
+
+  #### Return result
+  $response->logEvent( level=>'INFO', minimumVerbosity=>1, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+    message=>scalar(@mz_intensities)." mass-inten pairs read") if ($verbose);
+
+  $response->{mz} = \@mz_intensities;
+  $response->{observedPrecursorMz} = $observedPrecursorMz;
+  $response->{nativeId} = $nativeId;
+  $response->{filterLine} = $filterLine;
+  $response->{scanNumber} = $scanNumber;
+
+  #### Build a prototype PROXI spectrum
+  my $proxiSpectrum = {};
+  $proxiSpectrum->{attributes} = [];
+  push(@{$proxiSpectrum->{attributes}}, { accession=>"MS:1008025", name=>"scan number", value=>$scanNumber } );
+  push(@{$proxiSpectrum->{attributes}}, { accession=>"MS:1000827", name=>"isolation window target m/z", value=>$observedPrecursorMz } );
+  push(@{$proxiSpectrum->{attributes}}, { accession=>"MS:1000041", name=>"charge state", value=>$charge } ) if ( $charge );
+
+  my @mzs;
+  my @intensities;
+  foreach my $peak ( @mz_intensities ) {
+    push(@mzs,$peak->[0]);
+    push(@intensities,$peak->[1]);
+  }
+  $proxiSpectrum->{mzs} = \@mzs;
+  $proxiSpectrum->{intensities} = \@intensities;
+  $response->{proxiSpectrum} = $proxiSpectrum;
+
+  return $response;
+
+} # end getSpectrumFromMzmlFile
+
+
+###############################################################################
+# getSpectrumFromProteomeCentral
+###############################################################################
+sub getSpectrumFromProteomeCentral {
+  my $METHOD = 'getSpectrumFromProteomeCentral';
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $DEBUG );
+  my %parameters = @_;
+
+  #### Set up a response object
+  my $response = Proteomics::Response->new();
+
+  #### Process standard parameters
+  my $debug = processParameters( name=>'debug', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$DEBUG, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $verbose = processParameters( name=>'verbose', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$VERBOSE, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $quiet = processParameters( name=>'quiet', required=>0, allowUndef=>0, default=>0, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $outputDestination = processParameters( name=>'outputDestination', required=>0, allowUndef=>0, default=>'STDERR', parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $debug && !$DEBUG );
+
+  #$verbose = 1;
+
+  #### Process specific parameters
+  my $usiStr = processParameters( name=>'usiStr', required=>1, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+
+  #### Die if any unexpected parameters are passed
+  my $unexpectedParameters = '';
+  foreach my $parameter ( keys(%parameters) ) { $unexpectedParameters .= "ERROR: unexpected parameter '$parameter'\n"; }
+  die("CALLING ERROR [$METHOD]: $unexpectedParameters") if ($unexpectedParameters);
+
+  #### Return if there was a problem with the required parameters
+  return $response if ( $response->{errorCode} =~ /MissingParameter/i );
+ 
+  #### Try to fetch from ProteomeCentral
+  use HTTP::Request;
+  use LWP::UserAgent;
+  use JSON::Parse;
+
+  #### Read the spectrum data
+  my @mz_intensities;
+  my $observedPrecursorMz = 0;
+  my $peptideStr = "";
+  my $charge = 0;
+
+  my $url = "http://proteomecentral.proteomexchange.org/cgi/spectra?output_format=json&usi=$usiStr";
+  my $request = HTTP::Request->new( 'GET', $url );
+  $request->header( 'Content-Type' => 'application/json' );
+  my $lwp = LWP::UserAgent->new;
+  my $lwp_response = $lwp->request( $request );
+  if ( $lwp_response->is_success() ) {
+    my $proxiSpectrum = JSON::Parse::parse_json($lwp_response->content());
+    $response->{proxiSpectrum} = $proxiSpectrum;
+
+    #### Extract the precursor mz
+    if ( $proxiSpectrum->{'attributes'} ) {
+      my @attributes = @{$proxiSpectrum->{'attributes'}};
+      foreach my $attribute (@attributes) {
+        if ( $attribute->{accession} eq "MS:1000744" ) {  # selected ion m/z
+	  $observedPrecursorMz = $attribute->{value};
+        }
+        if ( $attribute->{accession} eq "MS:1000041" ) {  # charge state
+	  $charge = $attribute->{value};
+        }
+        if ( $attribute->{accession} eq "MS:1000888" ) {  # unmodified peptide sequence
+	  $peptideStr = $attribute->{value};
+        }
+      }
+    }
+
+    #### Extract the spectra data
+    if ( $proxiSpectrum->{'mzs'} ) {
+      my @peaks = @{$proxiSpectrum->{'mzs'}};
+      my $counter = 0;
+      foreach my $peak (@peaks) {
+        $mz_intensities[$counter] = [ $peak ];
+	$counter++;
+      }
+    }
+
+    #### Extract the spectra data
+    if ( $proxiSpectrum->{'intensities'} ) {
+      my @peaks = @{$proxiSpectrum->{'intensities'}};
+      my $counter = 0;
+      foreach my $peak (@peaks) {
+        $mz_intensities[$counter][1] = $peak;
+	$counter++;
+      }
+    }
+
+  } else {
+    print("ERROR: " . $lwp_response->status_line());
+  }
+
+  #### If there were no values, print diagnostics and return
+  unless (@mz_intensities) {
+    $response->logEvent( level=>'ERROR', errorCode=>'NoPeaksRead', statusCode=>500, verbose=>$verbose, debug=>$debug, quiet=>$quiet,
+      message=>"No peaks returned from USI $usiStr'");
+    return $response;
+ }
+
+  #### Return result
+  $response->logEvent( level=>'INFO', minimumVerbosity=>1, verbose=>$verbose, debug=>$debug, quiet=>$quiet, outputDestination=>$outputDestination, 
+    message=>scalar(@mz_intensities)." mass-inten pairs read");
+
+  $response->{mz} = \@mz_intensities;
+  $response->{observedPrecursorMz} = $observedPrecursorMz;
+  $response->{peptideStr} = $peptideStr;
+  $response->{charge} = $charge;
+  return $response;
+
+} # end getSpectrumFromProteomeCentral
+
+
+###############################################################################
+# writeSpectrum
+###############################################################################
+sub writeSpectrum {
+  my $METHOD = 'writeSpectrum';
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $DEBUG );
+  my %parameters = @_;
+
+  #### Set up a response object
+  my $response = Proteomics::Response->new();
+
+  #### Process standard parameters
+  my $debug = processParameters( name=>'debug', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$DEBUG, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $verbose = processParameters( name=>'verbose', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$VERBOSE, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $quiet = processParameters( name=>'quiet', required=>0, allowUndef=>0, default=>0, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $outputDestination = processParameters( name=>'outputDestination', required=>0, allowUndef=>0, default=>'STDERR', parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $debug && !$DEBUG );
+
+  #### Process specific parameters
+  my $proxiSpectrum = processParameters( name=>'proxiSpectrum', required=>1, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+  my $output_mode = processParameters( name=>'output_mode', required=>1, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+
+  #### Die if any unexpected parameters are passed
+  my $unexpectedParameters = '';
+  foreach my $parameter ( keys(%parameters) ) { $unexpectedParameters .= "ERROR: unexpected parameter '$parameter'\n"; }
+  die("CALLING ERROR [$METHOD]: $unexpectedParameters") if ($unexpectedParameters);
+
+  #### Return if there was a problem with the required parameters
+  return $response if ( $response->{errorCode} =~ /MissingParameter/i );
+ 
+  if ( $output_mode eq 'JSON' ) {
+    use JSON;
+    print("Access-Control-Allow-Origin: *\n");
+    print("Content-type: application/json\n\n");
+    print(encode_json($proxiSpectrum));
+
+  } elsif ( $output_mode eq 'TEXT' ) {
+    print("Content-type: text/plain\n\n");
+    print(encode_json($proxiSpectrum));
+
+  } elsif ( $output_mode eq 'TSV' || $output_mode eq 'CSV' ) {
+    print("Content-type: text/plain\n\n");
+    print("Output mode $output_mode not yet supported\n");
+
+  } else {
+    print("Content-type: text/plain\n\n");
+    print("Output mode $output_mode not yet supported\n");
+  }
+
+  return;
+
+} # end writeSpectrum
+
+
+###############################################################################
+# writeResponse
+###############################################################################
+sub writeResponse {
+  my $METHOD = 'writeResponse';
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $DEBUG );
+  my %parameters = @_;
+
+  #### Set up a response object
+  my $response = Proteomics::Response->new();
+
+  #### Process standard parameters
+  my $debug = processParameters( name=>'debug', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$DEBUG, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $verbose = processParameters( name=>'verbose', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$VERBOSE, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $quiet = processParameters( name=>'quiet', required=>0, allowUndef=>0, default=>0, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $outputDestination = processParameters( name=>'outputDestination', required=>0, allowUndef=>0, default=>'STDERR', parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $debug && !$DEBUG );
+
+  #### Process specific parameters
+  my $error_response = processParameters( name=>'response', required=>1, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+  my $output_mode = processParameters( name=>'output_mode', required=>1, allowUndef=>1, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+
+  #### Die if any unexpected parameters are passed
+  my $unexpectedParameters = '';
+  foreach my $parameter ( keys(%parameters) ) { $unexpectedParameters .= "ERROR: unexpected parameter '$parameter'\n"; }
+  die("CALLING ERROR [$METHOD]: $unexpectedParameters") if ($unexpectedParameters);
+
+  #### Return if there was a problem with the required parameters
+  return $response if ( $response->{errorCode} =~ /MissingParameter/i );
+
+  #print("Content-type: text/plain\n\n");
+  #print Data::Dumper->Dump([$error_response]);
+  #return;
+
+  my $statusCode = 200;
+  $statusCode = 400 if ( $error_response->{errorCode} ne 'OK' );
+  $statusCode = $error_response->{statusCode} if ( $error_response->{statusCode} );
+
+  if ( $output_mode eq 'JSON' ) {
+    use JSON;
+    print("Status: $statusCode $error_response->{errorCode}\n");
+    print("Access-Control-Allow-Origin: *\n");
+    print("Content-type: application/json\n\n");
+    my $http_response = { "status"=> $statusCode, "title"=> $error_response->{errorCode}, "detail"=> $error_response->{fullMessage}, "type"=> "about:blank" };
+    print(encode_json($http_response),"\n");
+
+  } elsif ( $output_mode eq 'TEXT' ) {
+    print("Status: $statusCode $error_response->{errorCode}\n");
+    print("Access-Control-Allow-Origin: *\n");
+    print("Content-type: text/plain\n\n");
+    print($error_response->serialize());
+
+  } elsif ( $output_mode eq 'HTML' ) {
+    print("Status: $statusCode $error_response->{errorCode}\n");
+    print("Access-Control-Allow-Origin: *\n");
+    print($error_response->serialize());
+
+  } elsif ( $output_mode eq 'TSV' || $output_mode eq 'CSV' ) {
+    print("Status: $statusCode $error_response->{errorCode}\n");
+    print("Access-Control-Allow-Origin: *\n");
+    print("Content-type: text/plain\n\n");
+    print("Output mode $output_mode not yet supported\n");
+
+  } else {
+    print("Status: $statusCode $error_response->{errorCode}\n");
+    print("Access-Control-Allow-Origin: *\n");
+    print("Content-type: text/plain\n\n");
+    print("Output mode $output_mode not yet supported\n");
+  }
+
+  return;
+
+} # end writeSpectrum
+
+
+###############################################################################
+# getCompactNativeId
+###############################################################################
+sub getCompactNativeId {
+  my $METHOD = 'getCompactNativeId';
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $DEBUG );
+  my %parameters = @_;
+
+  #### Set up a response object
+  my $response = Proteomics::Response->new();
+
+  #### Process standard parameters
+  my $debug = processParameters( name=>'debug', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$DEBUG, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $verbose = processParameters( name=>'verbose', required=>0, allowUndef=>0, default=>0, overrideIfFalse=>$VERBOSE, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $quiet = processParameters( name=>'quiet', required=>0, allowUndef=>0, default=>0, parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  my $outputDestination = processParameters( name=>'outputDestination', required=>0, allowUndef=>0, default=>'STDERR', parameters=>\%parameters, caller=>$METHOD, response=>$response );
+  print "DEBUG: Entering $CLASS.$METHOD\n" if ( $debug && !$DEBUG );
+
+  #### Process specific parameters
+  my $nativeId = processParameters( name=>'nativeId', required=>1, allowUndef=>0, response=>$response, parameters=>\%parameters, caller=>$METHOD );
+
+  #### Die if any unexpected parameters are passed
+  my $unexpectedParameters = '';
+  foreach my $parameter ( keys(%parameters) ) { $unexpectedParameters .= "ERROR: unexpected parameter '$parameter'\n"; }
+  die("CALLING ERROR [$METHOD]: $unexpectedParameters") if ($unexpectedParameters);
+
+  #### If there's no useful nativeId, just return empty string
+  return '' unless ( $nativeId );
+
+  my $compactNativeId = '';
+
+  #### Try to parse the different nativeId types
+
+  #### For Thermo
+  if ( $nativeId =~ /controllerType=(\d+) controllerNumber=(\d+) scan=(\d+)/ ) {
+    $compactNativeId = "$1,$2,$3";
+
+  #### For SCIEX
+  } elsif ( $nativeId =~ /sample=(\d+) period=(\d+) cycle=(\d+) experiment=(\d+)/ ) {
+    $compactNativeId = "$1,$2,$3,$4";
+
+  #### Not yet coded or invalid
+  } else {
+    print("ERROR: unrecognized nativeId '$nativeId'\n");
+  }
+
+  return($compactNativeId);
+
+} # end getCompactNativeId
+

@@ -1,0 +1,910 @@
+#!/usr/local/bin/perl -w
+
+###############################################################################
+# Program     : GetLSIDAttributes
+# Author      : Eric Deutsch <edeutsch@systemsbiology.org>
+# $Id$
+#
+# Description : This program that allows users to
+#               get access to SBEAMS records given an LSID
+#
+# SBEAMS is Copyright (C) 2000-2005 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+#
+###############################################################################
+
+
+###############################################################################
+# Set up all needed modules and objects
+###############################################################################
+use strict;
+use Getopt::Long;
+use FindBin;
+
+use lib "$FindBin::Bin/../lib/perl";
+use vars qw ($sbeams $sbeamsMOD $q $current_contact_id $current_username
+             $PROG_NAME $USAGE %OPTIONS $QUIET $VERBOSE $DEBUG $TESTONLY
+             $TABLE_NAME $PROGRAM_FILE_NAME $CATEGORY $DB_TABLE_NAME
+             @MENU_OPTIONS);
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Microarray::Tables;
+
+
+###############################################################################
+# Set program name and usage banner for command line use
+###############################################################################
+$PROG_NAME = $FindBin::Script;
+$USAGE = <<EOU;
+Usage: $PROG_NAME [OPTIONS] key=value key=value ...
+Options:
+  --verbose n         Set verbosity level.  default is 0
+  --quiet             Set flag to print nothing at all except errors
+  --debug n           Set debug flag to level n
+  --testonly          Set testonly flag which simulates INSERTs/UPDATEs only
+
+ e.g.:  $PROG_NAME --verbose 2 keyword=value
+
+EOU
+
+#### Process options
+unless (GetOptions(\%OPTIONS,"verbose:s","quiet","debug:s","quiet")) {
+  print "$USAGE";
+  exit;
+}
+
+$VERBOSE = $OPTIONS{"verbose"} || 0;
+$QUIET = $OPTIONS{"quiet"} || 0;
+$DEBUG = $OPTIONS{"debug"} || 0;
+$TESTONLY = $OPTIONS{"testonly"} || 0;
+if ($DEBUG) {
+  print "Options settings:\n";
+  print "   VERBOSE = $VERBOSE\n";
+  print "     QUIET = $QUIET\n";
+  print "     DEBUG = $DEBUG\n";
+  print "  TESTONLY = $TESTONLY\n";
+}
+
+
+###############################################################################
+# Set Global Variables and execute main()
+###############################################################################
+$sbeams = new SBEAMS::Connection;
+my %parameters;
+my $output_mode;
+my %module_coderefs = ( core => \&get_core_data,
+                        microarray => \&get_microarray_data );
+
+
+main();
+exit(0);
+
+
+###############################################################################
+# Main Program:
+#
+# Call $sbeams->Authenticate() and exit if it fails or continue if it works.
+###############################################################################
+sub main {
+
+  #### Do the SBEAMS authentication and exit if a username is not returned
+  exit unless ($current_username = $sbeams->Authenticate(
+    #permitted_work_groups_ref=>['xxx','yyy'],
+    connect_read_only=>1,
+    allow_anonymous_access=>1,
+  ));
+
+
+  #### Read in the default input parameters
+  my $n_params_found = $sbeams->parse_input_parameters(
+    q=>$q,parameters_ref=>\%parameters);
+  #$sbeams->printDebuggingInfo($q);
+
+
+  #### Process generic "state" parameters before we start
+  $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+  $output_mode = $sbeams->output_mode();
+
+  #### Decide what action to take based on information so far
+  if (defined($parameters{action}) && $parameters{action} eq "???") {
+    # Some action
+  } else {
+    $sbeams->display_page_header();
+    handle_request();
+    $sbeams->display_page_footer();
+  }
+
+
+} # end main
+
+
+
+###############################################################################
+# Handle Request
+###############################################################################
+sub handle_request {
+  my %args = @_;
+
+  #### Define some variables for a query and resultset
+  my %resultset = ();
+  my $resultset_ref = \%resultset;
+  my (%url_cols,%hidden_cols,%max_widths,$show_sql);
+
+
+  #### Read in the standard form values
+  my $apply_action=$parameters{'action'} || $parameters{'apply_action'} || '';
+  my $TABLE_NAME = $parameters{'QUERY_NAME'};
+
+
+  #### Set some specific settings for this program
+  my $CATEGORY="Get LSID Attrbiutes";
+  my $base_url = "$CGI_BASE_DIR/$PROGRAM_FILE_NAME";
+
+
+  #### Define the available parameters
+  my @columns = qw ( lsid namespace object_id revision_id extended );
+  my %input_types = ();
+
+  #### Read the input parameters for each column
+  my $n_params_found = $sbeams->parse_input_parameters(
+    q=>$q,parameters_ref=>\%parameters,
+    columns_ref=>\@columns,input_types_ref=>\%input_types);
+
+  print_usage() unless $q->param();
+
+  #########################################################################
+  #### Process all the paramters
+
+  my %rs_params;
+
+  #### Process LSID
+  if ($parameters{lsid}) {
+    $sbeams->handle_error(
+      message => "Parameter 'lsid' not yet supported",
+      error_type => 'Bad Constraint',
+    );
+  }
+
+  #### Process namespace
+  my ($namespace,$module,$class);
+  if ($parameters{namespace}) {
+    $namespace = $parameters{namespace};
+    if ($namespace =~ /^\s*(\w+)\.(\w+)\.(\w+)\s*$/) {
+      if ($1 ne 'sbeams') {
+        $sbeams->handle_error(
+          message => "First block of namespace must be 'sbeams': ".
+		     "'$namespace'",
+          error_type => 'bad constraint',
+        );
+      }
+      $module = $2;
+      $class = $3;
+
+    } else {
+      $sbeams->handle_error(
+        message => "Unable to parse namespace '$namespace' into ".
+		   "sbeams.module.class",
+        error_type => 'bad constraint',
+      );
+    }
+  }
+
+
+  #### Process object_id
+  my $object_id;
+  if ($parameters{object_id}) {
+    $object_id = $parameters{object_id};
+    if ($object_id =~ /^\s*(\d+)\s*/) {
+      $object_id = $1;
+    } else {
+      $sbeams->handle_error(
+        message => "Unable to parse object_id '$object_id' as an integer",
+        error_type => 'data mismatch',
+      );
+    }
+  }
+
+
+  #### Process version_id
+  my $version_id;
+  if ($parameters{version_id}) {
+    $sbeams->handle_error(
+      message => "version_id is not currently supported",
+      error_type => '',
+    );
+  }
+
+
+  #### Make sure we have enough information
+  unless ($module) {
+    $sbeams->handle_error(
+      message => "module was not supplied",
+      error_type => 'insufficient constraints',
+    );
+  }
+  $module = lc($module); # We won't worry about case...
+
+  unless ($class) {
+    $sbeams->handle_error(
+      message => "class was not supplied",
+      error_type => 'insufficient constraints',
+    );
+  }
+
+
+  unless ($object_id) {
+    $sbeams->handle_error(
+      message => "object_id was not supplied",
+      error_type => 'insufficient constraints',
+    );
+  }
+ 
+  my @supported = get_supported_modules();
+  unless ( grep /^$module$/, @supported ) {
+    $sbeams->handle_error(
+      message => "Invalid module '$module', supported options are: " . get_supported_modules(),
+      error_type => 'bad constraint',
+    );
+  }
+  
+
+  # fetch data based on the module/class
+  my $data = '';
+  if ( $module_coderefs{$module} ) {
+
+    # Run module-specific fetch, module decides if class is legal
+    $data = $module_coderefs{$module}( class     => $class, 
+                                       object_id => $object_id, 
+                                       module    => $module,
+                                       paramref  => \%parameters );
+
+  } else {
+    $log->error( "Code missing for nominally supported module: $module" );
+    $sbeams->handle_error(
+      message => "Unable to process request",
+      error_type => 'sbeams_error',
+    );
+  }
+  
+  print get_headers();
+  print "$data\n";
+  print get_footers();
+
+} # end handle_request
+
+sub print_usage {
+
+  print get_headers();
+  print "Whoa, no params!\n";
+  print get_footers();
+  exit;
+}
+
+#+
+# Generate markup headers as needed
+#-
+sub get_headers {
+  my $header = '';
+  if ($output_mode eq 'html') { 
+    $header .= "<PRE>\n";
+  } elsif ($output_mode =~ /xml/) {
+    $header .= $sbeams->get_http_header();
+    $header .= "<?xml version=\"1.0\" standalone=\"yes\"?>\n<data>\n";
+  } else {
+    $header .= $sbeams->get_http_header();
+  }
+  return $header;
+}
+
+
+#+
+# Generate markup footers as needed
+#-
+sub get_footers {
+  my $footer = '';
+  # Print any closing markup
+  if ($output_mode eq 'html') {
+    $footer .= "</PRE>\n";
+  } elsif ($output_mode =~ /xml/) {
+    $footer .= "</data>\n";
+  } 
+  return $footer;
+}
+
+
+#+
+# Return array or comma sep string based on call context.
+#-
+sub get_supported_modules {
+  my @supported = qw( core microarray );
+  return (wantarray()) ? @supported : join ", ", @supported;
+}
+
+
+###############################################################################
+# enforceOneRow
+#
+# Throw errors if 0 or more than 1 row returned
+###############################################################################
+sub enforceOneRow {
+  my %args = @_;
+
+  #### Process the arguments list
+  my $rows = $args{'rows'} || die("parameter 'rows' not passed");
+  my $module = $args{'module'} || die("parameter 'module' not passed");
+  my $class = $args{'class'} || die("parameter 'class' not passed");
+  my $object_id = $args{'object_id'} ||
+    die("parameter 'object_id' not passed");
+
+  if (scalar(@{$rows}) == 0) {
+    $sbeams->handle_error(
+      message => "There is no $module.$class with object_id '$object_id'",
+      error_type => '',
+    );
+  }
+  if (scalar(@{$rows}) > 1) {
+    $sbeams->handle_error(
+      message => "Internal error: incorrect number of rows",
+      error_type => '',
+    );
+  }
+
+  return(1);
+
+} # end enforceOneRow
+
+
+###############################################################################
+# encodeAttributes
+#
+# Encode the attributes of the requested object
+###############################################################################
+sub encodeAttributes {
+  my %args = @_;
+
+  #### Process the arguments list
+  my $hash = $args{'hash'} || die("parameter 'hash' not passed");
+  my $class = $args{'class'} || die("parameter 'class' not passed");
+  my $object_id = $args{'object_id'} ||
+    die("parameter 'object_id' not passed");
+
+  my $buffer = '';
+
+  if ($output_mode =~ /xml/) {
+      $buffer .= $sbeams->encodeXMLEntity( entity_name => $class,
+                                                indent => 2,
+                                            attributes => $hash );
+      return($buffer);
+  }
+
+  #### Print a header for the class and object_id
+  $buffer .= "\n====\t$class\t$object_id\n";
+
+  #### Print column headings
+  $buffer .= "column\tvalue\n";
+
+  #### Dump the attributes
+  while (my ($key,$value) = each %{$hash}) {
+    $value =~ s/\n/\\n/g;
+    $value =~ s/\r/\\r/g;
+    $value =~ s/\t/\\t/g;
+    $buffer .= "$key\t$value\n";
+  }
+
+  #### Return the buffered output
+  return($buffer);
+
+} # end encodeAttributes
+
+
+
+###############################################################################
+## Core Module
+###############################################################################
+
+#+
+# Handle calls to the core module
+#-
+sub get_core_data {
+
+  my %args = @_;
+  my $class = lc($args{class});
+  my $object_id = $args{object_id};
+  my $module =  $args{module};
+  my $paramref =  $args{paramref};
+
+  my $content = '';
+
+  # Make sure we have a valid class
+  my @supported_classes = qw( project user_login user_project_permissions );
+  unless ( grep /^$class$/, @supported_classes ) {
+    $sbeams->handle_error(
+      message => "sbeams.$module.$class is not a valid or supported namespace",
+      error_type => 'bad constraint',
+    );
+  }
+
+  # If a request for project information
+  if ($class eq 'project') {
+
+    $content .= get_core_project( object_id => $object_id, module => $module );
+
+    if ($paramref->{extended}) {
+      $content .= get_extended_project_data( $object_id );
+
+      for my $module ( get_supported_modules() ) {
+        next if $module eq 'core';
+        $content .= $module_coderefs{$module}( class     => $class,
+                                               module    => 'core',
+                                               object_id => $object_id );
+      }
+    }
+
+  } elsif ($class eq 'contact') {
+
+    #### First find the object if possible
+    my $sql = "SELECT * FROM $TB_CONTACT WHERE contact_id='$object_id' ".
+	"AND record_status != 'D'";
+    my @rows = $sbeams->selectHashArray($sql);
+    enforceOneRow( rows => \@rows, module => $module, class => $class,
+		   object_id => $object_id );
+
+    $content .= encodeAttributes(
+      class => $class,
+      object_id => $object_id,
+      hash => $rows[0],
+    );
+
+  } elsif ($class eq 'user_login') {
+
+    #### First find the object if possible
+    my $sql = "SELECT * FROM $TB_USER_LOGIN WHERE contact_id='$object_id' ".
+	"AND record_status != 'D'";
+    my @rows = $sbeams->selectHashArray($sql);
+    enforceOneRow( rows => \@rows, module => $module, class => $class,
+		   object_id => $object_id );
+
+    $content .= encodeAttributes(
+      class => $class,
+      object_id => $object_id,
+      hash => $rows[0],
+    );
+    
+  } elsif ($class eq 'work_group') {
+
+    #### First find the object if possible
+    my $sql = "SELECT * FROM $TB_WORK_GROUP WHERE work_group_id='$object_id' ".
+	"AND record_status != 'D'";
+    my @rows = $sbeams->selectHashArray($sql);
+    enforceOneRow( rows => \@rows, module => $module, class => $class,
+		   object_id => $object_id );
+
+    $content .= encodeAttributes(
+      class => $class,
+      object_id => $object_id,
+      hash => $rows[0],
+    );
+  }
+  return($content);
+} # end get_core_data
+
+
+#+
+# Fetch core project info, with foreign keys resolved for clarity
+#-
+sub get_core_project {
+
+  my %args = @_;
+  my $module = $args{module};
+  my $object_id = $args{object_id};
+  my $class = 'project';
+
+  my $content = '';
+
+  my @project_fields = qw(project_id name project_tag description
+     budget project_status uri additional_information comment 
+     date_created date_modified record_status );
+
+#     modified_by_id 
+#     owner_group_id 
+#     created_by_id 
+#      PI_contact_id 
+
+    my $fields = 'P.' . join( ", P.", @project_fields );
+      
+    my $sql =<<"    END_SQL";
+    SELECT $fields, 
+    ( SELECT first_name || ' ' || last_name || ' (' || organization || ')' FROM $TB_CONTACT C JOIN $TB_ORGANIZATION O ON C.organization_id = O.organization_id WHERE PI_contact_id = C.contact_id ) AS pi_contact,
+    ( SELECT first_name || ' ' || last_name || ' (' || organization || ')' FROM $TB_CONTACT C JOIN $TB_ORGANIZATION O ON C.organization_id = O.organization_id WHERE P.created_by_id = C.contact_id ) AS created_by,
+    ( SELECT first_name || ' ' || last_name || ' (' || organization || ')' FROM $TB_CONTACT C JOIN $TB_ORGANIZATION O ON C.organization_id = O.organization_id WHERE P.modified_by_id = C.contact_id ) AS modified_by,
+    ( SELECT work_group_name FROM $TB_WORK_GROUP W WHERE W.work_group_id = owner_group_id ) AS owner_group 
+    FROM $TB_PROJECT P
+    WHERE project_id=$object_id 
+	  AND record_status != 'D'
+    END_SQL
+
+    # First find the project if possible
+    my @rows = $sbeams->selectHashArray($sql);
+    enforceOneRow( rows => \@rows, module => $module, 
+                  class => $class, object_id => $object_id );
+
+    # Then check to make sure the user can access it
+    my @accessible_projects = $sbeams->getAccessibleProjects();
+    my $project_id;
+    my $is_permitted;
+    foreach $project_id ( sort(@accessible_projects) ) {
+      if ($project_id == $object_id) {
+        $is_permitted = 1;
+        last;
+      }
+    }
+    unless ($is_permitted) {
+      $sbeams->handle_error(
+        message => "Currently authenticated user '$current_username' does ".
+	  "not have access privilege to sbeams.$module.$class:$object_id",
+        error_type => 'access_denied',
+      );
+    }
+
+    $content .= encodeAttributes(
+      class => $class,
+      object_id => $object_id,
+      hash => $rows[0],
+    );
+  return $content;
+
+}
+
+
+
+#+
+# Fetch extended core project info, user/group project permissions 
+#-
+sub get_extended_project_data {
+
+  my $object_id = shift;
+  my $content;
+
+  #### Get user project privilege information
+  my $sql = qq ~
+    SELECT * FROM $TB_USER_PROJECT_PERMISSION
+     WHERE project_id='$object_id'
+	AND record_status != 'D'
+  ~;
+  my @rows = $sbeams->selectHashArray($sql);
+  foreach my $row ( @rows ) {
+    $content .= encodeAttributes(
+      class => 'user_project_permission',
+      object_id => $row->{user_project_permission_id},
+      hash => $row,
+    );
+  }
+
+  #### Get group project privilege information
+  $sql = qq ~
+    SELECT * FROM $TB_GROUP_PROJECT_PERMISSION
+     WHERE project_id='$object_id'
+	AND record_status != 'D'
+  ~;
+  my @rows = $sbeams->selectHashArray($sql);
+  foreach my $row ( @rows ) {
+    $content .= encodeAttributes(
+      class => 'group_project_permission',
+      object_id => $row->{group_project_permission_id},
+      hash => $row,
+    );
+  }
+  return $content;
+}
+
+
+
+###############################################################################
+## Microarray Module
+###############################################################################
+
+
+#+
+# Handle calls to the microarray module
+#-
+sub get_microarray_data {
+
+  my %args = @_;
+  my $class = lc($args{class});
+  my $object_id = $args{object_id};
+  my $module =  $args{module};
+  my $paramref =  $args{paramref};
+
+  my $content = '';
+
+  # Make sure we have a valid class
+  my @supported_classes = qw( project comparison_condition affy_array_sample
+                              affy_array affy_analysis slide_type file_path );
+  unless ( grep /^$class$/, @supported_classes ) {
+    $sbeams->handle_error(
+      message => "sbeams.$module.$class is not a valid or supported namespace",
+      error_type => 'bad constraint',
+    );
+  }
+
+  # OK, kluge fans, here it is!  We will cache the returned object row in 
+  # this scalar for possible later use (in extended realm).
+  my $object_row;
+
+  # If a request for project information
+  if ($class eq 'project') {
+
+    if ( $module eq 'microarray' ) {
+      $content = get_core_project( object_id => $object_id, 
+                                   module    => $module );
+    }
+    $content .= get_project_arrays( $object_id );
+    $content .= get_project_analyses( $object_id );
+    $content .= get_project_conditions( $object_id );
+
+    # May have 2-color data as well?
+    $content .= get_twocolor_arrays( $object_id );
+  }
+
+
+  elsif ( $class =~ /some special case/i ) {
+
+    #### First find the object if possible
+    my $sql = qq ~
+      SELECT * FROM TBMA_SPECIAL_CASE
+      WHERE condition_id='$object_id'
+	    AND record_status != 'D'
+    ~;
+    my @rows = $sbeams->selectHashArray($sql);
+    enforceOneRow( rows => \@rows,
+                   module => $module, 
+                   class => $class,
+		               object_id => $object_id );
+
+    # Must have just had one row, let the kluge roll on!
+    $object_row = $rows[0];
+
+    $content .= encodeAttributes(
+      class => $class,
+      object_id => $object_id,
+      hash => $rows[0],
+    );
+
+  } else {  # Generic fetch
+    my $sql = $sbeams->get_object_SQL( table_name => 'MA_' . $class,
+                                       module_prefix => '$TBMA',
+                                       object_id => $object_id );
+    
+    my @rows = $sbeams->selectHashArray($sql);
+    enforceOneRow( rows => \@rows,
+                   module => $module, 
+                   class => $class,
+		               object_id => $object_id );
+
+    # Must have just had one row, let the kluge roll on!
+    $object_row = $rows[0];
+
+    $content .= encodeAttributes(
+      class => $class,
+      object_id => $object_id,
+      hash => $rows[0],
+    );
+
+  }
+
+  # May have some 'extended' data to return...
+  if ( $parameters{extended} ) {
+    if ( $class =~ /affy_analysis/i ) {
+      # for my $k ( keys( %$object_row) ) { $log->debug( "$k => $object_row->{$k}" ); }
+ 
+      # Must... Hack... Wildly...
+      my $desc = $object_row->{analysis_description} || '';
+      $desc =~ /File Names\ *=>(.*)\/\/Class\&nbsp\;labels/;
+      my @files = split( /, /, $1 );
+      for my $f ( @files ) { $f =~ s/\.CEL$//g }
+      my $file_list = "'" . join( "','", @files ) . "'";
+
+
+      my $sql = qq ~
+      SELECT * FROM $TBMA_AFFY_ARRAY
+      WHERE file_root IN ( $file_list )
+      AND record_status <> 'D'
+      ~;
+      # Add project limitation here!
+
+      my $filecnt = scalar( @files );
+
+      my @rows = $sbeams->selectHashArray($sql);
+      my $rowcnt = scalar( @rows );
+
+      for my $row ( @rows ) {
+        $content .= encodeAttributes(
+          class => 'affy_array',
+          object_id => $row->{affy_array_id},
+          hash => $row,
+        );
+      }
+      $log->error( "Got $rowcnt files from $filecnt files " ) if $filecnt != $rowcnt;
+    } # End extended affy_analysis
+  }
+
+  return( $content );
+  
+} # end get_microarray_data 
+
+
+#+
+# Get all arrays for specified project
+#-
+sub get_project_arrays {
+  my $project_id = shift;
+  my $content = '';
+
+  # Get affy array sample info
+  my $sql = qq ~
+    SELECT AAS.* 
+    FROM $TBMA_AFFY_ARRAY_SAMPLE AAS 
+    JOIN $TBMA_AFFY_ARRAY AA 
+    ON AA.affy_array_sample_id = AAS.affy_array_sample_id
+    WHERE project_id='$project_id'
+    AND AAS.record_status != 'D'
+    AND AA.record_status != 'D'
+  ~;
+  my @rows = $sbeams->selectHashArray($sql);
+  foreach my $row ( @rows ) {
+    $content .= encodeAttributes(
+      class => 'affy_array_sample',
+      object_id => $row->{affy_array_sample_id},
+      hash => $row,
+    );
+  }
+
+   #### Get affy array info
+   $sql = qq ~
+    SELECT AA.*, FP.file_path 
+    FROM $TBMA_AFFY_ARRAY_SAMPLE AAS 
+    JOIN $TBMA_AFFY_ARRAY AA 
+    ON AA.affy_array_sample_id = AAS.affy_array_sample_id
+    JOIN $TBMA_FILE_PATH FP 
+    ON AA.file_path_id = FP.file_path_id
+    WHERE project_id='$project_id'
+    AND AAS.record_status != 'D'
+    AND AA.record_status != 'D'
+   ~;
+   my @rows = $sbeams->selectHashArray($sql);
+   foreach my $row ( @rows ) {
+     $content .= encodeAttributes(
+       class => 'affy_array',
+       object_id => $row->{affy_array_id},
+       hash => $row,
+     );
+   }
+   return $content;
+}
+
+#+
+# Get all (type 3) analyses for specified project
+#-
+sub get_project_analyses {
+  my $project_id = shift;
+  my $content = '';
+
+    #### Get affy analysis info
+    my $sql = qq ~
+      SELECT * FROM $TBMA_AFFY_ANALYSIS 
+      WHERE project_id='$project_id'
+      AND affy_analysis_type_id = 3
+      AND record_status != 'D'
+    ~;
+    my @rows = $sbeams->selectHashArray($sql);
+    foreach my $row ( @rows ) {
+      $content .= encodeAttributes(
+        class => 'affy_analysis',
+        object_id => $row->{affy_analysis_id},
+        hash => $row,
+        );
+    }
+    return($content);
+}
+
+#+
+# Get all comparison_conditions for specified project
+#-
+sub get_project_conditions {
+  my $project_id = shift;
+  my $content = '';
+
+    #### Get affy analysis info
+    my $sql = qq ~
+      SELECT * FROM $TBMA_COMPARISON_CONDITION 
+      WHERE project_id='$project_id'
+      AND analysis_type IS NOT NULL
+      AND record_status != 'D'
+    ~;
+    my @rows = $sbeams->selectHashArray($sql);
+    foreach my $row ( @rows ) {
+      $content .= encodeAttributes(
+        class => 'comparison_condition',
+        object_id => $row->{condition_id},
+        hash => $row,
+        );
+    }
+
+    return($content);
+}
+
+sub get_microarray_objects {
+  my %args = @_;
+  for my $key ( qw( class object_id ) ) {
+    $sbeams->handle_error(
+      message => "Missing required parameter $key",
+      error_type => 'Bad Constraint',
+    ) unless $args{$key};
+  }
+
+  if ( $args{class} =~ /^affy_array$/i ) {
+  }
+}
+
+#+
+# Get all arrays for specified project
+#-
+sub get_twocolor_arrays {
+  my $project_id = shift;
+  my $content = '';
+
+  # Get affy array sample info
+  my $sql = qq ~
+  SELECT -- Array table
+         A.array_id,printing_batch_id,array_name,array_request_slide_id,
+         A.comment AS array_comment,
+
+         -- Slide table
+         S.slide_id,slide_lot_id,slide_number,barcode,S.comment AS slide_comment,
+         
+         -- Array scan table
+         ASCN.array_scan_id,ASCN.protocol_id AS array_scan_protocol_id,
+         protocol_deviations,resolution,ASCN.stage_location 
+         AS array_scan_stage_location,ASCN.uri AS array_scan_uri,
+         ASCN.data_flag AS array_scan_data_flag,date_scanned,
+         ASCN.comment AS array_scan_comment,
+         
+         -- Array layout table
+         AL.layout_id,slide_type_id,AL.name AS layout_name,
+         biosequence_set_id,data_file,source_filename,
+         AL.comment AS array_layout_comment,
+         
+         -- Array quantitation table
+         array_quantitation_id,AQ.protocol_id AS array_quantitation_protocol_id,
+         AQ.stage_location AS array_quantitation_stage_location,
+         AQ.uri AS array_quantitation_uri,AQ.data_flag AS array_quantitation_data_flag,
+         date_quantitated,AQ.comment AS array_quantiation_comment
+           
+    FROM $TBMA_ARRAY A
+    JOIN $TBMA_SLIDE S on S.slide_id = A.slide_id
+    JOIN $TBMA_ARRAY_SCAN ASCN ON ASCN.array_id = A.array_id
+    JOIN $TBMA_ARRAY_LAYOUT AL ON AL.layout_id = A.layout_id
+    JOIN $TBMA_ARRAY_QUANTITATION AQ ON ASCN.array_scan_id = AQ.array_scan_id
+    WHERE project_id = $project_id
+    AND A.record_status != 'D'
+    AND S.record_status != 'D'
+    AND ASCN.record_status != 'D'
+    AND AL.record_status != 'D'
+    AND AQ.record_status != 'D'
+  ~;
+  my @rows = $sbeams->selectHashArray($sql);
+  foreach my $row ( @rows ) {
+    $content .= encodeAttributes(
+      class => 'two_color_array',
+      object_id => $row->{array_id},
+      hash => $row,
+    );
+  }
+  return $content;
+}

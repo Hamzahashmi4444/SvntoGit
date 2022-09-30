@@ -1,0 +1,412 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : GetSELExperiments
+# Author      : Terry Farrah
+# Description : Javascipt browser for SRM experiments
+#
+# SBEAMS is Copyright (C) 2000-2021 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+#
+###############################################################################
+use strict;
+use CGI::Carp qw(fatalsToBrowser croak);
+use Getopt::Long;
+use FindBin;
+use POSIX qw(ceil floor);
+use LWP::Simple;
+use lib "$FindBin::Bin/../../lib/perl";
+use vars qw ($sbeams $sbeamsMOD $q $current_contact_id $current_username
+             $PROG_NAME $USAGE %OPTIONS $QUIET $VERBOSE $DEBUG $DATABASE
+             $TABLE_NAME $PROGRAM_FILE_NAME $CATEGORY $DB_TABLE_NAME
+             @MENU_OPTIONS);
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Authenticator;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::TabMenu;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+
+$sbeams = new SBEAMS::Connection;
+my $sbeamsMOD = new SBEAMS::PeptideAtlas;
+$sbeamsMOD->setSBEAMS($sbeams);
+$sbeams->setSBEAMS_SUBDIR($SBEAMS_SUBDIR);
+
+use  SBEAMS::PeptideAtlas::PASSEL;
+use SBEAMS::Connection::PubMedFetcher;
+
+###############################################################################
+# Set program name and usage banner for command line use
+###############################################################################
+$PROG_NAME = $FindBin::Script;
+$USAGE = <<EOU;
+Usage: $PROG_NAME [OPTIONS] key=value key=value ...
+Options:
+  --verbose n         Set verbosity level.  default is 0
+  --quiet             Set flag to print nothing at all except errors
+  --debug n           Set debug flag
+
+ e.g.:  $PROG_NAME [OPTIONS] [keyword=value],...
+
+EOU
+
+#### Process options
+unless (GetOptions(\%OPTIONS,"verbose:s","quiet","debug:s")) {
+  print "$USAGE";
+  exit;
+}
+
+$VERBOSE = $OPTIONS{"verbose"} || 0;
+$QUIET = $OPTIONS{"quiet"} || 0;
+$DEBUG = $OPTIONS{"debug"} || 0;
+if ($DEBUG) {
+  print "Options settings:\n";
+  print "  VERBOSE = $VERBOSE\n";
+  print "  QUIET = $QUIET\n";
+  print "  DEBUG = $DEBUG\n";
+}
+
+
+###############################################################################
+# Set Global Variables and execute main()
+###############################################################################
+main();
+exit(0);
+
+###############################################################################
+# Main Program:
+#
+# Call $sbeams->Authenticate() and exit if it fails or continue if it works.
+###############################################################################
+sub main {
+  # This script is very simple.
+  # Display PeptideAtlas header and footer.
+  # In between, sandwich some static HTML.
+  # Also create the static data file.
+
+  exit unless ($current_username = $sbeams->Authenticate(
+	permitted_work_groups_ref=>['PeptideAtlas_user','PeptideAtlas_admin',
+	'PeptideAtlas_readonly', 'PeptideAtlas_exec'],
+	allow_anonymous_access=>1,
+    ));
+
+  #### Read in the default input parameters
+  my %parameters;
+
+  $parameters{uploaded_file_not_saved} = 1;
+
+  my $n_params_found = $sbeams->parse_input_parameters(
+    q=>$q,parameters_ref=>\%parameters);
+     #$sbeams->printDebuggingInfo($q);
+
+  #### Process generic "state" parameters before we start
+  $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+  #### Decide what action to take based on information so far
+  if ($parameters{action} eq "???") {
+
+    # Some action
+
+  } else {
+
+    my $project_id = $sbeamsMOD->getProjectID(
+        atlas_build_id => $parameters{atlas_build_id}
+        );
+
+    $sbeamsMOD->display_page_header(project_id => $project_id);
+    if(defined $parameters{SEL_experiment_id}){
+      showSELExperiment(ref_parameters=>\%parameters);
+    }else{ 
+      handle_request(ref_parameters=>\%parameters);
+    }
+    $sbeamsMOD->display_page_footer();
+
+  }
+
+
+} # end main
+
+
+###############################################################################
+# Handle Request
+###############################################################################
+sub showSELExperiment{
+  my %args = @_;
+  my $ref_parameters = $args{'ref_parameters'}
+    || die "ref_parameters not passed";
+  my %parameters = %{$ref_parameters};
+  my $SEL_experiment_id = $parameters{SEL_experiment_id};
+  my $passel = new SBEAMS::PeptideAtlas::PASSEL;
+  my $json = new JSON;
+
+  # Collect a JSON hash containing data from all of the experiments.
+  # Store also in string form to use for searching, sorting.
+  my $json_filename_all = "$PHYSICAL_BASE_DIR/tmp/PASSEL_experiments_all.json";
+  $passel->srm_experiments_2_json_all() if (! -e $json_filename_all);
+  open (JSONFILE, "$json_filename_all") ||
+    die "Can't open $json_filename_all for reading\n";
+  my $json_href = $json->decode(join(" ",<JSONFILE>));
+  close JSONFILE;
+
+  my $tabMenu = $sbeamsMOD->getTabMenu(
+    parameters_ref => \%parameters,
+    program_name => $PROG_NAME,
+  );
+  
+  my %labels = (
+     experiment_title => 'Experiment Title',
+     comment => 'Experiment Description',
+     description => 'Sample Description',
+     publication_name => 'Publication',
+     abstract => 'Abstract',
+     sample_date => 'Sample Date',
+     contributors => 'Contributors',
+     taxonomy => 'Organism',
+     instrumentation => 'Instrument',
+     spikein => 'Spikein',
+     
+  );
+
+  if ($sbeams->output_mode() eq 'html'){
+    print $tabMenu->asHTML() ; 
+    print "<TABLE width=\"800\"><TR><TD><BR>\n";
+    #print "<B>Metadata:</B><P>\n";
+		foreach my $sample (@{$json_href->{"MS_QueryResponse"}{samples}}){
+			next if($sample->{SEL_experiment_id} != $SEL_experiment_id);
+			my $datasetIdentifier = $sample->{datasetIdentifier};
+      print "<div align=\"center\"><font size=3><B>$datasetIdentifier</B></font></div>\n";
+      my $link = "http://www.PeptideAtlas.org/PASS/$datasetIdentifier"; #$HTML_BASE_DIR ."/PASS/$datasetIdentifier";
+
+      print qq~ <B><font color=blue>
+            <a href="$link">
+            Download raw data and supporting files
+            </a>       
+            </font></B><BR><BR>
+            ~;
+
+			foreach my $key (qw(experiment_title
+                          comment
+													description
+													publication_name
+													abstract
+													taxonomy
+													instrumentation
+													spikein
+													counts
+                          contributors
+													sample_date)){ 
+        if($key !~ /(publication|counts)/){
+          if($sample->{$key} ne ''){
+				    print "<B><font color=blue>$labels{$key}:</font></B> $sample->{$key}<BR>\n";
+          }
+        }elsif($key =~ /count/){
+          print qq~
+                <B><font color=blue>Experiment Summary:</font></B>
+                <ul>
+                <li>Transition Group Measured: $sample->{counts}{"transition_groups"} 
+                <a href="$CGI_BASE_DIR/PeptideAtlas/GetSELTransitions?SEL_experiments=$SEL_experiment_id\&row_limit=5000\&QUERY_NAME=AT_GetSELTransitions\&action=QUERY\&apply_action=QUERY">[Explore Transition Groups]</a></li>
+                <li>Number of Ms Runs: $sample->{counts}{"runs"}</li>
+                <li>Number of Proteins: $sample->{counts}{"prots"}</li>
+                <li>Distinct Peptide Sequences: $sample->{counts}{"peps"}</li>
+                </ul>
+                ~;
+        }elsif($key =~ /publication/){
+           if(defined $sample->{publication}{ids}){
+             my @ids = @{$sample->{publication}{ids}};
+             print "<B><font color=blue>Publication:</font></B>";
+             foreach my $id (@ids){
+                #### Get the XML data from NCBI
+                my $url = "http://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?".
+                  "db=pubmed&id=$id&retmode=text&rettype=abstract";
+                my $content = get $url or die "Couldn't get $url";
+                my $ref = '';
+                if($content !~ /Cannot process ID/){
+                   my @lines = split("\n", $content);
+                   shift @lines;
+                   $ref = shift @lines;
+                   $ref =~ s/^\d+\.\s+//;
+                   shift @lines;
+                   $ref = $lines[0] . " ". $ref;
+                    print qq~ $ref
+                             <a href="http://www.ncbi.nlm.nih.gov/pubmed/?term=$id">$id</a>
+                             <BR>
+                          ~;
+                }else{ 
+                  if(defined $sample->{publication_name}){
+                    print " $sample->{publication_name}<BR>";
+                  }
+               }
+             }
+			    }else{
+            if(defined $sample->{publication_name}){
+              print "<B><font color=blue>Publication:</font></B> $sample->{publication_name}<BR>";
+            }
+
+          }
+		    }
+       }
+     }
+		print "<BR>\n";
+		print "</TR></TD></TABLE>\n";
+  }
+}
+
+
+sub handle_request {
+  my %args = @_;
+
+  #### Process the arguments list
+  my $ref_parameters = $args{'ref_parameters'}
+    || die "ref_parameters not passed";
+  my %parameters = %{$ref_parameters};
+
+
+  #### Show current user context information
+  #$sbeams->printUserContext();
+
+
+#### Get the HTML to display the tabs
+  my $tabMenu = $sbeamsMOD->getTabMenu(
+    parameters_ref => \%parameters,
+    program_name => $PROG_NAME,
+  );
+  print $tabMenu->asHTML() if ($sbeams->output_mode() eq 'html');
+
+
+  my $html;
+
+  # Javascript stuff
+  $html = qq~
+
+    <head xmlns:xi="http://www.w3.org/2001/XInclude">
+		  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+					  
+		  <title>Repository</title>
+
+		  <script type='text/javascript' src="$CGI_BASE_DIR/../usr/javascript/passel/js/portal.js"></script>
+		  <script type="text/javascript" src="$CGI_BASE_DIR/../usr/javascript/passel/js/jig.min.js"></script> 
+
+		  <link rel="stylesheet" type="text/css" href="$CGI_BASE_DIR/../usr/javascript/passel/css/ext-all.css" />
+		  <script type="text/javascript" src="$CGI_BASE_DIR/../usr/javascript/passel/js/ext-big.js"></script>
+		  <script type="text/javascript" src="$CGI_BASE_DIR/../usr/javascript/passel/js/grid_ISB.js"></script>
+
+	  <!--[if IE]>
+			  <style>div#ext-gen27 {height:0px; }</style>
+			  <![endif]-->
+		  <style>
+			  #south-panel .x-tool-collapse-south {
+			  background-position:0 -210px;
+			  }
+			  #south-panel .x-tool-collapse-south-over {
+			  background-position:-15px -210px;
+			  }
+			  #south-panel-xcollapsed .x-tool-expand-south {
+			  background-position:0 -195px;
+			  }
+			  #south-panel-xcollapsed .x-tool-expand-south-over {
+			  background-position:-15px -195px;
+			  }
+			  .x-grid3-header-offset{padding-left:1px;width:auto !important;}
+			  ul.x-tab-strip {        
+					  width:auto !important;
+			  }
+			  #contentbox-left {width: 99% !important;}
+			  #contentbox-right {width: 1px !important; display:none; margin-right:0px !important;}
+			  div#display_bar1 { display: none;}
+		  </style>
+
+		  <script type="text/javascript">
+		  document.title = 'PASSEL Experiment Repository';
+		  var browseAttributes = {
+			  sample: '',
+		  }
+		  </script>
+
+		  </head>
+  ~;
+  print $html;
+
+  # Text at the top of the window
+  $html = qq~
+	  <body class="datagrid">
+
+	   <form style="width: 1000px;overflow:auto;padding: 5px;-ro-width: auto;" enctype="application/x-www-form-urlencoded" action="/" name="EntrezForm" method="post" onsubmit="return false;" id="EntrezForm">
+	  <div>
+	  <br>
+	  <h1>SRM Experiments Available in PASSEL</h1>
+	  <br>
+					  <p class="rep">
+  <b>Please wait a few seconds for table to display.</b><br>Then, click individual experiments
+  for detailed info and links to raw data.<br>Click TxGrps link for PASSEL
+  transition group tables.
+
+					  </p>
+					  </p>
+
+	  <br>
+	  </div>
+  ~;
+  print $html;
+
+#  Filter experiments using Search, then click individual experiments
+#  for detailed info and links to transition lists and experimental results.
+
+  # Search boxes and buttons
+  $html = qq~
+	  <div class="search">
+	  <span>&nbsp;&nbsp;Search:&nbsp;</span>
+	  <select id="selectedTitle" name="selectedTitle" style="font-size:92%">
+	    <option value="all" selected="selected">&nbsp;All </option>
+	    <option value="title" >&nbsp;Experiment Title</option>
+	    <option value="organism" >&nbsp;Organism</option>
+	    <option value="tag" >&nbsp;Sample Tag</option>
+	    <option value="instrument" >&nbsp;Instrument</option>
+	    <option value="publication" >&nbsp;Publication</option>
+	    <option value="abstract" >&nbsp;Abstract</option>
+	    <option value="contributors" >&nbsp;Contributors</option>
+	  </select>
+	  <span>for</span>
+	  <input type="text" size="38" id="searchq" name="searchq"  >
+	  <input type="button" id="searchbtn" name="searchbtn" class="sarchBtnOK" value="Search" >
+
+	  &nbsp;&nbsp; 
+	  <input type="button" id="downloadbtn" name="downloadbtn" value="Download Table">
+
+	  </div>
+  ~;
+  print $html;
+
+  # Display of data table
+  $html = qq~
+
+		 <table cellpadding="0" width="100%" cellspacing="0" id="br1owseWrapper">                    
+		      <tr>
+			<td valign="top">
+			  <div class="datagrid"> 
+			    <div id="sample-layout"></div>
+			    <div id="tabsPanel"></div>
+			    <div id="center"></div>
+			    <div id="samplestudyWrapper">
+			       <div id="browse"> 
+				  <div id="toolbar"></div>
+				  <div id="prot-grid"></div>
+			       </div>  <!--"browse"  -->
+			     </div>   <!-- "samplestudyWrapper" -->
+			  </div> <!-- "datagrid" -->
+		      </td>
+		      </tr>
+	  </table>
+	  </form>
+          <br><br>
+	  </body>
+  ~;
+  print $html;
+
+}

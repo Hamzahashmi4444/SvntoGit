@@ -1,0 +1,13 @@
+# RCSid:  $Revision: 3058 $   $Date: 2005-02-11 23:28:59 +0000 (Fri, 11 Feb 2005) $
+#-------------------------------------------------------------------------------
+plugin.0.load=csplugins.isb.pshannon.gaggle.cy.CyGagglePlugin
+plugin.2.load=csplugins.isb.dtenenbaum.jython.PyConsolePlugin
+plugin.layout.load=csplugins.trial.pshannon.Y2Layouters
+plugin.int.load=csplugins.isb.dreiss.getInteractions.GetInteractions
+plugin.seq.load=csplugins.isb.dreiss.sequence.SequencePlugin
+plugin.hom.load=csplugins.isb.dreiss.sequence.HomologPlugin
+plugin.syn.load=csplugins.isb.dreiss.sequence.SynonymPlugin
+
+
+#----------------------------------- vizmapper
+visualStyle=Affy_Expression

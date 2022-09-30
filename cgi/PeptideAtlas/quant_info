@@ -1,0 +1,717 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : quant_info
+# $Id: $
+#
+# Description : This script displays details about a single quant SRM Atlas peptide
+#
+# SBEAMS is Copyright (C) 2000-2016 Institute for Systems Biology
+# This program is governed by the terms of the GNU General Public License (GPL)
+# version 2 as published by the Free Software Foundation.  It is provided
+# WITHOUT ANY WARRANTY.  See the full description of GPL terms in the
+# LICENSE file distributed with this software.
+#
+###############################################################################
+
+
+use strict;
+use vars qw ($q $sbeams $atlas $PROG_NAME
+             $current_contact_id $current_username);
+use lib qw (../../lib/perl);
+use CGI::Carp qw(fatalsToBrowser croak);
+use Statistics::LineFit;
+  use Data::Dumper;
+
+use SBEAMS::Connection qw($q $log);
+use SBEAMS::Connection::DataTable;
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+use SBEAMS::Connection::TabMenu;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+
+$sbeams = new SBEAMS::Connection;
+$atlas = new SBEAMS::PeptideAtlas;
+$atlas->setSBEAMS($sbeams);
+
+
+###############################################################################
+# Global Variables
+###############################################################################
+$PROG_NAME = 'quant_info';
+my $aslog = 'true';
+my $showline = 1;
+my $avg_type = 'log';
+main();
+
+
+###############################################################################
+# Main Program:
+#
+# Call $sbeams->Authentication and stop immediately if authentication
+# fails else continue.
+###############################################################################
+sub main
+{
+    #### Do the SBEAMS authentication and exit if a username is not returned
+    exit unless ($current_username = $sbeams->Authenticate(
+        permitted_work_groups_ref=>['PeptideAtlas_user','PeptideAtlas_admin',
+        'PeptideAtlas_readonly', 'PeptideAtlas_exec'],
+        #connect_read_only=>1,
+#allow_anonymous_access=>1,
+    ));
+
+
+    #### Read in the default input parameters
+    my %parameters;
+    my $n_params_found = $sbeams->parse_input_parameters(
+        q=>$q,
+        parameters_ref=>\%parameters
+        );
+
+
+    ## get project_id to send to HTMLPrinter display
+    my $project_id = $atlas->getProjectID(
+        atlas_build_name => $parameters{atlas_build_name},
+        atlas_build_id => $parameters{atlas_build_id}
+        );
+
+
+    #### Process generic "state" parameters before we start
+    $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+#    $sbeams->printCGIParams($q);
+
+    $aslog = ( $parameters{plottype} && $parameters{plottype} eq 'linear' ) ? 'false' : 'true';
+    $showline = ( defined $parameters{showline} ) ? $parameters{showline} : 1;
+    $avg_type = ( defined $parameters{avg_type} && $parameters{avg_type} eq 'linear' ) ? 'linear' : 'log';
+
+    #### Decide what action to take based on information so far
+    if ($parameters{action} eq "???") {
+
+        # Some action
+ 
+    } else {
+
+      # zhi says maybe make a new version of this subroutine to put in new style sheet
+        $atlas->display_page_header(project_id => $project_id);
+
+        print $sbeams->getGifSpacer(800);
+
+        handle_request(ref_parameters=>\%parameters);
+
+        $atlas->display_page_footer();
+
+    }
+
+
+
+
+} # end main
+
+
+###############################################################################
+# Show the page
+###############################################################################
+sub handle_request {
+
+    my %args = @_;
+
+    #### Process the arguments list
+    my $ref_parameters = $args{'ref_parameters'}
+        || die "ref_parameters not passed";
+
+    my %parameters = %{$ref_parameters};
+
+
+  #### Get the current atlas_build_id based on parameters or session
+  my $atlas_build_id = $atlas->getCurrentAtlasBuildID(
+    parameters_ref => \%parameters,
+  );
+  if (defined($atlas_build_id) && $atlas_build_id < 0) {
+    #### Don't return. Let the user pick from a valid one.
+    #return;
+  }
+
+
+  #### Get the HTML to display the tabs
+  my $tabMenu = $atlas->getTabMenu(
+    parameters_ref => \%parameters,
+    program_name => $PROG_NAME,
+  );
+  if ($sbeams->output_mode() eq 'html') {
+    print "<BR>\n";
+    print $tabMenu->asHTML() if ($sbeams->output_mode() eq 'html');
+    print "<BR>\n";
+  }
+
+
+    #### Read in the standard form values
+    my $apply_action  = $parameters{'action'} || $parameters{'apply_action'};
+    my $TABLE_NAME = $parameters{'QUERY_NAME'};
+
+
+    #### Set some specific settings for this program
+    my $PROGRAM_FILE_NAME = $PROG_NAME;
+    my $base_url = "$CGI_BASE_DIR/$SBEAMS_SUBDIR/$PROGRAM_FILE_NAME";
+    my $help_url = "$CGI_BASE_DIR/help_popup.cgi";
+    my $ppt = $parameters{'ppt'} || 0;
+    my $table_width = $parameters{'width'} || 800;
+
+    $aslog = ( $parameters{plottype} && $parameters{plottype} eq 'linear' ) ? 'false' : 'true';
+    my $expt_id = $parameters{expt_id} || 1;
+
+    #### Get a list of accessible project_ids
+    my @accessible_project_ids = $sbeams->getAccessibleProjects();
+    my $accessible_project_ids = join( ",", @accessible_project_ids ) || '0';
+
+    my $pre_min = $parameters{precursor} || 1000;
+    my $pre_max = $parameters{precursor} + 1;
+    my $sql = qq~
+    SELECT peptide_sequence, precursor_mz, titr_min, titr_max, r_sq, lod, loq, 
+           linear_min, linear_max, fail_mode, conc, slope, intercept, n_points,
+           repl_num, area, product_mz
+    FROM $TBAT_QUANT_INFO
+    WHERE peptide_sequence = '$parameters{peptide_sequence}'
+    AND precursor_mz BETWEEN $pre_min AND $pre_max
+    ORDER BY precursor_mz DESC, product_mz ASC, conc DESC
+    ~;
+	  my @all_rows = $sbeams->selectSeveralColumns($sql);
+
+    my @quant = ();
+    if (@all_rows){
+      my $global_vals = shift @all_rows;
+		  @quant = @{$global_vals};
+    }
+    my %line_info = ( Sum => { slope => $quant[11], 
+                             intercept => $quant[12], 
+                                points => $quant[13] 
+                               } );
+
+    my @entries = ( { key => 'Peptide Sequence', value => 'Amino acid sequence of target peptide' },
+                    { key => 'Precursor m/z', value => 'Mass to charge ratio of intact precursor' },
+                    { key => 'Titration range', value => 'Range of concentration of calibration curve (femtomoles)' },
+                    { key => 'R-squared value', value => 'R-squared measure of correlation from calibration curve' },
+                    { key => 'LOD', value => 'Limit of detection (LOD) in femtomoles' },
+                    { key => 'LOQ', value => 'Limit of quantitation (LOQ) in femtomoles' },
+                    { key => 'Linear range', value => 'Range of concentration of linear portion of calibration curve (femtomoles)' },
+                    { key => 'Fold', value => 'Fold concentration of linear range' },
+                    { key => 'Is quantitative', value => 'Is assay considered to be quantiative' },
+    );
+
+    my $showtext = 'show row descriptions';
+    my $hidetext = 'hide row descriptions';
+    my $heading = 'Quantation Information (no matrix)';
+    my $description= 'Quantiation information determined for this peptide in buffer background (no matrix)';
+
+    my $help = $atlas->get_table_help_section( name => 'Quantitation',
+                                        description => $description,
+                                            heading => $heading,
+                                            entries => \@entries,
+                                           showtext => $showtext,
+                                           hidetext => $hidetext  );
+
+
+
+    my $table = "<TABLE WIDTH=800>\n";
+
+    my ( $tr, $link ) = $sbeams->make_table_toggle( name    => 'overview',
+                                                  visible => 1,
+                                                  tooltip => 'Show/Hide Section',
+                                                  imglink => 1,
+                                                  sticky  => 1 );
+
+    $table .= $atlas->encodeSectionHeader(
+      text => 'Quantitation information',
+      LMTABS => 1,
+      no_toggle => 1,
+      span => 4,
+      link => $link
+    );
+    my $spc = $sbeams->getGifSpacer(400);
+
+    my @entries = ( { key => 'Peptide Sequence', value => 'Amino acid sequence of target peptide' },
+                    { key => 'Precursor m/z', value => 'Mass to charge ratio of intact precursor' },
+                    { key => 'Titration range', value => 'Range of concentration of calibration curve (femtomoles)' },
+                    { key => 'R-squared value', value => 'R-squared measure of correlation from calibration curve' },
+                    { key => 'LOD', value => 'Limit of detection (LOD) in femtomoles' },
+                    { key => 'LOQ', value => 'Limit of quantitation (LOQ) in femtomoles' },
+                    { key => 'Linear range', value => 'Range of concentration of linear portion of calibration curve (femtomoles)' },
+                    { key => 'Fold change', value => 'Fold concentration of linear range' },
+                    { key => 'Is quantitative', value => 'Is assay considered to be quantiative' }  );
+
+
+  $table .= $atlas->encodeSectionItem( key => 'Peptide Sequence', tr_info => $tr, value => $quant[0] ) . "\n";
+  $table .= $atlas->encodeSectionItem( key => 'Precursor m/z', tr_info => $tr, value => sprintf( "%0.3f", $quant[1] ) ) . "\n";
+
+  # Minimal format
+  my $mf = ( $quant[2] < 1 ) ? 2 : 1;
+  $table .= $atlas->encodeSectionItem( key => 'Titration range', tr_info => $tr, value => sprintf( "%0.${mf}f", $quant[2] ) . '-' . sprintf( "%0.1f", $quant[3] ) ) . "\n";
+
+  $table .= $atlas->encodeSectionItem( key => 'R-squared value', tr_info => $tr, value => sprintf( "%0.4f", $quant[4] ) ) . "\n";
+
+  $mf = ( $quant[5] < 1 ) ? 2 : 1;
+  $table .= $atlas->encodeSectionItem( key => 'LOD', tr_info => $tr, value => sprintf( "%0.${mf}f", $quant[5] ) ) . "\n";
+  
+  $mf = ( $quant[6] < 1 ) ? 2 : 1;
+  $table .= $atlas->encodeSectionItem( key => 'LOQ', tr_info => $tr, value => sprintf( "%0.${mf}f", $quant[6] ) ) . "\n";
+
+  $mf = ( $quant[7] < 1 ) ? 2 : 1;
+  $table .= $atlas->encodeSectionItem( key => 'Linear range', tr_info => $tr, value => sprintf( "%0.${mf}f", $quant[7] )  . '-' . sprintf( "%0.1f", $quant[8]  ) ) . "\n";
+
+
+  my $fold = ($quant[7]) ? int( $quant[8]/$quant[7] + 0.5 ) : 'N/A';
+  $table .= $atlas->encodeSectionItem( key => 'Fold change', tr_info => $tr, value => $fold ) . "\n";
+
+	my $is_quant = ( $quant[9] eq 'PASSED' ) ? "Yes $spc" : "No $spc";
+  $table .= $atlas->encodeSectionItem( key => 'Is quantitative', tr_info => $tr, value => $is_quant ) . "\n";
+
+   my $sl = sprintf( "%0.3f", $quant[11] );
+   my $in = sprintf( "%0.3f", $quant[12] );
+   $table .= $atlas->encodeSectionItem( key => 'Linear Equation', tr_info => $tr, value => "response = $sl x Conc + $in"  ) . "\n";
+
+
+  $table .= "</TABLE>\n";
+
+  print $help;
+  print $table;
+
+
+  # If we have quant data, show a plot.
+	my $pre_mz = sprintf( "%0.4f", $quant[1] );
+	my $mz_low = int( $quant[1] );
+	my $mz_hi = $mz_low + 1;
+
+
+	my %data;
+	my %ldata;
+  my $cnt = 1;
+  my @data;
+
+  my %dil = ( 5 => 1,
+              4 => 4,
+              3 => 16,
+              2 => 64,
+              1 => 256,
+              0 => 1024 );
+
+  my $microliters_injected = 2;
+
+  my %avg;
+              
+#    0 peptide_sequence
+#    1 precursor_mz
+#    2 titr_min
+#    3 titr_max
+#    4 r_sq
+#    5 lod
+#    6 loq
+#    7 linear_min
+#    8 linear_max
+#    9 fail_mode
+#    10 conc
+#    11 slope
+#    12 intercept
+#    13 n_points
+#    14 repl_num
+#    15 area
+#    16 product_mz
+
+  for my $row ( @all_rows ) {
+    my @row = @{$row}; 
+
+		my $mz = sprintf( "%0.4f", $row[16] );
+		my $area = sprintf( "%0.1f", $row[15] );
+#		my $conc = sprintf( "%0.2f", $microliters_injected * ($row[4]/$dil{$row[3]}) );
+		my $conc = sprintf( "%0.2f", $row[10] );
+    my $rep = $row[14];
+
+    my $pre_mz = sprintf( "%0.4f", $row[1] );
+    $avg{$conc} ||= { Sum => 0 };
+    $avg{$conc}->{Sum} += $area;
+
+    $avg{$conc}->{$mz} += $area;
+
+    $line_info{$mz} ||= {}; 
+    $line_info{$mz}->{slope} ||= $row[11]; 
+    $line_info{$mz}->{intercept} ||= $row[12]; 
+    $line_info{$mz}->{points} ||= $row[13]; 
+    $line_info{$mz}->{points} = 6; 
+
+#    push @data, [ $mz, $area, $row[3], $dil{$row[3]}, $conc, $row[5] ];
+    $data{$mz} ||= {};
+    $data{$mz}->{$conc} ||= {};
+    $data{$mz}->{$conc}->{$rep} = $area;
+    $cnt++;
+	}
+	return unless %data; 
+#  die Dumper( %data );
+
+  my ( $div_strings, $chart_functions, $chart_callbacks );
+  if ( $avg_type eq 'log' ) {
+    ( $div_strings, $chart_functions, $chart_callbacks ) = get_avg_plot_log_fit( \%avg, \%line_info );
+  } else {
+    ( $div_strings, $chart_functions, $chart_callbacks ) = get_avg_plot_linear_fit( \%avg, \%line_info );
+  }
+
+
+	for my $frag ( sort{ $a <=> $b } keys( %data ) ) {
+    my $js_data = '';
+    my $conc_str .= "begin: ";
+    my $pcnt = 0;
+    for my $conc ( sort{ $b <=> $a } keys( %{$data{$frag}} ) ) {
+      $conc_str .= "$conc... ";
+      $pcnt++;
+#      print "conc is $conc<BR>\n";
+      my @reps = sort { $a <=> $b } ( keys( %{$data{$frag}->{$conc}} ) );
+
+      if ( !$js_data ) {
+        $js_data .= "['Conc'";
+        for my $rep ( @reps ) {
+          $js_data .= ", 'rep_$rep'";
+        }
+        if ( $showline ) {
+          $js_data .= ",'Fit']";
+        } else {
+          $js_data .= ",'']";
+        }
+      }
+
+      my @areas;
+      my $tot = 0;
+      my $cnt = 0;
+    	for my $rep ( @reps ) {
+        my $val = $data{$frag}->{$conc}->{$rep};
+
+        $val = 1 if $val < 1;
+        $tot += $val;
+	  	  push @areas, $val;
+        $cnt++;
+      }
+      my $response = int( $conc * $line_info{$frag}->{slope} + $line_info{$frag}->{intercept} );
+      if ( $pcnt > $line_info{$frag}->{points} ) {
+#        $response = 'null';
+      }
+	  	push @areas, $response;
+
+#      my $avg = int( abs($tot/$cnt) );
+#      $avg ||= 1;
+#      push @areas, $avg;
+	  	$js_data .= ",\n[$conc," . join( ',', @areas ) . ']' . "\n";
+    }
+#    print "<pre>";
+#    print Dumper( $js_data );
+#    print "</pre>";
+
+
+  		my $div_name = $sbeams->getRandomString( num_chars => 20 );
+
+#	 	my $line_info = "<BR> r-squared = $rSquared,  y=$slope*x + $intercept";
+      my $line_info = '';
+  		$div_strings .= qq~<BR><DIV style="border: 1px solid gray; width: 500px" > <div id="$div_name" style="width: 500px; height: 360px" > </div><CENTER>$line_info</CENTER></DIV>~;
+#		$div_strings .= qq~<BR><DIV style="width: 500px; height: 360px; border: 1px solid gray"   <div id="$div_name" style="width: 500px; height: 360px; border: 1px solid gray" > </div>~;
+
+      $chart_callbacks .= "google.setOnLoadCallback(draw_${div_name}_Chart);\n";
+		$chart_functions .= qq~
+      function draw_${div_name}_Chart() {
+        var data = google.visualization.arrayToDataTable([
+				$js_data
+        ]);
+
+        var options = {
+          title: "$quant[0] product ion $frag",
+					pointSize:  3,
+					hAxis: {title: 'Femtomoles on Column', logScale: $aslog   },
+					vAxis: {title: 'Intensity (area under chromatogram)', logScale: $aslog },
+					series: [{ pointSize: 4 },{ pointSize: 4 },{ pointSize: 4 },{ pointSize: 4 },{ pointSize: 4 },  { pointSize: 0, lineWidth: $showline, visibleInLegend: true}]
+        };
+
+        var chart = new google.visualization.ScatterChart(document.getElementById('$div_name'));
+        chart.draw(data, options);
+      }
+		~;
+	}
+
+#					series: [{ pointSize: 4 },{ pointSize: 4 },{ pointSize: 4 },{ pointSize: 4 },{ pointSize: 4 },  { pointSize: 0, lineWidth: 1, visibleInLegend: true}]
+  print qq~
+    $div_strings
+    <script type="text/javascript" src="https://www.google.com/jsapi"></script>
+    <script type="text/javascript">
+      google.load("visualization", "1", {packages:["corechart"]});
+			$chart_callbacks
+			$chart_functions
+    </script>
+   <BR><BR>
+	~;
+
+
+} # end showMainPage
+
+# Get avg plot with log-log fitted transition lines
+sub get_avg_plot_log_fit {
+  my $avg = shift;
+  my $line = shift;
+  
+  my @quant;
+  my $frag;
+
+  my @lconcs;
+  my %log_areas;
+  my $pcnt = 0;
+
+  # Loop over concentrations, calculating line fit in log-log space
+  for my $conc ( sort { $b <=> $a } keys( %{$avg} ) ) {
+    $pcnt++;
+    last if $pcnt > $line->{Sum}->{points};
+    push @lconcs, log($conc)/log(10);
+    for my $pt ( keys( %{$avg->{$conc}} ) ) {
+      $log_areas{$pt} ||= [];
+      push @{$log_areas{$pt}}, log( ($avg->{$conc}->{$pt}/5 ) )/log(10) if $pcnt <= $line->{$pt}->{points};
+    }
+  }
+
+
+  my %fits;
+  for my $pt ( keys( %log_areas ) ) {
+    my $lineFit = Statistics::LineFit->new();
+    $lineFit->setData (\@lconcs, \@{$log_areas{$pt}} ) or die "Invalid data";
+    my ($intercept, $slope) = $lineFit->coefficients();
+    my $rSquared = $lineFit->rSquared();
+    my @lpred = $lineFit->predictedYs();
+    $fits{$pt} = { slope => sprintf( "%0.1f", $slope ),
+                   intercept => sprintf( "%0.1f", $intercept ),
+                   rSquared => sprintf( "%0.4f", $rSquared ),
+                   predicted_ys => \@lpred };
+  }
+
+  my $points;
+  my $sep = '';
+  for my $frag ( sort( keys( %{$line} ) ) ) {
+    $points .= "$sep$frag: $line->{$frag}->{points}";
+    $sep = ',&nbsp;&nbsp;';
+  }
+
+#  print Dumper( $line );
+  my $js_data;
+  my @data_pts;
+  my $titles = "['Conc',";
+  my $h_seen = 0;
+  my $conc_idx = 0;
+
+
+  $pcnt = 0;
+  for my $conc ( sort { $b <=> $a } keys( %{$avg} ) ) {
+    $pcnt++;
+    my $sep = '';
+    my $data_pt = "[$conc,";
+    for my $pt ( sort { $a <=> $b } keys( %{$avg->{$conc}} ) ) {
+
+      my $response = int( $conc * $line->{$pt}->{slope} + $line->{$pt}->{intercept} );
+      
+      $avg->{$conc}->{$pt} ||= 5;
+      my $val = int( $avg->{$conc}->{$pt} / 5 );
+
+      my $short_pt = $pt;
+      unless( $short_pt eq 'Sum' ) {
+        $short_pt = sprintf( "%0.2f", $pt );
+      }
+      $titles .= $sep . "'$short_pt'" unless $h_seen;
+      $data_pt .= $sep . "$val";
+      $sep ||= ',';
+
+      $titles .= $sep . "'Linear'" unless $h_seen;
+      $data_pt .= $sep . "$response";
+
+      my $log_response = int(10**$fits{$pt}->{predicted_ys}->[$conc_idx] );
+      $titles .= $sep . "'Log Fit'" unless $h_seen;
+      $data_pt .= $sep . $log_response;
+    }
+    $titles .= "],\n" unless $h_seen;
+    $data_pt .= "]";
+    push @data_pts, $data_pt;
+    $h_seen++;
+    $conc_idx++;
+  }
+  $js_data = $titles . join( ",\n", @data_pts ) . "\n";
+
+
+  my $slope_js = "['',";
+
+  my $div_name = $sbeams->getRandomString( num_chars => 20 );
+
+  my $line_info = '';
+  my $div_strings .= qq~<BR><DIV style="border: 1px solid gray; width: 500px" > <div id="$div_name" style="width: 500px; height: 360px" > </div><CENTER>$line_info</CENTER></DIV>~;
+
+  my $chart_callbacks .= "google.setOnLoadCallback(draw_${div_name}_Chart);\n";
+  my $noline = ( $avg_type eq 'linear' ) ? 1 : 0;
+  my $chart_functions .= qq~
+  function draw_${div_name}_Chart() {
+    var data = google.visualization.arrayToDataTable([
+      $js_data
+    ]);
+
+    var options = {
+      title: "$quant[0] product ion $frag",
+      pointSize:  3,
+      hAxis: {title: 'Femtomoles on Column', logScale: $aslog   },
+      vAxis: {title: 'Intensity (area under chromatogram)', logScale: $aslog },
+      colors: [ 'green', 'green', 'green',
+                'yellow','yellow','yellow',
+                'purple', 'purple','purple', 
+                'blue', 'blue', 'blue', 
+                'orange', 'orange','orange', 
+                'black', 'black','black', 
+                'pink', 'pink', 'pink' ],
+      series: [{ pointSize: 5, lineWidth: 0 },{ pointSize: 0, lineWidth: $noline, visibleInLegend: false },{ pointSize: 0, lineWidth: 1, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $noline, visibleInLegend: false },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $noline, visibleInLegend: false },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $noline, visibleInLegend: false },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $noline, visibleInLegend: false },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $noline, visibleInLegend: false },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+             ]
+    };
+
+    var chart = new google.visualization.ScatterChart(document.getElementById('$div_name'));
+    chart.draw(data, options);
+
+
+    var div = document.getElementById('$div_name');
+//    div.innerHTML = div.innerHTML + '$points';
+  }
+~;
+  return( $div_strings, $chart_callbacks, $chart_functions );
+}
+
+
+
+sub get_avg_plot_linear_fit {
+  my $avg = shift;
+  my $line = shift;
+  
+  my @quant;
+  my $frag;
+
+  my @lconcs;
+  my @lareas;
+  my $pcnt = 0;
+#die Dumper( $line );
+  for my $conc ( sort { $b <=> $a } keys( %{$avg} ) ) {
+    $pcnt++;
+    next if $pcnt > $line->{Sum}->{points};
+    push @lconcs, log($conc)/log(10);
+    push @lareas, log( ($avg->{$conc}->{Sum}/5 ) )/log(10);
+  }
+  my $lineFit = Statistics::LineFit->new();
+
+  $lineFit->setData (\@lconcs, \@lareas) or die "Invalid data";
+  my ($intercept, $slope) = $lineFit->coefficients();
+  my $rSquared = $lineFit->rSquared();
+  my @lpred = $lineFit->predictedYs();
+  $intercept = sprintf( "%0.1f", $intercept );
+  $slope = sprintf( "%0.1f", $slope );
+  $rSquared = sprintf( "%0.4f", $rSquared );
+
+  $intercept = $line->{Sum}->{intercept};
+  $slope = $line->{Sum}->{slope};
+
+  my $points;
+  my $sep = '';
+  for my $frag ( sort( keys( %{$line} ) ) ) {
+    $points .= "$sep$frag: $line->{$frag}->{points}";
+    $sep = ',&nbsp;&nbsp;';
+  }
+
+#  print Dumper( $line );
+  my $js_data;
+  my @data_pts;
+  my $titles = "['Conc',";
+  my $h_seen = 0;
+  my $conc_idx = 0;
+
+  $pcnt = 0;
+  for my $conc ( sort { $b <=> $a } keys( %{$avg} ) ) {
+    $pcnt++;
+    my $sep = '';
+    my $data_pt = "[$conc,";
+    for my $pt ( sort { $a <=> $b } keys( %{$avg->{$conc}} ) ) {
+
+      my $response = int( $conc * $line->{$pt}->{slope} + $line->{$pt}->{intercept} );
+      
+      $avg->{$conc}->{$pt} ||= 5;
+      my $val = int( $avg->{$conc}->{$pt} / 5 );
+      $titles .= $sep . "'$pt'" unless $h_seen;
+      $data_pt .= $sep . "$val";
+      $sep ||= ',';
+
+      if ( $pcnt > $line->{$pt}->{points} ) {
+#        $response = 'null';
+      }
+      $titles .= $sep . "'Linear'" unless $h_seen;
+      $data_pt .= $sep . "$response";
+
+      if ( $pt eq 'Sum' ) {
+        if ( $aslog eq 'true' ) {
+          $response = int(10**$lpred[$conc_idx] );
+          $titles .= $sep . "'Log Fit'" unless $h_seen;
+        } else {
+          $titles .= $sep . "'Fit'" unless $h_seen;
+        }
+        $data_pt .= $sep . $response;
+      }
+    }
+    $titles .= "],\n" unless $h_seen;
+    $data_pt .= "]";
+    push @data_pts, $data_pt;
+    $h_seen++;
+    $conc_idx++;
+  }
+  $js_data = $titles . join( ",\n", @data_pts ) . "\n";
+
+
+  my $slope_js = "['',";
+
+  my $div_name = $sbeams->getRandomString( num_chars => 20 );
+
+  my $line_info = '';
+  my $div_strings .= qq~<BR><DIV style="border: 1px solid gray; width: 500px" > <div id="$div_name" style="width: 500px; height: 360px" > </div><CENTER>$line_info</CENTER></DIV>~;
+
+  my $chart_callbacks .= "google.setOnLoadCallback(draw_${div_name}_Chart);\n";
+  my $chart_functions .= qq~
+  function draw_${div_name}_Chart() {
+    var data = google.visualization.arrayToDataTable([
+      $js_data
+    ]);
+
+    var options = {
+      title: "$quant[0] product ion $frag",
+      pointSize:  3,
+      hAxis: {title: 'Femtomoles on Column', logScale: $aslog   },
+      vAxis: {title: 'Intensity (area under chromatogram)', logScale: $aslog },
+      colors: [ 'green', 'green', 'green',
+                'yellow','yellow',
+                'purple', 'purple', 
+                'blue', 'blue', 
+                'orange', 'orange', 
+                'black', 'black', 
+                'pink', 'pink' ],
+      series: [{ pointSize: 5, lineWidth: 0 },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },{ pointSize: 0, lineWidth: 1 },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+               { pointSize: 3, lineWidth: 0 },{ pointSize: 0, lineWidth: $showline, visibleInLegend: false },
+             ]
+    };
+
+    var chart = new google.visualization.ScatterChart(document.getElementById('$div_name'));
+    chart.draw(data, options);
+
+
+    var div = document.getElementById('$div_name');
+//    div.innerHTML = div.innerHTML + '$points';
+  }
+~;
+  return( $div_strings, $chart_callbacks, $chart_functions );
+}

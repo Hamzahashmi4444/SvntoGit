@@ -1,0 +1,302 @@
+#!/usr/local/bin/perl
+
+###############################################################################
+# Program     : ShowChromatogram
+#
+# Description : This CGI program displays a single chromatogram in PeptideAtlas
+#
+# Terry Farrah
+#
+###############################################################################
+
+
+###############################################################################
+# Basic SBEAMS setup
+###############################################################################
+use strict;
+use FindBin;
+
+use lib "$FindBin::Bin/../../lib/perl";
+use vars qw ($q $sbeams $sbeamsMOD $PROG_NAME
+             $current_username $massCalculator );
+
+use SBEAMS::Connection qw($q);
+use SBEAMS::Connection::Settings;
+use SBEAMS::Connection::Tables;
+
+use SBEAMS::Proteomics::ChromatogramViewer;
+use SBEAMS::Proteomics::PeptideMassCalculator;
+
+use SBEAMS::PeptideAtlas;
+use SBEAMS::PeptideAtlas::Settings;
+use SBEAMS::PeptideAtlas::Tables;
+use SBEAMS::PeptideAtlas::Chromatogram;
+
+use File::Basename;
+use Data::Dumper;
+use JSON;
+
+use Carp;
+$SIG{__DIE__} = sub { &Carp::confess };
+use CGI::Carp qw (fatalsToBrowser);
+
+#$q = new CGI;
+$sbeams = new SBEAMS::Connection;
+$sbeamsMOD = new SBEAMS::PeptideAtlas;
+$sbeamsMOD->setSBEAMS($sbeams);
+
+
+$PROG_NAME="ShowChromatogram";
+
+# Allowable neutral losses
+my @neutral_loss_masses = ();
+
+###############################################################################
+# Define global variables if any and execute main()
+###############################################################################
+main();
+
+
+###############################################################################
+# Main Program:
+#
+# If $sbeams->Authenticate() succeeds, print header, process the CGI request,
+# print the footer, and end.
+###############################################################################
+sub main {
+
+  #### Do the SBEAMS authentication and exit if a username is not returned
+  exit unless ($current_username = $sbeams->Authenticate(
+    permitted_work_groups_ref=>['PeptideAtlas_user','PeptideAtlas_admin',
+      'PeptideAtlas_readonly', 'PeptideAtlas_exec'],
+    #connect_read_only=>1,
+    allow_anonymous_access=>1,
+  ));
+
+  #### Read in the default input parameters
+  my %parameters;
+  my $n_params_found = 
+  $sbeams->parse_input_parameters(q=>$q,parameters_ref=>\%parameters);
+
+  #### Process generic "state" parameters before we start
+  $sbeams->processStandardParameters(parameters_ref=>\%parameters);
+
+  my $apply_action  = $q->param('apply_action');
+  
+  #### Process certain actions, then print the header, figure and do what the user wants, and print footer
+  $sbeamsMOD->display_page_header( show_doctype => 1 );
+  #processRequest();
+  processRequest(ref_parameters=>\%parameters);
+  $sbeamsMOD->display_page_footer();
+
+  $sbeams->display_page_footer(close_tables=>'YES',
+    separator_bar=>'YES',display_footer=>'NO');
+
+} # end main
+
+
+
+###############################################################################
+# processRequest
+###############################################################################
+sub processRequest {
+
+  #### Process the arguments list
+  my %args = @_;
+  my $ref_parameters = $args{'ref_parameters'}
+    || die "ref_parameters not passed";
+
+  $ref_parameters->{show_sptxt_info} = 1 if !defined $ref_parameters->{show_sptxt_info};
+
+  #### Define param usage and print if parameter "help=1" defined.
+  my $usage = qq~
+     spectrum_pathname           full pathname of mzML or mzXML file
+     modified_pepseq             peptide to display
+     q1                          precursor mz to display
+     q1_tolerance                matching tolerance; default 0.07
+     precursor_neutral_mass      computed from modified_pepseq if not supplied;
+                                   used to derive q1
+     precursor_charge            if not provided, +2 and +3 will be displayed
+     isotype                     light or heavy
+     machine                     QTRAP, QQQ, TSQ. Currently unused; machine
+                                   type is guessed from spectrum file.
+     transition_info             string of form Q3,frg_ion,eri,Q3,frg_ion,eri, ...
+                                   frg_ion of form 3y+1  or 12b+2; can be empty
+                                   eri=expected relative intensity; can be empty
+                                   If not provided, all Q3 for given Q1 displayed.
+     q3_tolerance                matching tolerance; default 0.07
+     show_sptxt_info             Print sptxt file information; default true.
+
+   For display only (not needed to draw chromatogram):
+     ce                          collision energy
+     rt                          precursor retention time
+     Tr                          best peak group RT
+     is_decoy                    1 or 0
+     m_score                     mProphet score
+     experiment_title            
+     monoisotopic_peptide_mass
+     isotype_delta_mass          for heavy isotypes, mass of label
+
+   For PASSEL chromatograms:
+     SEL_chromatogram_id         overwrites all of the above params with info
+                                   from the PASSEL tables
+
+   REQUIRED: spectrum_pathname, plus one of the following:
+       SEL_chromatogram_id,  modified_pepseq, Q1, precursor_neutral_mass
+   ~;
+
+  $sbeams->show_help_if_requested(
+    usage_string   => $usage,
+    ref_parameters => $ref_parameters,
+  );
+
+  # Create a chromatogram object so we can use its methods
+  my $cgram = new SBEAMS::PeptideAtlas::Chromatogram;
+  $cgram->setSBEAMS($sbeams);
+
+  # If there is any data on this chromatogram in the PASSEL database tables,
+  # fetch it and add it to the parameters hash.
+  my ($json_string, $sptxt_fulltext)
+     = $cgram->getChromatogramInfo($ref_parameters);
+
+  if ( $ref_parameters->{sort_peaks} ) {
+    my $json = new JSON;
+    my $traces = $json->decode( $json_string );
+    for my $item ( @{$traces->{data_json}} ) {
+      my $max = 0;
+      for my $tp ( @{$item->{data}} ) {
+        $max = $tp->{intensity} if $tp->{intensity} > $max;
+      }
+      $item->{max} = $max;
+    }
+    my @data = sort { $b->{max} <=> $a->{max} } @{$traces->{data_json}};
+    $traces->{data_json} = \@data;
+    $json_string = $json->encode( $traces );
+  }
+
+  # Fetch some of the parameters into scalar variables and do some processing.
+  my $precursor_charge = $ref_parameters->{'precursor_charge'};
+  my $pepseq = $ref_parameters->{'pepseq'};
+  my $modified_pepseq = $ref_parameters->{'modified_pepseq'} || $pepseq;
+  my $spectrum_pathname = $ref_parameters->{'spectrum_pathname'} ||
+    die 'ShowChromatogram; Need parameter spectrum_pathname';
+  my $spectrum_basename = $ref_parameters->{'spectrum_basename'};
+  $spectrum_pathname =~ /.*(\..*)/; my $filename_extension = $1;
+  if (! $spectrum_basename ) {
+    $spectrum_pathname =~ /.*\/(\S+?)\.${filename_extension}/;
+    $spectrum_basename = $1;
+  }
+  my $precursor_neutral_mass = $ref_parameters->{'precursor_neutral_mass'};
+  if ($ref_parameters->{'isotype'} =~ /heavy/i) {
+    $precursor_neutral_mass += $ref_parameters->{'isotype_delta_mass'};
+  }
+  my $machine = $ref_parameters->{'machine'};  #unused 12/06/11
+
+
+  #### Display the Chromatogram Viewer page.
+
+  # Print the HTML for the top of the chromatogram viewer page
+#--------------------------------------------------
+#   my $top_html = $cgram->getTopHTMLforChromatogramViewer (
+#     param_href => $ref_parameters,
+#     seq => $modified_pepseq,
+#     precursor_neutral_mass => $precursor_neutral_mass,
+#     precursor_charge => $precursor_charge,
+#     spectrum_pathname => $spectrum_pathname,
+#   );
+#-------------------------------------------------- 
+  my $json_string_no_newlines = $json_string;
+  $json_string_no_newlines =~ s/\n/ /g;
+  $json_string_no_newlines =~ s/'/"/g;
+  my $top_html = $cgram->getTopHTMLfromJson (
+    json_string => $json_string_no_newlines,
+  );
+
+  print $top_html;
+	my %smoothing;
+	if ( $ref_parameters->{default_smoothing_factor} ) {
+		$smoothing{default_smoothing_factor} = $ref_parameters->{default_smoothing_factor};
+	}
+	if ( $ref_parameters->{limit_smoothing_options} ) {
+		$smoothing{limit_smoothing_options} = $ref_parameters->{limit_smoothing_options};
+	}
+	if ( $ref_parameters->{expand_timeframe} ) {
+		$smoothing{expand_timeframe} = $ref_parameters->{expand_timeframe};
+	}
+
+  # Generate the Chromavis javascript chromatogram viewer
+  my $chromavis = new SBEAMS::Proteomics::ChromatogramViewer;
+  print $chromavis->generateChromatogram(
+    chromatogram_id => $ref_parameters->{'SEL_chromatogram_id'},
+    spectrum_pathname         => $spectrum_pathname,
+    precursor_neutral_mass=> $precursor_neutral_mass,
+    precursor_charge      => $precursor_charge,
+    seq                   => $modified_pepseq,
+    precursor_rt          => $ref_parameters->{rt},
+    best_peak_group_rt    => $ref_parameters->{Tr},
+    m_score               => $ref_parameters->{m_score},
+    json_string           => $json_string,
+		%smoothing
+  );
+
+  # Read the data from the JSON object into a hash of the
+  # format required by writeResultSet
+  my $cgram_href = $cgram->readJsonChromatogramIntoResultsetHash (
+    param_href => $ref_parameters,
+    json_string => $json_string,
+    #json_physical_pathname => $json_physical_pathname,
+  );
+
+  # Store chromatogram data as a recallable resultset
+  my $rs_set_name = "SETME";
+  $sbeams->writeResultSet(
+    resultset_file_ref=>\$rs_set_name,
+    resultset_ref=>$cgram_href,
+    file_prefix=>'chromgram_',
+    query_parameters_ref=>$ref_parameters,
+  );
+
+  # Print sptxt info, if provided.
+  unless ( $sbeams->isGuestUser() ) {
+    my ($SRMProb) = ($sptxt_fulltext =~ /SRMProb=(\S*)\s*/);
+	  if ( $ref_parameters->{show_sptxt_info} ) {
+      print "<p>SRM Probability: $SRMProb</p>\n" if $SRMProb;
+      print "<pre>$sptxt_fulltext</pre>\n";
+  	}
+  }
+
+  my $hidden = '';
+  for my $param ( keys( %{$ref_parameters} ) ) {
+    next if $param =~ /tolerance/;
+    $hidden .= "<input type=hidden name='$param' value='$ref_parameters->{$param}'></input>\n";
+  }
+  $ref_parameters->{q1_tolerance} ||= 0.07;
+  $ref_parameters->{q3_tolerance} ||= 0.07;
+
+  my $advanced_form = qq~
+  <form name=advanced>
+    <table>
+     <tr>
+      <td align=right>Q1 tolerance</td>
+      <td align=left><input type=text name=q1_tolerance value=$ref_parameters->{q1_tolerance} size=20></td>
+     </tr>
+     <tr>
+      <td align=right>Q3 tolerance</td>
+      <td align=left><input type=text name=q3_tolerance value=$ref_parameters->{q3_tolerance} size=20></td>
+     </tr>
+     <tr><td align=right><input type=submit value=re-draw></input></td></tr>
+    </table>
+    $hidden
+   </form>
+  </form>
+  ~;
+  print $advanced_form if $ref_parameters->{show_advanced};
+
+
+  # Print the HTML that allows user to recall and download resultset
+  print $cgram->getBottomHTMLforChromatogramViewer(
+    param_href => $ref_parameters,
+    rs_set_name => $rs_set_name,
+  );
+
+} # end processRequest

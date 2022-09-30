@@ -1,0 +1,148 @@
+
+The following changes to the Proteomics database should be made when
+upgrading SBEAMS
+
+from version 0.22
+  to 0.23 (development branch)
+     0.24 (next release)
+     or later
+
+---------------
+
+Aug 9, 2006
+
+Made Proteomics publication table identical to PeptideAtlas
+publication table
+
+- server sql calls to drop constraints, tables, and columns:
+
+  ALTER TABLE publication drop constraint fk_publication_publication_category_id
+  ALTER TABLE publication drop constraint fk_publication_publication_rating_id
+  DROP TABLE publication_category, publication_rating
+  ALTER TABLE publication drop column publication_category_id
+  ALTER TABLE publication drop column publication_rating_id
+  ALTER TABLE publication drop column presented_on_date
+  ALTER TABLE publication drop column presented_by_contact_id
+
+- server sql calls to delete table_column entries:
+
+  DELETE FROM table_column WHERE table_name = 'PR_publication' AND column_name = 'publication_category_id'
+  DELETE FROM table_column WHERE table_name = 'PR_publication' AND column_name = 'presented_by_contact_id'
+  DELETE FROM table_column WHERE table_name = 'PR_publication' AND column_name = 'presented_on_date'
+  DELETE FROM table_column WHERE table_name = 'PR_publication' AND column_name = 'publication_rating_id'
+
+  DELETE FROM table_column WHERE table_name = 'PR_publication_category'
+  DELETE FROM table_column WHERE table_name = 'PR_publication_rating'
+
+
+- server sql calls to delete table_property entries:
+
+  DELETE from table_property WHERE table_name = 'PR_publication_category'
+  DELETE from table_property WHERE table_name = 'PR_publication_rating'
+
+
+- update driver tables (make sure you have latest code)
+  cd $SBEAMS/lib/scripts/Core
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column.txt
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_property.txt
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column_manual.txt
+
+---------------
+
+Aug 10, 2006
+
+Changed Proteomics peptide table name to proteomics_peptide
+
+- edited $SBEAMS/lib/conf/Proteomics/Proteomics_table_column.txt
+  and $SBEAMS/lib/conf/Proteomics/Proteomics_table_property.txt
+
+- edited $SBEAMS/cgi/Proteomics/BrowseProteinSummary to use
+  $TBPR_PROTEOMICS_TABLE
+
+- edited $SBEAMS/lib/scripts/Proteomics/load_ProteinProphet.pl 
+  to use proteomics_peptide in delete tables subroutine
+
+- edited $SBEAMS/lib/perl/SBEAMS/Proteomics/Tables.pm
+
+- Change the server table name (used the MSSQL tool)
+
+- updated the driver tables:
+  cd $SBEAMS/lib/scripts/Core
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column.txt
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_property.txt
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column_manual.txt
+
+---------------
+
+Sep 1, 2006
+
+Complete change for Proteomics peptide table name to proteomics_peptide
+by renaming peptide_id to proteomics_peptide_id
+
+#### SQL Server:
+cd $SBEAMS/lib/scripts/Core
+cat > zz9
+EXEC sp_rename 'proteomics_peptide.peptide_id', 'proteomics_peptide_id', 'COLUMN'
+EXEC sp_rename 'indistinguishable_peptide.peptide_id', 'proteomics_peptide_id', 'COLUMN'
+EXEC sp_rename 'peptide_parent_protein.peptide_id', 'proteomics_peptide_id', 'COLUMN'
+^D
+./runsql.pl -u sbeamsadmin -s zz9
+rm zz9
+
+#### or MySQL:
+cd $SBEAMS/lib/scripts/Core
+cat > zz9
+alter table proteomics_peptide rename column peptide_id to proteomics_peptide_id;
+alter table indistinguishable_peptide rename column peptide_id to proteomics_peptide_id;
+alter table peptide_parent_protein rename column peptide_id to proteomics_peptide_id;
+^D
+./runsql.pl -u sbeamsadmin -s zz9
+rm zz9
+
+
+#### Clear and reload the driver tables:
+cd $SBEAMS/lib/scripts/Core
+cat > zz9
+DELETE FROM table_column
+ WHERE table_name IN (
+       'PR_peptide',
+       'PR_proteomics_peptide',
+       'PR_indistinguishable_peptide',
+       'PR_peptide_parent_protein' )
+^D
+./runsql.pl -u sbeamsadmin -s zz9
+rm zz9
+./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column.txt
+./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column_manual.txt
+
+---------------
+
+Nov 1, 2006
+
+Removed two obsolete query options from BrowseProteinSummary:
+
+- server sql calls to delete table_column entries:
+
+DELETE FROM table_column WHERE table_name = 'PR_BrowseProteinSummary' AND column_name = 'annotation_status_id'
+DELETE FROM table_column WHERE table_name = 'PR_BrowseProteinSummary' AND column_name = 'annotation_label_id'
+
+
+- update the driver tables:
+  cd $SBEAMS/lib/scripts/Core
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column.txt
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_property.txt
+  ./update_driver_tables.pl ../../conf/Proteomics/Proteomics_table_column_manual.txt
+
+---------------
+
+Apr 16, 2007
+
+Added two more options for CompareBySpectrum
+
+use LocalProteomicsDatabase
+INSERT INTO query_option ( option_type,option_key,option_value,sort_order )
+VALUES ( 'CBS_display_options','SameSequence','Show same-sequence matches',40 );
+INSERT INTO query_option ( option_type,option_key,option_value,sort_order )
+VALUES ( 'CBS_display_options','DifferentSequence','Show different-sequence matches',50 );
+
+
